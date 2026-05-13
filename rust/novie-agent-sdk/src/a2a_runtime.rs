@@ -38,13 +38,7 @@
 //! // agent.serve("0.0.0.0:8080".parse().unwrap()).await.unwrap();
 //! ```
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 #[cfg(feature = "persistence")]
 use std::{
     path::{Path as FsPath, PathBuf},
@@ -1019,6 +1013,19 @@ impl RegistrationClient {
         }
     }
 
+    pub fn new_with_token(
+        registry_url: impl Into<String>,
+        agent_id: impl Into<String>,
+        registration_token: Option<String>,
+    ) -> Self {
+        Self {
+            registry_url: registry_url.into(),
+            agent_id: agent_id.into(),
+            registration_token: registration_token.filter(|v| !v.trim().is_empty()),
+            http: reqwest::Client::new(),
+        }
+    }
+
     fn request_with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.registration_token {
             Some(token) => req.header("Agent-Secret", token).bearer_auth(token),
@@ -1039,14 +1046,21 @@ impl RegistrationClient {
     }
 
     pub async fn heartbeat(&self) -> Result<(), String> {
+        self.heartbeat_registered().await.map(|_| ())
+    }
+
+    pub async fn heartbeat_registered(&self) -> Result<bool, String> {
         let url = format!("{}/agents/{}/heartbeat", self.registry_url, self.agent_id);
-        self.request_with_auth(self.http.post(&url))
+        let response = self
+            .request_with_auth(self.http.post(&url))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
             .map_err(|e| e.to_string())?;
-        Ok(())
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        response.error_for_status().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub async fn deregister(&self) -> Result<(), String> {
@@ -1059,6 +1073,237 @@ impl RegistrationClient {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// Environment-driven Platform registration options.
+#[derive(Clone, Debug)]
+pub struct RegistrationOptions {
+    pub platform_url: String,
+    pub registration_token: Option<String>,
+    pub heartbeat_interval: Duration,
+    pub required: bool,
+    pub register_max_attempts: usize,
+    pub register_backoff: Duration,
+}
+
+impl RegistrationOptions {
+    pub fn from_env() -> Option<Self> {
+        let platform_url = std::env::var("NOVIE_PLATFORM_BASE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())?;
+        Some(Self {
+            platform_url,
+            registration_token: env_trimmed("NOVIE_AGENT_REGISTRATION_TOKEN")
+                .or_else(|| env_trimmed("NOVIE_AGENT_SECRET")),
+            heartbeat_interval: env_duration_positive(
+                "NOVIE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
+                30.0,
+            ),
+            required: registration_required_from_env(),
+            register_max_attempts: env_parse("NOVIE_AGENT_REGISTER_MAX_ATTEMPTS", 5usize).max(1),
+            register_backoff: env_duration_nonnegative("NOVIE_AGENT_REGISTER_BACKOFF_SECONDS", 2.0),
+        })
+    }
+}
+
+/// Registration lifecycle matching the Python SDK:
+/// startup register, background heartbeat, and shutdown deregister.
+#[derive(Clone, Debug)]
+pub struct RegistrationLifecycle {
+    manifest: AgentManifestV2,
+    client: RegistrationClient,
+    options: RegistrationOptions,
+}
+
+impl RegistrationLifecycle {
+    pub fn new(manifest: AgentManifestV2, options: RegistrationOptions) -> Result<Self, String> {
+        let validation_errors = manifest.validate();
+        if !validation_errors.is_empty() {
+            return Err(validation_errors.join("; "));
+        }
+        let client = RegistrationClient::new_with_token(
+            options.platform_url.clone(),
+            manifest.agent_id.clone(),
+            options.registration_token.clone(),
+        );
+        Ok(Self {
+            manifest,
+            client,
+            options,
+        })
+    }
+
+    pub fn from_env(mut manifest: AgentManifestV2) -> Option<Self> {
+        let options = RegistrationOptions::from_env()?;
+        if let Some(endpoint) = env_trimmed("NOVIE_AGENT_PUBLIC_ENDPOINT") {
+            manifest.endpoint = Some(endpoint.trim_end_matches('/').to_owned());
+        }
+        match Self::new(manifest, options) {
+            Ok(lifecycle) => Some(lifecycle),
+            Err(error) => {
+                tracing::warn!(error = %error, "agent manifest invalid after registration env overrides");
+                None
+            }
+        }
+    }
+
+    pub fn manifest(&self) -> &AgentManifestV2 {
+        &self.manifest
+    }
+
+    pub fn client(&self) -> &RegistrationClient {
+        &self.client
+    }
+
+    pub async fn register_on_startup(&self) -> Result<bool, String> {
+        let mut last_error = None;
+        for attempt in 1..=self.options.register_max_attempts {
+            match self.client.register(&self.manifest).await {
+                Ok(()) => {
+                    info!(
+                        agent_id = %self.manifest.agent_id,
+                        attempt,
+                        "registered agent with Platform registry"
+                    );
+                    return Ok(true);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt >= self.options.register_max_attempts {
+                        break;
+                    }
+                    let delay = self.options.register_backoff.mul_f64(attempt as f64);
+                    tracing::warn!(
+                        agent_id = %self.manifest.agent_id,
+                        attempt,
+                        max_attempts = self.options.register_max_attempts,
+                        retry_in_ms = delay.as_millis(),
+                        "Platform registration attempt failed"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        let message = format!(
+            "failed to register with Platform registry for agent {} after {} attempts{}",
+            self.manifest.agent_id,
+            self.options.register_max_attempts,
+            last_error
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        );
+        if self.options.required {
+            Err(message)
+        } else {
+            tracing::warn!("{message}; continuing without registration");
+            Ok(false)
+        }
+    }
+
+    pub fn spawn<S>(self, shutdown: S) -> tokio::task::JoinHandle<()>
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _registered = match self.register_on_startup().await {
+                Ok(registered) => registered,
+                Err(error) => {
+                    error!("{error}");
+                    return;
+                }
+            };
+
+            let mut interval = tokio::time::interval(self.options.heartbeat_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tokio::pin!(shutdown);
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    _ = interval.tick() => {
+                        match self.client.heartbeat_registered().await {
+                            Ok(true) => {
+                                tracing::debug!(agent_id = %self.manifest.agent_id, "Platform registry heartbeat ok");
+                            }
+                            Ok(false) => {
+                                tracing::warn!(agent_id = %self.manifest.agent_id, "agent missing from Platform registry during heartbeat; attempting re-registration");
+                                if let Err(error) = self.client.register(&self.manifest).await {
+                                    tracing::warn!(error = %error, agent_id = %self.manifest.agent_id, "failed to re-register agent with Platform registry");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(error = %error, agent_id = %self.manifest.agent_id, "Platform registry heartbeat failed");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Err(error) = self.client.deregister().await {
+                tracing::debug!(error = %error, agent_id = %self.manifest.agent_id, "Platform registry deregister failed");
+            } else {
+                info!(agent_id = %self.manifest.agent_id, "deregistered agent from Platform registry");
+            }
+        })
+    }
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_parse<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + Copy,
+{
+    env_trimmed(name)
+        .and_then(|value| value.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+fn env_duration_positive(name: &str, default_seconds: f64) -> Duration {
+    let seconds = env_parse(name, default_seconds);
+    if seconds.is_finite() && seconds > 0.0 {
+        Duration::from_secs_f64(seconds)
+    } else {
+        Duration::from_secs_f64(default_seconds)
+    }
+}
+
+fn env_duration_nonnegative(name: &str, default_seconds: f64) -> Duration {
+    let seconds = env_parse(name, default_seconds);
+    if seconds.is_finite() && seconds >= 0.0 {
+        Duration::from_secs_f64(seconds)
+    } else {
+        Duration::from_secs_f64(default_seconds)
+    }
+}
+
+fn registration_required_from_env() -> bool {
+    if env_truthy("NOVIE_AGENT_REGISTRATION_REQUIRED") {
+        return true;
+    }
+    env_trimmed("NOVIE_RUNTIME_MODE")
+        .or_else(|| env_trimmed("NOVIE_ENV"))
+        .map(|value| value.eq_ignore_ascii_case("production"))
+        .unwrap_or(false)
+}
+
+fn env_truthy(name: &str) -> bool {
+    env_trimmed(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1584,6 +1829,7 @@ pub struct Agent {
     stream_handler: Option<StreamHandlerFn>,
     task_handler: Option<TaskHandlerFn>,
     registry_client: Option<RegistrationClient>,
+    registration_lifecycle: Option<RegistrationLifecycle>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -1610,6 +1856,7 @@ impl Agent {
             stream_handler: None,
             task_handler: None,
             registry_client: None,
+            registration_lifecycle: None,
         }
     }
 
@@ -1662,6 +1909,25 @@ impl Agent {
         self
     }
 
+    /// Configure Python-style registration from environment variables.
+    ///
+    /// Reads `NOVIE_PLATFORM_BASE_URL`, `NOVIE_AGENT_PUBLIC_ENDPOINT`,
+    /// `NOVIE_AGENT_REGISTRATION_TOKEN` / `NOVIE_AGENT_SECRET`, and the
+    /// registration retry / required flags.
+    pub fn configure_registration_from_env(mut self) -> Self {
+        if let Some(lifecycle) = RegistrationLifecycle::from_env(self.manifest.clone()) {
+            self.manifest = lifecycle.manifest().clone();
+            self.registration_lifecycle = Some(lifecycle);
+        }
+        self
+    }
+
+    pub fn with_registration_lifecycle(mut self, lifecycle: RegistrationLifecycle) -> Self {
+        self.manifest = lifecycle.manifest().clone();
+        self.registration_lifecycle = Some(lifecycle);
+        self
+    }
+
     /// Build the Axum router without starting an HTTP server.
     /// Useful for testing with `axum_test::TestServer`.
     pub fn build_router(self) -> Router {
@@ -1695,9 +1961,27 @@ impl Agent {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let manifest = self.manifest.clone();
         let registry_client = self.registry_client.clone();
+        let registration_lifecycle = self.registration_lifecycle.clone();
 
         // Register with Platform registry if configured
-        if let Some(ref rc) = registry_client {
+        let heartbeat_handle = if let Some(ref lifecycle) = registration_lifecycle {
+            lifecycle.register_on_startup().await.map_err(|e| {
+                format!(
+                    "failed to register agent {} with Platform registry: {}",
+                    manifest.agent_id, e
+                )
+            })?;
+            let hb_lifecycle = lifecycle.clone();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(hb_lifecycle.options.heartbeat_interval);
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = hb_lifecycle.client.heartbeat().await {
+                        error!("heartbeat failed: {e}");
+                    }
+                }
+            }))
+        } else if let Some(ref rc) = registry_client {
             rc.register(&manifest).await.map_err(|e| {
                 format!(
                     "failed to register agent {} with Platform registry: {}",
@@ -1711,7 +1995,7 @@ impl Agent {
 
             // Background heartbeat task
             let hb_client = rc.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
@@ -1719,8 +2003,10 @@ impl Agent {
                         error!("heartbeat failed: {e}");
                     }
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         let router = self.build_router();
         let listener = tokio::net::TcpListener::bind(addr.into()).await?;
@@ -1730,8 +2016,16 @@ impl Agent {
             .with_graceful_shutdown(shutdown_signal())
             .await?;
 
+        if let Some(handle) = heartbeat_handle {
+            handle.abort();
+        }
+
         // Deregister on clean shutdown
-        if let Some(rc) = registry_client {
+        if let Some(lifecycle) = registration_lifecycle {
+            if let Err(e) = lifecycle.client.deregister().await {
+                error!("deregister failed: {e}");
+            }
+        } else if let Some(rc) = registry_client {
             if let Err(e) = rc.deregister().await {
                 error!("deregister failed: {e}");
             }
