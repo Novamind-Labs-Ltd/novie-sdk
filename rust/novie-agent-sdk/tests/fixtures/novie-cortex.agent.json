@@ -1,0 +1,99 @@
+{
+  "$schema": "https://novie.dev/schemas/agent-manifest-v2.json",
+  "agent_id": "novie-cortex",
+  "name": "Novie Cortex",
+  "version": "0.2.2",
+  "kind": "expert_complex",
+  "runtime": "external_a2a",
+  "capabilities": [
+    "code_execution",
+    "git_operations",
+    "multi_provider",
+    "task_bundle_execution",
+    "repo_editing",
+    "code_generation"
+  ],
+  "capability_manifest": [
+    {
+      "capability_id": "agent.novie-cortex.execute_task_bundle",
+      "version": "0.2.2",
+      "display_name": "Execute Task Bundle",
+      "description": "Execute a validated task bundle against a project repository.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "write",
+      "side_effect": "external",
+      "exec_kind": "async",
+      "runtime_ref": "agent:novie-cortex:execute_task_bundle",
+      "tags": ["task_bundle", "implementation", "cortex"],
+      "natural_language_aliases": ["执行 task bundle", "开始编码", "execute task bundle"],
+      "expected_duration_class": ">1h",
+      "streamable": false,
+      "cancellation_supported": true,
+      "progress_events": true,
+      "requires_confirmation": true,
+      "consumes": ["task_bundle", "project.repo.default"],
+      "provides": ["implementation_result", "code_changes"],
+      "execution_lane": "board_controlled",
+      "risk_class": "repo_mutation",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": true,
+        "requires_human_gate": true
+      }
+    }
+  ],
+  "declared_gates": [],
+  "protocol_mode": "tasks",
+  "endpoint": "http://novie-cortex:8080",
+  "execution": {
+    "expected_duration_seconds": 600,
+    "max_duration_seconds": 14400,
+    "idempotent": false,
+    "supports_cancel": true,
+    "supports_resume": false,
+    "emits_events": true,
+    "durability": "task_store"
+  },
+  "required_secrets": [
+    "GITHUB_TOKEN",
+    "ANTHROPIC_API_KEY"
+  ],
+  "supports_streaming": false,
+  "sandbox_isolation": "shared",
+  "task_bundles_path": "/task-bundles",
+  "metadata": {
+    "owner_team": "novie-core",
+    "durability": "task_store",
+    "protocol_mode": "tasks",
+    "runtime_mode": "platform_bundle",
+    "role_description": "Executes approved build work against a repository, including code edits, git operations, and pull request creation.",
+    "when_to_use": [
+      "Approved build tasks that require repository edits, GitHub operations, code generation, tests, commits, or pull requests.",
+      "Task bundles produced by Planner or Task Splitter for implementation."
+    ],
+    "when_not_to_use": [
+      "Initial requirements clarification, research reports, product design, or task decomposition.",
+      "Answering casual questions or inspecting unrelated platform status without an active run."
+    ],
+    "handoff_contract": "Consumes validated task bundles and repository context; returns implementation results, code changes, and pull request metadata.",
+    "user_facing_aliases": [
+      "coding agent",
+      "implementation agent",
+      "GitHub PR agent",
+      "repo editing agent"
+    ],
+    "artifact_input_types": [
+      "task_bundle"
+    ],
+    "managed_skills_summary": [
+      "context7",
+      "gitnexus",
+      "linear",
+      "repo_inspection",
+      "tech_stack_detection",
+      "readme_update",
+      "pr_creation"
+    ]
+  }
+}
