@@ -1,0 +1,285 @@
+{
+  "$schema": "https://novie.dev/schemas/agent-manifest-v2.json",
+  "agent_id": "analyst",
+  "name": "Novie Analyst",
+  "version": "0.2.0",
+  "kind": "expert_basic",
+  "runtime": "external_a2a",
+  "capabilities": [
+    "requirement_extraction",
+    "stakeholder_analysis",
+    "scope_clarification",
+    "competitor_identification",
+    "feature_comparison",
+    "market_positioning_analysis",
+    "report_synthesis"
+  ],
+  "capability_manifest": [
+    {
+      "capability_id": "agent.analyst.requirement_extraction",
+      "version": "0.2.0",
+      "display_name": "Extract Requirements",
+      "description": "Extract structured requirements from user goals and project context.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:requirement_extraction",
+      "tags": ["requirements", "analysis"],
+      "natural_language_aliases": ["需求分析", "提炼需求", "extract requirements"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["task_brief"],
+      "provides": ["requirements_analysis"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.stakeholder_analysis",
+      "version": "0.2.0",
+      "display_name": "Analyze Stakeholders",
+      "description": "Identify stakeholders, concerns, and decision points for a product request.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:stakeholder_analysis",
+      "tags": ["stakeholders", "analysis"],
+      "natural_language_aliases": ["干系人分析", "stakeholder analysis"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["requirements_analysis"],
+      "provides": ["stakeholder_matrix"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.scope_clarification",
+      "version": "0.2.0",
+      "display_name": "Clarify Scope",
+      "description": "Clarify ambiguous scope, constraints, and acceptance boundaries.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:scope_clarification",
+      "tags": ["scope", "clarification"],
+      "natural_language_aliases": ["澄清范围", "scope clarification"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["requirements_analysis", "stakeholder_matrix"],
+      "provides": ["scope_questions"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.competitor_identification",
+      "version": "0.2.0",
+      "display_name": "Identify Competitors",
+      "description": "Identify direct, adjacent, and emerging competitors for a target product category.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:competitor_identification",
+      "tags": ["research", "competitors"],
+      "natural_language_aliases": ["竞品识别", "identify competitors"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["task_brief"],
+      "provides": ["competitor_set"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.feature_comparison",
+      "version": "0.2.0",
+      "display_name": "Compare Features",
+      "description": "Build a structured feature comparison matrix across the identified competitors.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:feature_comparison",
+      "tags": ["research", "features"],
+      "natural_language_aliases": ["功能对比", "feature comparison"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["competitor_set"],
+      "provides": ["feature_matrix"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.market_positioning_analysis",
+      "version": "0.2.0",
+      "display_name": "Analyze Market Positioning",
+      "description": "Analyze competitor positioning, target customer segments, and value propositions.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:market_positioning_analysis",
+      "tags": ["research", "positioning"],
+      "natural_language_aliases": ["市场定位分析", "market positioning analysis"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["competitor_set", "feature_matrix"],
+      "provides": ["positioning_map"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    },
+    {
+      "capability_id": "agent.analyst.report_synthesis",
+      "version": "0.2.0",
+      "display_name": "Synthesize Management Report",
+      "description": "Synthesize a management-facing report from upstream analysis artifacts.",
+      "input_schema": {"type": "object"},
+      "output_schema": {"type": "object"},
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:report_synthesis",
+      "tags": ["research", "report"],
+      "natural_language_aliases": ["报告综合", "report synthesis"],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": ["requirements_analysis", "competitor_set", "feature_matrix", "positioning_map"],
+      "provides": ["management_report"],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      }
+    }
+  ],
+  "skills": [
+    "requirements-extraction"
+  ],
+  "declared_gates": [
+    "scope_confirmation"
+  ],
+  "protocol_mode": "stream",
+  "endpoint": "http://analyst:8010",
+  "execution": {
+    "expected_duration_seconds": 180,
+    "max_duration_seconds": 600,
+    "idempotent": false,
+    "supports_cancel": false,
+    "supports_resume": false,
+    "emits_events": true,
+    "durability": "none"
+  },
+  "required_secrets": [],
+  "supports_streaming": true,
+  "sandbox_isolation": "shared",
+  "metadata": {
+    "owner_team": "novie-core",
+    "durability": "none",
+    "protocol_mode": "stream",
+    "role_description": "Turns user goals, project context, and research prompts into structured analysis artifacts.",
+    "when_to_use": [
+      "Requirements extraction, product scoping, stakeholder analysis, research framing, feasibility analysis, or report synthesis.",
+      "Early planning stages where the platform needs a clear artifact before implementation."
+    ],
+    "when_not_to_use": [
+      "Direct repository edits, GitHub operations, pull request creation, or task-bundle execution.",
+      "Inspecting an already running plan or agent execution status."
+    ],
+    "handoff_contract": "Produces analysis artifacts for Planner, Task Splitter, or downstream review; does not execute repository changes.",
+    "user_facing_aliases": [
+      "requirements agent",
+      "analyst agent",
+      "research agent",
+      "report agent"
+    ],
+    "artifact_output_type": "requirements_analysis",
+    "analysis_modes": [
+      "requirements",
+      "research_report",
+      "feasibility"
+    ],
+    "analysis_phases": [
+      "discovery",
+      "scoping",
+      "validation",
+      "reporting"
+    ],
+    "runtime_phases": [
+      {
+        "runtime_phase": "research_synthesize",
+        "semantic_phase": "collecting_sources",
+        "display_name": "Collecting sources"
+      },
+      {
+        "runtime_phase": "condense",
+        "semantic_phase": "condensing_evidence",
+        "display_name": "Condensing evidence"
+      },
+      {
+        "runtime_phase": "finalize",
+        "semantic_phase": "finalizing_output",
+        "display_name": "Finalizing output"
+      }
+    ],
+    "stream_events": {
+      "phase_change_event": "analyst_phase_change",
+      "run_summary_event": "analyst_run_summary",
+      "summary_fields": [
+        "phases_completed",
+        "resumed_from_checkpoint",
+        "checkpoint_id",
+        "research_fallback_used",
+        "finalize_strategy",
+        "finalize_attempts",
+        "degraded_flags",
+        "condense",
+        "transport_recovery_safe"
+      ]
+    },
+    "transport_recovery_safe": true,
+    "checkpoint_resume_supported": true,
+    "supports_gemini_deep_research": true,
+    "external_research_providers": ["gemini"],
+    "external_research_note": "Routing controlled by ANALYST_GEMINI_DEEP_RESEARCH_ENABLED on the analyst host. Gemini credentials live with the analyst service; platform never calls Gemini directly. See docs/ANALYST_GEMINI_DEPLOYMENT.md.",
+    "skill_hint_note": "skills[] is a planner routing hint only; does not imply a physical skill server is available"
+  }
+}
