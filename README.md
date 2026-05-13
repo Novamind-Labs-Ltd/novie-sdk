@@ -10,6 +10,7 @@ This repository hosts language-specific implementations of the Novie Agent SDK. 
 | --- | --- | --- | --- |
 | [`python/novie-agent-sdk`](./python/novie-agent-sdk) | Python ≥ 3.14 | `novie-agent-sdk` (v0.3.0) | Reference implementation |
 | [`rust/novie-agent-sdk`](./rust/novie-agent-sdk) | Rust (edition 2024, MSRV 1.85) | `novie-agent-sdk` (v0.2.0) | A2A runtime parity |
+| [`examples/`](./examples) | — | — | Reference **consumer** projects for both SDKs (private Git-dependency setup) |
 
 Both SDKs target the same wire protocol described in `docs/openapi/platform_callback.v1.yaml` (hosted alongside the platform). Pick the language that fits your agent's runtime and follow the SDK-local README for installation and usage.
 
@@ -76,6 +77,23 @@ The two SDKs are intentionally kept on the same wire contract so a task started 
 - **Removed `/memory/recall` and `/memory/remember`** — curated knowledge goes through `WikiService.search` / `/wiki/search` in both SDKs.
 
 See the **Python Parity Matrix** in the Rust README for a capability-by-capability status.
+
+## Consuming the SDK (private Git dependency)
+
+The SDKs are **not published** to PyPI or crates.io. Consumers pull them as Git dependencies pinned to language-prefixed tags (`python-v<x>`, `rust-v<x>`). Full setup, auth, and CI snippets live in [`examples/`](./examples) — start there.
+
+## Cutting a release
+
+Release tags are produced by [`.github/workflows/release.yml`](./.github/workflows/release.yml). Trigger it from the **Actions** tab → "Release SDK" → "Run workflow", choose `python` or `rust`, and enter the new semver. The workflow:
+
+1. Validates the version string is semver and isn't already tagged.
+2. Confirms the version matches `pyproject.toml` / `Cargo.toml`.
+3. Runs the SDK's tests.
+4. Builds wheel/sdist (Python) or runs `cargo package --no-verify` (Rust) as a sanity check.
+5. Creates and pushes the annotated tag (`python-v<x>` / `rust-v<x>`).
+6. Drafts a GitHub Release with the consumer dependency snippet pre-filled.
+
+Bumping a version is therefore a two-step PR: edit the version in `pyproject.toml` / `Cargo.toml`, merge, then run the workflow.
 
 ## Implementing the SDK in another language
 

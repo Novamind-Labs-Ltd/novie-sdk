@@ -37,3 +37,7 @@ target/
 # Env
 .env
 .env.local
+
+# Demo virtualenvs / lockfiles (regenerated locally)
+examples/python-consumer/.venv/
+examples/rust-consumer/Cargo.lock

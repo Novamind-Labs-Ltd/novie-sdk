@@ -1,0 +1,178 @@
+name: Release SDK
+
+# Manually triggered. Picks one SDK (python | rust) and a semver version, then:
+#   1. Verifies the SDK builds / tests cleanly.
+#   2. Verifies the version string matches what's declared in pyproject.toml / Cargo.toml.
+#   3. Creates an annotated tag `<lang>-v<version>` (e.g. python-v0.3.1, rust-v0.2.1).
+#   4. Pushes the tag.
+#   5. Drafts a GitHub Release pointing at the tag.
+#
+# This workflow does NOT publish to PyPI or crates.io. Consumers pull the SDK
+# as a Git dependency pinned to the tag — see examples/ for the pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Which SDK to release"
+        required: true
+        type: choice
+        options:
+          - python
+          - rust
+      version:
+        description: "Semver version (no leading 'v'), e.g. 0.3.1"
+        required: true
+        type: string
+      release_notes:
+        description: "Optional release notes (markdown). Leave blank to autofill."
+        required: false
+        type: string
+
+permissions:
+  contents: write   # needed to push tags and create releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed so we can push tags back
+
+      # ── Validate version format ─────────────────────────────────────────────
+      - name: Validate version string
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '${{ inputs.version }}' is not valid semver (e.g. 0.3.1)"
+            exit 1
+          fi
+
+      - name: Compute tag name
+        id: tag
+        run: |
+          echo "name=${{ inputs.language }}-v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing tag
+        run: |
+          if git rev-parse --verify "refs/tags/${{ steps.tag.outputs.name }}" >/dev/null 2>&1; then
+            echo "::error::tag ${{ steps.tag.outputs.name }} already exists. Bump the version."
+            exit 1
+          fi
+
+      # ── Python branch ───────────────────────────────────────────────────────
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Verify Python version matches pyproject.toml
+        if: inputs.language == 'python'
+        working-directory: python/novie-agent-sdk
+        run: |
+          declared=$(python -c "import tomllib,sys; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "::error::pyproject.toml declares version '$declared', but workflow input is '${{ inputs.version }}'. Update the file and re-run."
+            exit 1
+          fi
+
+      - name: Install build + dev deps (Python)
+        if: inputs.language == 'python'
+        working-directory: python/novie-agent-sdk
+        run: |
+          python -m pip install --upgrade pip
+          pip install hatch build pytest pytest-asyncio fastapi langchain-core
+          pip install -e .
+
+      - name: Run Python tests
+        if: inputs.language == 'python'
+        working-directory: python/novie-agent-sdk
+        run: pytest -q
+
+      - name: Build Python wheel + sdist (artifact only, not published)
+        if: inputs.language == 'python'
+        working-directory: python/novie-agent-sdk
+        run: python -m build
+
+      - name: Upload Python build artifacts
+        if: inputs.language == 'python'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ inputs.version }}
+          path: python/novie-agent-sdk/dist/*
+
+      # ── Rust branch ─────────────────────────────────────────────────────────
+      - name: Set up Rust toolchain
+        if: inputs.language == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: inputs.language == 'rust'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/novie-agent-sdk
+
+      - name: Verify Rust version matches Cargo.toml
+        if: inputs.language == 'rust'
+        working-directory: rust/novie-agent-sdk
+        run: |
+          declared=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "::error::Cargo.toml declares version '$declared', but workflow input is '${{ inputs.version }}'. Update the file and re-run."
+            exit 1
+          fi
+
+      - name: Run Rust tests
+        if: inputs.language == 'rust'
+        working-directory: rust/novie-agent-sdk
+        run: cargo test --all-features
+
+      - name: Verify Rust package metadata (cargo package --no-verify)
+        if: inputs.language == 'rust'
+        working-directory: rust/novie-agent-sdk
+        run: cargo package --no-verify --allow-dirty
+
+      # ── Tag + Release ───────────────────────────────────────────────────────
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push annotated tag
+        run: |
+          git tag -a "${{ steps.tag.outputs.name }}" \
+            -m "Release ${{ steps.tag.outputs.name }}"
+          git push origin "${{ steps.tag.outputs.name }}"
+
+      - name: Compose release notes
+        id: notes
+        run: |
+          if [ -n "${{ inputs.release_notes }}" ]; then
+            printf '%s\n' "${{ inputs.release_notes }}" > /tmp/notes.md
+          else
+            cat > /tmp/notes.md <<EOF
+          Released **${{ inputs.language }} SDK v${{ inputs.version }}**.
+
+          Consumers pin the dependency to this tag:
+
+          ${{ inputs.language == 'python' && format('```toml
+          "novie-agent-sdk @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@{0}#subdirectory=python/novie-agent-sdk"
+          ```', steps.tag.outputs.name) || '' }}${{ inputs.language == 'rust' && format('```toml
+          novie-agent-sdk = {{ git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "{0}" }}
+          ```', steps.tag.outputs.name) || '' }}
+
+          See [examples/](https://github.com/Novamind-Labs-Ltd/novie-sdk/tree/main/examples) for full consumer setup.
+          EOF
+          fi
+          echo "path=/tmp/notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.name }}" \
+            --title "${{ steps.tag.outputs.name }}" \
+            --notes-file "${{ steps.notes.outputs.path }}" \
+            --target "${{ github.sha }}"

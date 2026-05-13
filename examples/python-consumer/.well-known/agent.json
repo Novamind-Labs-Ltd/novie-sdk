@@ -1,0 +1,24 @@
+{
+  "$schema": "https://novie.dev/schemas/agent-manifest-v2.json",
+  "agent_id": "novie-python-consumer-demo",
+  "name": "Novie Python Consumer Demo",
+  "version": "0.0.1",
+  "kind": "expert_basic",
+  "runtime": "external_a2a",
+  "protocol_mode": "tasks",
+  "endpoint": "http://localhost:8000",
+  "capabilities": ["demo.echo"],
+  "capability_manifest": [],
+  "declared_gates": [],
+  "execution": {
+    "supports_cancel": true,
+    "emits_events": true,
+    "durability": "task_store",
+    "expected_duration_seconds": 30
+  },
+  "required_secrets": [],
+  "supports_streaming": false,
+  "sandbox_isolation": "shared",
+  "task_bundles_path": "",
+  "metadata": {}
+}
