@@ -1,4 +1,11 @@
-"""SDK compatibility checks for platform-owned dev seed manifests."""
+"""SDK compatibility checks for platform-owned dev seed manifests.
+
+The platform's dev seed manifests (analyst / task_splitter / novie-cortex)
+are vendored into this test tree at tests/fixtures/dev-seed-manifests/.
+When the platform updates a manifest, refresh this fixture directory by
+copying the JSON files from
+``novie/apps/agentic-beta/deploy/dev/manifests/``.
+"""
 from __future__ import annotations
 
 import json
@@ -7,8 +14,7 @@ from typing import Any
 
 from novie_protocol.contracts.agent_sdk_v2 import AgentManifestV2
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-MANIFEST_DIR = REPO_ROOT / "deploy/dev/manifests"
+MANIFEST_DIR = Path(__file__).resolve().parent / "fixtures" / "dev-seed-manifests"
 
 
 def _load_manifest(name: str) -> dict[str, Any]:
