@@ -69,7 +69,7 @@
 pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.0";
 
 // ── A2A Runtime (v2 primary path) ────────────────────────────────────────────
-#[cfg(feature = "runtime")]
+#[cfg(feature = "http")]
 pub mod a2a_runtime;
 pub mod headers;
 pub mod manifest;

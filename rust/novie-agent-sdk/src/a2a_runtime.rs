@@ -41,10 +41,14 @@
 use std::{
     collections::HashMap,
     future::Future,
-    path::{Path as FsPath, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::Duration,
+};
+#[cfg(feature = "persistence")]
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::Mutex as StdMutex,
 };
 
 use axum::{
@@ -55,6 +59,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
+#[cfg(feature = "persistence")]
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -116,6 +121,7 @@ pub struct TaskEvent {
     pub data: Value,
 }
 
+#[cfg(feature = "persistence")]
 #[derive(Debug)]
 struct SqliteTaskRow {
     task_id: String,
@@ -373,16 +379,19 @@ impl TaskStore for InMemoryTaskStore {
 }
 
 /// SQLite-backed [`TaskStore`] for restart-safe worker task state.
+#[cfg(feature = "persistence")]
 pub struct SqliteTaskStore {
     conn: StdMutex<Connection>,
 }
 
+#[cfg(feature = "persistence")]
 impl std::fmt::Debug for SqliteTaskStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteTaskStore").finish()
     }
 }
 
+#[cfg(feature = "persistence")]
 impl SqliteTaskStore {
     pub fn open(path: impl AsRef<FsPath>) -> Result<Self, String> {
         if let Some(parent) = path.as_ref().parent() {
@@ -443,6 +452,7 @@ impl SqliteTaskStore {
     }
 }
 
+#[cfg(feature = "persistence")]
 #[async_trait::async_trait]
 impl TaskStore for SqliteTaskStore {
     fn backend_name(&self) -> &'static str {
@@ -583,6 +593,7 @@ impl TaskStore for SqliteTaskStore {
     }
 }
 
+#[cfg(feature = "persistence")]
 impl SqliteTaskStore {
     fn get_events_locked(&self, conn: &Connection, task_id: &str) -> Vec<TaskEvent> {
         let Ok(mut stmt) = conn.prepare(
@@ -900,16 +911,19 @@ impl OneShotInvocationStore for InMemoryOneShotInvocationStore {
     }
 }
 
+#[cfg(feature = "persistence")]
 pub struct SqliteOneShotInvocationStore {
     conn: StdMutex<Connection>,
 }
 
+#[cfg(feature = "persistence")]
 impl std::fmt::Debug for SqliteOneShotInvocationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteOneShotInvocationStore").finish()
     }
 }
 
+#[cfg(feature = "persistence")]
 impl SqliteOneShotInvocationStore {
     pub fn open(path: impl AsRef<FsPath>) -> Result<Self, String> {
         if let Some(parent) = path.as_ref().parent() {
@@ -933,6 +947,7 @@ impl SqliteOneShotInvocationStore {
     }
 }
 
+#[cfg(feature = "persistence")]
 #[async_trait::async_trait]
 impl OneShotInvocationStore for SqliteOneShotInvocationStore {
     fn backend_name(&self) -> &'static str {
@@ -1180,6 +1195,7 @@ fn stream_events_to_ndjson(mut events: Vec<StreamEvent>) -> String {
         + "\n"
 }
 
+#[cfg(feature = "persistence")]
 fn state_dir() -> PathBuf {
     std::env::var("NOVIE_AGENT_STATE_DIR")
         .ok()
@@ -1188,6 +1204,7 @@ fn state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".novie-agent-state"))
 }
 
+#[cfg(feature = "persistence")]
 fn sanitized_agent_id(agent_id: &str) -> String {
     agent_id
         .chars()
@@ -1202,8 +1219,10 @@ fn sanitized_agent_id(agent_id: &str) -> String {
 }
 
 fn default_task_store(manifest: &AgentManifestV2) -> Arc<dyn TaskStore> {
-    let production = env_is_production();
-    if manifest.execution.durability == DurabilityLevel::TaskStore || production {
+    let needs_persistence =
+        manifest.execution.durability == DurabilityLevel::TaskStore || env_is_production();
+    #[cfg(feature = "persistence")]
+    if needs_persistence {
         let path = std::env::var("NOVIE_AGENT_TASK_STORE_PATH")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -1218,11 +1237,21 @@ fn default_task_store(manifest: &AgentManifestV2) -> Arc<dyn TaskStore> {
             SqliteTaskStore::open(path).expect("failed to open default SQLite task store"),
         );
     }
+    #[cfg(not(feature = "persistence"))]
+    if needs_persistence {
+        tracing::warn!(
+            agent_id = %manifest.agent_id,
+            "manifest requests durable task store but `persistence` feature is disabled; \
+             falling back to in-memory task store (task state will not survive restart)"
+        );
+    }
     Arc::new(InMemoryTaskStore::default())
 }
 
 fn default_invocation_store(manifest: &AgentManifestV2) -> Arc<dyn OneShotInvocationStore> {
-    if manifest.execution.durability == DurabilityLevel::ResultCache {
+    let needs_persistence = manifest.execution.durability == DurabilityLevel::ResultCache;
+    #[cfg(feature = "persistence")]
+    if needs_persistence {
         let path = std::env::var("NOVIE_AGENT_INVOCATION_STORE_PATH")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -1236,6 +1265,14 @@ fn default_invocation_store(manifest: &AgentManifestV2) -> Arc<dyn OneShotInvoca
         return Arc::new(
             SqliteOneShotInvocationStore::open(path)
                 .expect("failed to open default SQLite invocation store"),
+        );
+    }
+    #[cfg(not(feature = "persistence"))]
+    if needs_persistence {
+        tracing::warn!(
+            agent_id = %manifest.agent_id,
+            "manifest requests durable invocation cache but `persistence` feature is disabled; \
+             falling back to in-memory invocation store (idempotency keys will not survive restart)"
         );
     }
     Arc::new(InMemoryOneShotInvocationStore::default())

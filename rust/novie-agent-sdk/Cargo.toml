@@ -1,6 +1,6 @@
 [package]
 name = "novie-agent-sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Rust A2A Agent Runtime SDK for Novie Platform. Contracts are hand-mirrored from novie-protocol; see MIRRORED_PROTOCOL_VERSION in src/lib.rs."
 license = "Apache-2.0"
@@ -35,4 +35,13 @@ tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["runtime"]
-runtime = ["dep:tower-http", "dep:futures", "dep:rusqlite"]
+# Split feature set (since 0.3.0):
+#   - `http`         enables the hosted A2A HTTP runtime (axum + tower-http + futures)
+#   - `persistence`  enables SQLite-backed TaskStore / OneShotInvocationStore
+#   - `runtime`      back-compat alias for everything (http + persistence)
+# Consumers that need the HTTP runtime but cannot tolerate `rusqlite`'s
+# `links = "sqlite3"` (e.g. crates that also depend on sqlx-sqlite) should
+# enable only `http`.
+http = ["dep:tower-http", "dep:futures"]
+persistence = ["dep:rusqlite"]
+runtime = ["http", "persistence"]
