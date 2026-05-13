@@ -51,10 +51,25 @@
 //! # }
 //! ```
 //!
+//! ## Protocol mirror
+//!
+//! The Rust SDK does **not** depend on the `novie-protocol` Python package via
+//! Cargo. Instead, the contract types in this crate (manifest, call_scope,
+//! session, memory, agent_status, …) are hand-mirrored from the canonical
+//! Python definitions at `novie-protocol` tag [`MIRRORED_PROTOCOL_VERSION`].
+//!
+//! When bumping `novie-protocol`, also bump [`MIRRORED_PROTOCOL_VERSION`] and
+//! re-sync any changed contracts in the same PR. CI greps for this constant.
 #![warn(missing_debug_implementations)]
 
+/// The `novie-protocol` tag whose Python contracts this crate hand-mirrors.
+///
+/// See module-level docs for the mirror policy. Bump this in lockstep with
+/// `novie-protocol` releases.
+pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.0";
+
 // ── A2A Runtime (v2 primary path) ────────────────────────────────────────────
-#[cfg(feature = "runtime")]
+#[cfg(feature = "http")]
 pub mod a2a_runtime;
 pub mod headers;
 pub mod manifest;

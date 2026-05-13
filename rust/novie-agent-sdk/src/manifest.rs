@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn parses_current_cortex_manifest_shape() {
         let m = AgentManifestV2::from_json(include_str!(
-            "../../../../deploy/dev/manifests/novie-cortex.agent.json"
+            "../tests/fixtures/novie-cortex.agent.json"
         ))
         .unwrap();
 
