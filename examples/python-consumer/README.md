@@ -19,6 +19,8 @@ Three things make this work:
 | `#subdirectory=python/novie-agent-sdk` | The SDK lives in a subdirectory; without this, pip looks in the repo root and fails. |
 | `[server]` | Pulls in FastAPI (needed for `agent.serve()`). Drop if you only need the contract types. |
 
+> ⚠️ The SDK transitively depends on the private [`novie-protocol`](https://github.com/Novamind-Labs-Ltd/novie-protocol) repo. Your auth (SSH key / deploy key / PAT) must grant read access to both `novie-sdk` and `novie-protocol`.
+
 ## Run the demo locally
 
 ```bash
@@ -63,6 +65,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: webfactory/ssh-agent@v0.9.0
         with:
+          # Same private key must be registered as a deploy key on
+          # BOTH novie-sdk and novie-protocol.
           ssh-private-key: ${{ secrets.NOVIE_SDK_DEPLOY_KEY }}
       - uses: actions/setup-python@v5
         with:
