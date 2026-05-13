@@ -2,7 +2,7 @@
 name = "novie-agent-sdk"
 version = "0.2.0"
 edition = "2024"
-description = "Rust A2A Agent Runtime SDK for Novie Platform."
+description = "Rust A2A Agent Runtime SDK for Novie Platform. Contracts are hand-mirrored from novie-protocol; see MIRRORED_PROTOCOL_VERSION in src/lib.rs."
 license = "Apache-2.0"
 publish = false
 rust-version = "1.85"
