@@ -1,0 +1,3 @@
+resource_types:
+  - trace
+  - usage_record

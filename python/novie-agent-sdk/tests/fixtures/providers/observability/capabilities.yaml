@@ -1,0 +1,56 @@
+capabilities:
+  - capability_id: platform.observability.trace.get
+    kind: query
+    risk_level: read
+    side_effect: none
+    input_schema:
+      type: object
+      properties:
+        trace_id:
+          type: string
+        run_id:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        spans:
+          type: array
+    consumes_resources:
+      - trace
+    routing_hints:
+      when_to_use: |
+        Fetch the structured trace for one workflow run so the user can
+        see span timings, errors, and tool calls. Use when the user
+        asks "why was this run slow" or "what tools did this run use".
+      when_not_to_use: |
+        Skip when the user only needs aggregate usage metrics — use
+        platform.observability.usage.summarize instead.
+
+  - capability_id: platform.observability.usage.summarize
+    kind: query
+    risk_level: read
+    side_effect: none
+    input_schema:
+      type: object
+      properties:
+        scope:
+          type: string
+          enum: [session, project, workspace]
+        scope_value:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        cost_usd:
+          type: number
+    consumes_resources:
+      - usage_record
+    routing_hints:
+      when_to_use: |
+        Summarize aggregate usage (tokens / cost / requests) for a
+        scope. Use when the user asks "which agent spent the most
+        tokens today".

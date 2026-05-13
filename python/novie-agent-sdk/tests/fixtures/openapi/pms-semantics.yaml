@@ -1,0 +1,53 @@
+# Hand-maintained semantics sidecar for the synthetic PMS OpenAPI.
+# Mirrors the shape a real .NET PMS integrator would author once and
+# regenerate `capabilities.yaml` against on every upstream release.
+operations:
+  listIssues:
+    intent_label: pms.issue.list
+    risk_level: read
+    side_effect: external
+    resource_binding:
+      - issue
+    when_to_use: |
+      List issues on a project board, optionally filtered by lane
+      (Backlog / Todo / InProgress / Done).
+    when_not_to_use: |
+      Don't use for single-issue lookup — use pms.issue.get instead.
+
+  getIssue:
+    intent_label: pms.issue.get
+    risk_level: read
+    side_effect: external
+    resource_binding:
+      - issue
+    when_to_use: |
+      Fetch a single issue's full payload by id.
+
+  moveIssueToLane:
+    intent_label: pms.issue.move_lane
+    risk_level: write
+    side_effect: tenant
+    resource_binding:
+      - issue
+      - lane
+    confirmation_default: required
+    when_to_use: |
+      Move an issue to a different lane (e.g. promote Todo to InProgress).
+    when_not_to_use: |
+      Don't use for archiving — that's pms.issue.archive (dangerous).
+
+  archiveIssue:
+    intent_label: pms.issue.archive
+    risk_level: dangerous
+    side_effect: irreversible
+    resource_binding:
+      - issue
+    confirmation_default: required
+    when_to_use: |
+      Permanently archive an issue. Irreversible — operator must confirm.
+
+  # Healthcheck is a liveness probe, not a Novie capability.
+  healthcheck:
+    generator_skip: true
+
+aliases: {}

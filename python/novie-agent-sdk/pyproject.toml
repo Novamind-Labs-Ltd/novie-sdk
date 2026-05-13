@@ -1,0 +1,35 @@
+[project]
+name = "novie-agent-sdk"
+version = "0.3.0"
+description = "Novie Agent SDK: A2A task runtime (FastAPI), observability helpers, and protocol-aligned prompt utilities."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "Novie" }]
+dependencies = [
+    "novie-protocol",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+]
+observability = [
+    "langchain-core>=0.3",
+    "langfuse>=2",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "fastapi>=0.110",
+    "langchain-core>=0.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/novie_agent_sdk"]

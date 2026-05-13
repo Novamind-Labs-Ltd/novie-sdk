@@ -1,0 +1,13 @@
+provider:
+  id: integration.github
+  type: openapi
+  display_name: GitHub Integration
+  version: 0.1.0
+  transport:
+    kind: openapi
+    spec_url: https://api.github.com/openapi.json
+    base_url: https://api.github.com
+    security_scheme: github_app
+  health:
+    kind: http_get
+    url: https://api.github.com/rate_limit

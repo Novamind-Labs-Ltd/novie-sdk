@@ -1,0 +1,60 @@
+capabilities:
+  - capability_id: integration.github.repo.read
+    kind: query
+    risk_level: read
+    side_effect: none
+    input_schema:
+      type: object
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+    output_schema:
+      type: object
+    consumes_resources:
+      - repository
+    routing_hints:
+      when_to_use: |
+        Read GitHub repository metadata (default branch, languages,
+        access controls). Use when the user needs context about a
+        repo without modifying it.
+
+  - capability_id: integration.github.issue.write
+    kind: command
+    risk_level: write
+    side_effect: external_write
+    input_schema:
+      type: object
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+        title:
+          type: string
+        body:
+          type: string
+    output_schema:
+      type: object
+      properties:
+        issue_number:
+          type: integer
+    consumes_resources:
+      - repository
+    produces_resources:
+      - issue
+    auth_scope:
+      - write:issues
+    credential_refs:
+      - github_app_token
+    dry_run_support: preview_with_diff
+    confirmation_default: required
+    routing_hints:
+      when_to_use: |
+        Create or update a GitHub issue when the user explicitly
+        requests writing to GitHub. The platform shows a confirmation
+        gate before executing.
+      when_not_to_use: |
+        Skip when the user only wants to read or summarize existing
+        issues — use a read-only capability instead.

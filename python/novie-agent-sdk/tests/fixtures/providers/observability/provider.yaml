@@ -1,0 +1,11 @@
+provider:
+  id: platform.observability
+  type: internal
+  display_name: Platform Observability
+  version: 0.1.0
+  transport:
+    kind: internal
+    entry_point: novie_platform.observability:provider
+  health:
+    kind: internal
+    check: novie_platform.observability:health

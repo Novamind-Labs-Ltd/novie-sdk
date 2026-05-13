@@ -1,0 +1,184 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Mock PMS Service",
+    "version": "1.0.0",
+    "description": "Synthetic OpenAPI doc representing a .NET-style internal PMS service for the OPENAPI_PROVIDER_AUTOGEN W1 unit tests. Real .NET PMS adoption tracked under W4."
+  },
+  "servers": [
+    { "url": "https://pms.internal.example/v1" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Issue": {
+        "type": "object",
+        "required": ["id", "title", "lane"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "lane": { "type": "string", "enum": ["Backlog", "Todo", "InProgress", "Done"] },
+          "labels": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "MoveIssueRequest": {
+        "type": "object",
+        "required": ["target_lane"],
+        "properties": {
+          "target_lane": {
+            "type": "string",
+            "enum": ["Backlog", "Todo", "InProgress", "Done"]
+          },
+          "reason": { "type": "string" }
+        }
+      },
+      "MoveIssueResponse": {
+        "type": "object",
+        "properties": {
+          "issue": { "$ref": "#/components/schemas/Issue" },
+          "previous_lane": { "type": "string" }
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/projects/{project_id}/issues": {
+      "parameters": [
+        {
+          "name": "project_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "listIssues",
+        "summary": "List issues on a project board",
+        "tags": ["issues"],
+        "parameters": [
+          {
+            "name": "lane",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "issues": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Issue" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/projects/{project_id}/issues/{issue_id}": {
+      "parameters": [
+        {
+          "name": "project_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        },
+        {
+          "name": "issue_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "operationId": "getIssue",
+        "summary": "Fetch a single issue",
+        "tags": ["issues"],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Issue" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "archiveIssue",
+        "summary": "Permanently archive an issue (irreversible)",
+        "tags": ["issues"],
+        "responses": {
+          "204": { "description": "archived" }
+        }
+      }
+    },
+    "/projects/{project_id}/issues/{issue_id}/move": {
+      "parameters": [
+        {
+          "name": "project_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        },
+        {
+          "name": "issue_id",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "operationId": "moveIssueToLane",
+        "summary": "Move an issue to a different lane",
+        "tags": ["issues"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MoveIssueRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MoveIssueResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "healthcheck",
+        "summary": "Liveness probe (skipped: not a Novie capability)",
+        "responses": {
+          "200": { "description": "ok" }
+        }
+      }
+    }
+  }
+}
