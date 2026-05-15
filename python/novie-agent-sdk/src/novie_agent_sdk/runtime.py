@@ -78,6 +78,26 @@ from novie_protocol.contracts.agent_sdk_v2 import (
 from .observability import AgentObservability, ObservabilitySink, build_default_sinks
 
 
+def _build_ctx_platform_and_llm(
+    hdrs: "RequestHeaders", agent_id: str
+) -> tuple[Any, Any]:
+    """Build (platform_ns, llm_facade) for an incoming request.
+
+    Returns (None, None) on import error so the context is still
+    created; the properties raise RuntimeError on access if None.
+    """
+    try:
+        from .platform_namespace import build_platform_namespace
+        from .llm_facade import build_llm_facade
+
+        platform_ns = build_platform_namespace(hdrs, agent_id=agent_id)
+        llm = build_llm_facade(platform_ns, agent_id=agent_id)
+        return platform_ns, llm
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        _log.debug("ctx platform/llm build failed: %s", exc)
+        return None, None
+
+
 # ── Contexts ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -198,10 +218,33 @@ class InvokeContext:
     headers: RequestHeaders
     agent_manifest: AgentManifestV2
     observability: AgentObservability
+    # Injected by the SDK runtime; None when build failed (e.g. missing dep).
+    _platform: Any = field(default=None, repr=False)
+    _llm: Any = field(default=None, repr=False)
 
     @property
     def brief(self) -> dict[str, Any]:
         return self.input.get("brief", {})
+
+    @property
+    def platform(self) -> Any:
+        """Live ``PlatformNamespace`` or ``_UnavailablePlatformNamespace``."""
+        if self._platform is None:
+            raise RuntimeError(
+                "ctx.platform is not available — the SDK runtime failed to build "
+                "the platform namespace for this request."
+            )
+        return self._platform
+
+    @property
+    def llm(self) -> Any:
+        """``LlmFacade`` for this request (platform or BYOK)."""
+        if self._llm is None:
+            raise RuntimeError(
+                "ctx.llm is not available — the SDK runtime failed to build "
+                "the LLM facade for this request."
+            )
+        return self._llm
 
 
 @dataclass
@@ -211,10 +254,32 @@ class StreamContext:
     headers: RequestHeaders
     agent_manifest: AgentManifestV2
     observability: AgentObservability
+    _platform: Any = field(default=None, repr=False)
+    _llm: Any = field(default=None, repr=False)
 
     @property
     def brief(self) -> dict[str, Any]:
         return self.input.get("brief", {})
+
+    @property
+    def platform(self) -> Any:
+        """Live ``PlatformNamespace`` or ``_UnavailablePlatformNamespace``."""
+        if self._platform is None:
+            raise RuntimeError(
+                "ctx.platform is not available — the SDK runtime failed to build "
+                "the platform namespace for this request."
+            )
+        return self._platform
+
+    @property
+    def llm(self) -> Any:
+        """``LlmFacade`` for this request (platform or BYOK)."""
+        if self._llm is None:
+            raise RuntimeError(
+                "ctx.llm is not available — the SDK runtime failed to build "
+                "the LLM facade for this request."
+            )
+        return self._llm
 
 
 @dataclass
@@ -230,10 +295,32 @@ class TaskContext:
     observability: AgentObservability
     _store: "TaskStore"
     _cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+    _platform: Any = field(default=None, repr=False)
+    _llm: Any = field(default=None, repr=False)
 
     @property
     def brief(self) -> dict[str, Any]:
         return self.input.get("brief", {})
+
+    @property
+    def platform(self) -> Any:
+        """Live ``PlatformNamespace`` or ``_UnavailablePlatformNamespace``."""
+        if self._platform is None:
+            raise RuntimeError(
+                "ctx.platform is not available — the SDK runtime failed to build "
+                "the platform namespace for this request."
+            )
+        return self._platform
+
+    @property
+    def llm(self) -> Any:
+        """``LlmFacade`` for this request (platform or BYOK)."""
+        if self._llm is None:
+            raise RuntimeError(
+                "ctx.llm is not available — the SDK runtime failed to build "
+                "the LLM facade for this request."
+            )
+        return self._llm
 
     @property
     def is_cancelled(self) -> bool:
@@ -1381,6 +1468,7 @@ class Agent:
                         step_id=hdrs.step_id,
                         trace_id=hdrs.trace_id,
                     ),
+                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
                 )
                 try:
                     result = await self._invoke_handler(ctx)
@@ -1450,6 +1538,7 @@ class Agent:
                         trace_id=hdrs.trace_id,
                         task_event_emitter=_emit_observability_event,
                     ),
+                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
                 )
 
                 async def _gen() -> AsyncIterator[bytes]:
@@ -1541,6 +1630,7 @@ class Agent:
                     task_id=record.task_id,
                     task_event_emitter=_emit_usage_event,
                 )
+                _platform, _llm = _build_ctx_platform_and_llm(hdrs, m.agent_id)
                 ctx = TaskContext(
                     task_id=task_id,
                     input=record.input,
@@ -1549,6 +1639,8 @@ class Agent:
                     observability=task_observability,
                     _store=self._store,
                     _cancelled=cancel_event,
+                    _platform=_platform,
+                    _llm=_llm,
                 )
                 background.add_task(self._run_task, ctx, task_id)
                 return {"task_id": task_id, "status": "pending"}

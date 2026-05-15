@@ -93,12 +93,20 @@ from .platform_namespace import (
     DegradationKind,
     KnowledgeNamespace,
     LlmNamespace,
+    PlatformLlmCallError,
+    PlatformLlmTransportError,
     PlatformNamespace,
     PlatformNamespaceProtocol,
     QuotaExceededError,
     build_platform_namespace,
     classify_envelope_error,
 )
+from .llm_facade import (
+    LlmFacade,
+    LlmMode,
+    build_llm_facade,
+)
+from .platform_chat_model import PlatformChatModel
 from .provider_authoring import (
     FileProviderRegistryWriter,
     ProviderFolderOutcome,
@@ -192,6 +200,8 @@ __all__ = [
     "DegradationKind",
     "KnowledgeNamespace",
     "LlmNamespace",
+    "PlatformLlmCallError",
+    "PlatformLlmTransportError",
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
     "QuotaExceededError",

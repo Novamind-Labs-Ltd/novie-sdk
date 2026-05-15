@@ -19,6 +19,8 @@ import pytest
 from novie_agent_sdk.platform_namespace import (
     CapabilityCallDiagnostics,
     LlmNamespace,
+    PlatformLlmCallError,
+    PlatformLlmTransportError,
     PlatformNamespace,
     QuotaExceededError,
     _UnavailablePlatformNamespace,
@@ -89,17 +91,46 @@ class TestLlmChat:
         with pytest.raises(QuotaExceededError):
             _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
 
-    def test_transport_error_returns_empty(self) -> None:
-        """Non-quota errors degrade gracefully (return empty dict)."""
+    def test_transport_error_raises_platform_llm_transport_error(self) -> None:
+        """Pre-0.3.3 SDKs returned ``{}`` here, which let the analyst's
+        finalize chain interpret a transport failure as an LLM-returned
+        empty object and surface as ``ProductBriefArtifact summary Field
+        required``.  0.3.3 raises ``PlatformLlmTransportError`` so callers
+        can decide whether to retry or surface a clear failure."""
         ns = _make_ns(responses={
             "platform.llm.chat": CapabilityCallDiagnostics(
                 ok=False,
                 capability_id="platform.llm.chat",
                 kind="transport_error",
+                detail="read timeout",
             ),
         })
-        result = _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
-        assert result == {}
+        with pytest.raises(PlatformLlmTransportError) as excinfo:
+            _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
+        assert excinfo.value.capability_id == "platform.llm.chat"
+        assert excinfo.value.is_transient is True
+        assert "read timeout" in excinfo.value.detail
+
+    def test_non_transport_failure_raises_platform_llm_call_error(self) -> None:
+        """Other non-quota failures (binding denied, schema violation,
+        platform unavailable) also raise — they're operational failures,
+        not data the agent should silently absorb."""
+        ns = _make_ns(responses={
+            "platform.llm.chat": CapabilityCallDiagnostics(
+                ok=False,
+                capability_id="platform.llm.chat",
+                kind="binding_denied",
+                error_code="denied_by_binding",
+                detail="no grant",
+            ),
+        })
+        with pytest.raises(PlatformLlmCallError) as excinfo:
+            _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
+        assert excinfo.value.kind == "binding_denied"
+        assert excinfo.value.is_transient is False
+        # Quota exceptions are deliberately a separate class — make sure
+        # this isn't accidentally a ``QuotaExceededError`` subclass.
+        assert not isinstance(excinfo.value, QuotaExceededError)
 
 
 class TestLlmEmbed:
@@ -185,11 +216,20 @@ class TestUnavailableNamespaceHasLlm:
         ns = _UnavailablePlatformNamespace(reason="test")
         assert hasattr(ns, "llm")
 
-    def test_llm_chat_returns_empty_not_raises(self) -> None:
+    def test_llm_chat_raises_platform_llm_call_error(self) -> None:
+        """Calling ``ns.llm.chat`` on the unavailable namespace is a
+        programming error in normal flow (handlers should branch on
+        ``LlmFacade.platform_available`` / fall back to BYOK first), but
+        if it happens we surface it as a structured failure rather than
+        silently returning ``{}`` — same reasoning as the transport_error
+        case."""
         ns = _UnavailablePlatformNamespace(reason="test")
-        result = _run(ns.llm.chat([{"role": "user", "content": "hi"}]))
-        # platform_unavailable error code should not trigger QuotaExceededError
-        assert result == {}
+        with pytest.raises(PlatformLlmCallError) as excinfo:
+            _run(ns.llm.chat([{"role": "user", "content": "hi"}]))
+        # ``unconfigured`` is not in the transient set — agents shouldn't
+        # retry against an unconfigured platform.
+        assert excinfo.value.kind == "unconfigured"
+        assert excinfo.value.is_transient is False
 
 
 class TestQuotaExceededError:

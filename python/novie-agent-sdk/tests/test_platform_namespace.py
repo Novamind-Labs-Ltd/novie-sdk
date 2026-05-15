@@ -29,11 +29,16 @@ import pytest
 
 from novie_agent_sdk import (
     CapabilityCallDiagnostics,
+    PlatformLlmCallError,
+    PlatformLlmTransportError,
     PlatformNamespace,
+    QuotaExceededError,
     build_platform_namespace,
     classify_envelope_error,
 )
 from novie_agent_sdk.platform_namespace import (
+    _DEFAULT_LLM_TIMEOUT_SECONDS,
+    _DEFAULT_TIMEOUT_SECONDS,
     _UnavailablePlatformNamespace,
 )
 
@@ -477,3 +482,155 @@ async def test_forwarded_headers_include_tenant_and_project() -> None:
     assert captured["x-novie-org-id"] == "tenant-1"
     assert captured["x-novie-project-id"] == "project-1"
     assert captured["x-novie-user-id"] == "user-1"
+
+
+# ── LLM namespace: surface failures instead of silently returning {} ────────
+
+
+@pytest.mark.asyncio
+async def test_llm_structured_raises_transport_error_instead_of_returning_empty() -> None:
+    """Pre-0.3.3 SDKs returned ``{}`` from ``LlmNamespace.structured`` when
+    the underlying capability call timed out; that fed an empty dict into
+    callers' Pydantic schemas and bubbled up as ``summary Field required``
+    on the analyst's ``ProductBriefArtifact``.  The 0.3.3 contract is to
+    raise ``PlatformLlmTransportError`` so callers can distinguish a real
+    LLM-returned empty object from a transport failure."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timeout")
+
+    ns = _build_with_responder(responder)
+    with pytest.raises(PlatformLlmTransportError) as excinfo:
+        await ns.llm.structured(
+            [{"role": "user", "content": "hi"}],
+            output_schema={"type": "object", "required": ["summary"]},
+        )
+    assert excinfo.value.capability_id == "platform.llm.structured"
+    assert excinfo.value.kind == "transport_error"
+    assert excinfo.value.is_transient is True
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_raises_call_error_on_envelope_5xx() -> None:
+    """Non-quota envelope failures (binding denied, schema violation,
+    unavailable) must also raise rather than silently degrade so callers
+    don't feed an empty ``content`` into downstream prompts."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error_code": "internal_error"})
+
+    ns = _build_with_responder(responder)
+    with pytest.raises(PlatformLlmCallError) as excinfo:
+        await ns.llm.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.capability_id == "platform.llm.chat"
+    assert excinfo.value.kind == "platform_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_llm_structured_still_raises_quota_exceeded_separately() -> None:
+    """``QuotaExceededError`` is the one exception that should NOT be
+    folded into ``PlatformLlmCallError`` — handlers branch on it to surface
+    a user-visible 'org pool exhausted' message instead of retrying."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        # envelope=ok with quota signalled inside ``result.error`` is the
+        # contract LLMUsageRecord uses today; covers the "successful HTTP
+        # but capability says no" pathway.
+        return httpx.Response(
+            200,
+            json=_ok_envelope({
+                "error": "quota_exceeded",
+                "org_id": "org-1",
+                "remaining_tokens": 0,
+                "reason": "out of tokens",
+            }),
+        )
+
+    ns = _build_with_responder(responder)
+    with pytest.raises(QuotaExceededError) as excinfo:
+        await ns.llm.structured(
+            [{"role": "user", "content": "hi"}],
+            output_schema={"type": "object"},
+        )
+    assert excinfo.value.org_id == "org-1"
+    # Sanity-check that we didn't accidentally subclass ``PlatformLlmCallError``
+    # — quota signalling is a known business state, not a transport problem.
+    assert not isinstance(excinfo.value, PlatformLlmCallError)
+
+
+@pytest.mark.asyncio
+async def test_llm_namespace_uses_dedicated_long_timeout_caller() -> None:
+    """LLM calls share the platform endpoint with knowledge / checkpoints
+    but legitimately take 10–30 s; they MUST NOT share the 8 s default
+    timeout that's appropriate for short capabilities or every slow LLM
+    structured call would surface as a transport error."""
+    captured_caps: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        # Path is ``/capabilities/{id}/invoke``; pull the id back out so
+        # we can confirm both callers route through the same endpoint
+        # shape — only the timeout differs.
+        path = request.url.path
+        captured_caps.append(path.split("/")[-2])
+        return httpx.Response(200, json=_ok_envelope({"structured": {"k": 1}}))
+
+    transport = httpx.MockTransport(responder)
+    client = httpx.AsyncClient(transport=transport, base_url="http://platform.test")
+    ns = build_platform_namespace(
+        _incoming_headers(),
+        agent_id="demo",
+        base_url="http://platform.test",
+        client=client,
+    )
+    assert isinstance(ns, PlatformNamespace)
+
+    # Default caller (knowledge / checkpoints) keeps the short timeout.
+    assert ns._caller._timeout == _DEFAULT_TIMEOUT_SECONDS  # noqa: SLF001
+    # LLM caller gets the long-form timeout.
+    assert ns._llm_caller._timeout == _DEFAULT_LLM_TIMEOUT_SECONDS  # noqa: SLF001
+    assert ns._llm_caller is not ns._caller  # noqa: SLF001
+
+    await ns.llm.structured(
+        [{"role": "user", "content": "x"}],
+        output_schema={"type": "object"},
+    )
+    assert captured_caps == ["platform.llm.structured"]
+
+
+@pytest.mark.asyncio
+async def test_invoke_llm_capability_routes_through_llm_caller() -> None:
+    """``invoke_llm_capability`` must use the long-timeout caller so the
+    ``LlmNamespace`` methods inherit the right latency tier even when
+    they're rebound or wrapped (e.g. by ``LlmFacade``)."""
+    counts = {"default": 0, "llm": 0}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ok_envelope({"hits": []}))
+
+    transport = httpx.MockTransport(responder)
+    client = httpx.AsyncClient(transport=transport, base_url="http://platform.test")
+    ns = build_platform_namespace(
+        _incoming_headers(),
+        agent_id="demo",
+        base_url="http://platform.test",
+        client=client,
+    )
+    assert isinstance(ns, PlatformNamespace)
+
+    # Patch each caller's ``invoke_with_diagnostics`` so we can witness
+    # which one ``invoke_llm_capability`` reaches for.
+    original_default = ns._caller.invoke_with_diagnostics  # noqa: SLF001
+    original_llm = ns._llm_caller.invoke_with_diagnostics  # noqa: SLF001
+
+    async def default_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        counts["default"] += 1
+        return await original_default(*args, **kwargs)
+
+    async def llm_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        counts["llm"] += 1
+        return await original_llm(*args, **kwargs)
+
+    ns._caller.invoke_with_diagnostics = default_wrapper  # type: ignore[method-assign]  # noqa: SLF001
+    ns._llm_caller.invoke_with_diagnostics = llm_wrapper  # type: ignore[method-assign]  # noqa: SLF001
+
+    await ns.invoke_capability("platform.knowledge.search", {"query": "x"})
+    await ns.invoke_llm_capability("platform.llm.chat", {"messages": []})
+
+    assert counts == {"default": 1, "llm": 1}

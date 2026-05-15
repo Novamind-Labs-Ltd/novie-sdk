@@ -70,6 +70,17 @@ DegradationKind = Literal[
 
 
 _DEFAULT_TIMEOUT_SECONDS = 8.0
+# LLM capability invocations go through the platform → provider (OpenRouter,
+# Anthropic, OpenAI) round-trip; ``platform.llm.structured`` against a
+# Pydantic schema with required fields routinely takes 10–30 s and can spike
+# higher under provider contention.  Reusing the 8 s default for short
+# capabilities (knowledge / checkpoints) here used to silently turn every
+# slow LLM call into ``httpx.ReadTimeout`` → ``_unwrap`` → ``{}`` → upstream
+# ``ProductBriefArtifact summary Field required`` validation error, which
+# read on the platform side as ``RemoteProtocolError`` once the analyst's
+# stream collapsed.  Treat LLM as its own latency tier so callers don't have
+# to second-guess the SDK default.
+_DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
@@ -313,6 +324,79 @@ class QuotaExceededError(RuntimeError):
         self.reason = reason
 
 
+class PlatformLlmCallError(RuntimeError):
+    """Raised when a ``platform.llm.*`` capability call cannot return a
+    usable result (transport error, platform 5xx, schema violation,
+    binding denied, platform unavailable).
+
+    Distinct from ``QuotaExceededError`` (which represents a *known*
+    business state that the agent should surface) — ``PlatformLlmCallError``
+    represents an *operational* failure where pretending the call returned
+    ``{}`` would silently corrupt downstream Pydantic / JSON-schema
+    validation.
+
+    Attributes:
+        capability_id: Platform capability that failed (e.g.
+            ``"platform.llm.structured"``).
+        kind: One of the ``DegradationKind`` values, mirroring the SDK's
+            ``CapabilityCallDiagnostics.kind``.  Use this to decide whether
+            a retry is meaningful (``transport_error`` may be transient,
+            ``binding_denied`` is not).
+        error_code: Platform envelope ``error_code`` when the failure
+            arrived as a non-OK envelope.  Empty string for transport-layer
+            failures.
+        detail: Human-readable explanation suitable for logs / metadata.
+    """
+
+    def __init__(
+        self,
+        *,
+        capability_id: str,
+        kind: DegradationKind | None,
+        error_code: str = "",
+        detail: str = "",
+    ) -> None:
+        message = (
+            f"platform LLM capability {capability_id!r} failed: "
+            f"kind={kind} error_code={error_code or '<none>'} detail={detail or '<none>'}"
+        )
+        super().__init__(message)
+        self.capability_id = capability_id
+        self.kind = kind
+        self.error_code = error_code
+        self.detail = detail
+
+    @property
+    def is_transient(self) -> bool:
+        """True when the failure category is plausibly retryable.
+
+        ``transport_error`` (httpx connect/read timeout, dropped TCP) and
+        ``platform_unavailable`` (5xx envelope without a binding code) are
+        treated as transient.  ``binding_denied`` and ``schema_violation``
+        are not — retrying without changing the request will yield the
+        same outcome.
+        """
+        return self.kind in {"transport_error", "platform_unavailable"}
+
+
+class PlatformLlmTransportError(PlatformLlmCallError):
+    """``PlatformLlmCallError`` subclass for transport-layer failures.
+
+    Kept as a distinct class so handler code can still
+    ``except PlatformLlmTransportError`` for the most common case
+    (httpx ``ReadTimeout`` / ``ConnectError``) without having to inspect
+    ``.kind``.
+    """
+
+    def __init__(self, *, capability_id: str, detail: str = "") -> None:
+        super().__init__(
+            capability_id=capability_id,
+            kind="transport_error",
+            error_code="",
+            detail=detail,
+        )
+
+
 class PlatformNamespaceProtocol(Protocol):
     """The shape of ``ctx.platform`` exposed to handlers."""
 
@@ -321,6 +405,10 @@ class PlatformNamespaceProtocol(Protocol):
     llm: "LlmNamespace"
 
     async def invoke_capability(
+        self, capability_id: str, arguments: Mapping[str, Any],
+    ) -> CapabilityCallDiagnostics: ...
+
+    async def invoke_llm_capability(
         self, capability_id: str, arguments: Mapping[str, Any],
     ) -> CapabilityCallDiagnostics: ...
 
@@ -507,6 +595,11 @@ class LlmNamespace:
     All methods raise ``QuotaExceededError`` when the platform returns
     ``error_code="quota_exceeded"`` so the agent can surface a clear
     message and stop processing, rather than receiving an opaque error.
+
+    All methods raise ``PlatformLlmTransportError`` /
+    ``PlatformLlmCallError`` (instead of returning ``{}``) when the
+    platform call cannot complete; this prevents transport timeouts from
+    being silently fed into Pydantic / JSON-schema validation downstream.
     """
 
     def __init__(self, parent: "PlatformNamespace") -> None:  # noqa: F821
@@ -538,7 +631,7 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
-        diagnostics = await self._parent.invoke_capability(_LLM_CHAT_CAP, args)
+        diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
         return self._unwrap(diagnostics, _LLM_CHAT_CAP)
 
     async def structured(
@@ -548,6 +641,8 @@ class LlmNamespace:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        method: str | None = None,
+        strict: bool | None = None,
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM with a JSON-schema structured output.
 
@@ -556,6 +651,12 @@ class LlmNamespace:
             output_schema: JSON Schema dict describing the expected output.
             model: Optional model override.
             temperature: Sampling temperature override.
+            method: Structured-output method (``json_schema``, ``function_calling``,
+                or ``json_mode``).  ``None`` lets the platform pick the default
+                (``json_schema``).
+            strict: Force strict-mode structured output.  ``None`` lets the
+                platform default kick in (currently ``True``); explicit ``False``
+                disables strict for callers whose schema isn't strict-compatible.
 
         Returns:
             ``{"structured": {...}}`` on success.
@@ -571,7 +672,11 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
-        diagnostics = await self._parent.invoke_capability(_LLM_STRUCTURED_CAP, args)
+        if method is not None:
+            args["method"] = method
+        if strict is not None:
+            args["strict"] = strict
+        diagnostics = await self._parent.invoke_llm_capability(_LLM_STRUCTURED_CAP, args)
         return self._unwrap(diagnostics, _LLM_STRUCTURED_CAP)
 
     async def embed(
@@ -592,7 +697,7 @@ class LlmNamespace:
         args: dict[str, Any] = {"texts": texts}
         if model:
             args["model"] = model
-        diagnostics = await self._parent.invoke_capability(_LLM_EMBED_CAP, args)
+        diagnostics = await self._parent.invoke_llm_capability(_LLM_EMBED_CAP, args)
         result = self._unwrap(diagnostics, _LLM_EMBED_CAP)
         embeddings = result.get("embeddings") or []
         return [list(v) for v in embeddings if isinstance(v, (list, tuple))]
@@ -604,7 +709,7 @@ class LlmNamespace:
         "total_tokens": int, "exhausted": bool}``.  Returns an empty
         dict on error (non-raising).
         """
-        diagnostics = await self._parent.invoke_capability(_LLM_BUDGET_CHECK_CAP, {})
+        diagnostics = await self._parent.invoke_llm_capability(_LLM_BUDGET_CHECK_CAP, {})
         if not diagnostics.ok:
             return {}
         return dict(diagnostics.result or {})
@@ -618,7 +723,7 @@ class LlmNamespace:
         Returns:
             Summary dict on success, ``{}`` on error (non-raising).
         """
-        diagnostics = await self._parent.invoke_capability(
+        diagnostics = await self._parent.invoke_llm_capability(
             _LLM_USAGE_SUMMARY_CAP, {"scope": scope},
         )
         if not diagnostics.ok:
@@ -636,7 +741,23 @@ class LlmNamespace:
                     remaining_tokens=int(result.get("remaining_tokens", 0)),
                     reason=result.get("reason", "org token pool exhausted"),
                 )
-            return {}
+            # Pre-0.3.3 SDKs returned ``{}`` here, which let the analyst
+            # finalize chain interpret a transport failure as a successful
+            # but empty LLM response (``ProductBriefArtifact summary Field
+            # required``).  Surface the failure instead so callers can
+            # retry, fall back, or fail loud — never silently feed an empty
+            # dict into a Pydantic schema.
+            if diagnostics.kind == "transport_error":
+                raise PlatformLlmTransportError(
+                    capability_id=capability_id,
+                    detail=diagnostics.detail,
+                )
+            raise PlatformLlmCallError(
+                capability_id=capability_id,
+                kind=diagnostics.kind,
+                error_code=diagnostics.error_code,
+                detail=diagnostics.detail,
+            )
         result = diagnostics.result or {}
         if result.get("error") == "quota_exceeded":
             raise QuotaExceededError(
@@ -653,11 +774,17 @@ class LlmNamespace:
 class PlatformNamespace:
     """Live ``ctx.platform`` for an SDK agent.
 
-    Owns the ``_CapabilityCaller`` and exposes typed sub-namespaces.
-    Records every non-OK call on ``_diagnostics`` so handlers can
-    surface them via ``last_diagnostics()`` (acceptance bullet
-    "Callback failures degrade predictably and can be reported in
-    final metadata").
+    Owns two ``_CapabilityCaller`` instances — a "default" one (short
+    timeout, used by knowledge / checkpoints / arbitrary capabilities)
+    and an "llm" one (long timeout, used by ``LlmNamespace``).  Splitting
+    them avoids the historical pitfall where a 8 s default turned every
+    real LLM round-trip into ``httpx.ReadTimeout`` and made the SDK return
+    ``{}`` to callers; LLM gets its own latency tier so callers don't
+    have to second-guess.
+
+    Records every non-OK call on ``_diagnostics`` so handlers can surface
+    them via ``last_diagnostics()`` (acceptance bullet "Callback failures
+    degrade predictably and can be reported in final metadata").
     """
 
     knowledge: KnowledgeNamespace
@@ -669,8 +796,14 @@ class PlatformNamespace:
         caller: _CapabilityCaller,
         *,
         default_project_id: str = "",
+        llm_caller: _CapabilityCaller | None = None,
     ) -> None:
         self._caller = caller
+        # Falls back to the default caller for backward compatibility with
+        # callers that build a ``PlatformNamespace`` directly (mostly tests).
+        # ``build_platform_namespace`` always provides a dedicated long-
+        # timeout caller in production.
+        self._llm_caller = llm_caller or caller
         self.default_project_id = default_project_id
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self.knowledge = KnowledgeNamespace(self)
@@ -687,6 +820,25 @@ class PlatformNamespace:
         arguments: Mapping[str, Any],
     ) -> CapabilityCallDiagnostics:
         diagnostics = await self._caller.invoke_with_diagnostics(
+            capability_id, arguments,
+        )
+        if not diagnostics.ok:
+            self._diagnostics.append(diagnostics)
+        return diagnostics
+
+    async def invoke_llm_capability(
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+    ) -> CapabilityCallDiagnostics:
+        """Invoke a ``platform.llm.*`` capability with the long-timeout caller.
+
+        Used by ``LlmNamespace`` so ``platform.llm.structured`` (which can
+        legitimately take 30+ seconds against Anthropic / OpenAI) doesn't
+        share the 8 s default that's appropriate for short capabilities
+        like knowledge / checkpoints.
+        """
+        diagnostics = await self._llm_caller.invoke_with_diagnostics(
             capability_id, arguments,
         )
         if not diagnostics.ok:
@@ -742,6 +894,13 @@ class _UnavailablePlatformNamespace:
         self._diagnostics.append(diagnostics)
         return diagnostics
 
+    async def invoke_llm_capability(
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+    ) -> CapabilityCallDiagnostics:
+        return await self.invoke_capability(capability_id, arguments)
+
     def last_diagnostics(self) -> tuple[CapabilityCallDiagnostics, ...]:
         return tuple(self._diagnostics)
 
@@ -758,6 +917,7 @@ def build_platform_namespace(
     agent_id: str,
     base_url: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    llm_timeout_seconds: float = _DEFAULT_LLM_TIMEOUT_SECONDS,
     client: httpx.AsyncClient | None = None,
 ) -> PlatformNamespace | _UnavailablePlatformNamespace:
     """Construct a per-request ``ctx.platform`` from incoming A2A
@@ -768,8 +928,18 @@ def build_platform_namespace(
     base URL is missing or required tenant/project headers are absent;
     handlers can read ``platform.is_available`` to branch.
 
+    ``timeout_seconds`` controls the short-capability caller (knowledge,
+    checkpoints, etc.); ``llm_timeout_seconds`` controls the dedicated
+    LLM caller.  The LLM tier defaults to 120 s because
+    ``platform.llm.structured`` against a Pydantic schema with required
+    fields routinely takes 10–30 s and can spike higher under provider
+    contention; sharing the 8 s default would silently turn slow LLM
+    calls into ``httpx.ReadTimeout`` → ``_unwrap`` → ``{}`` → upstream
+    Pydantic validation errors.
+
     ``client`` lets tests inject an ``httpx.AsyncClient`` (e.g. one
     bound to an ASGI transport) without booting a real HTTP server.
+    The same client is reused for both callers when supplied.
     """
     base = (base_url or os.getenv("NOVIE_PLATFORM_BASE_URL", "") or "").strip()
     if not base:
@@ -793,9 +963,17 @@ def build_platform_namespace(
         timeout_seconds=timeout_seconds,
         client=client,
     )
+    llm_caller = _CapabilityCaller(
+        base,
+        forward_headers,
+        agent_id=agent_id,
+        timeout_seconds=llm_timeout_seconds,
+        client=client,
+    )
     return PlatformNamespace(
         caller,
         default_project_id=forward_headers["x-novie-project-id"],
+        llm_caller=llm_caller,
     )
 
 
@@ -805,6 +983,8 @@ __all__ = [
     "DegradationKind",
     "KnowledgeNamespace",
     "LlmNamespace",
+    "PlatformLlmCallError",
+    "PlatformLlmTransportError",
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
     "QuotaExceededError",

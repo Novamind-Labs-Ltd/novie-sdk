@@ -187,8 +187,19 @@ class ByokLlmClient:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        method: str | None = None,
+        strict: bool | None = None,
     ) -> dict[str, Any]:
         """Structured JSON-schema output using the agent's own key.
+
+        ``method``/``strict`` are forwarded to
+        ``ChatOpenAI.with_structured_output`` so BYOK and platform modes
+        produce equivalent wire-level requests when the same arguments are
+        supplied.  Defaults are conservative: when both are ``None`` we mirror
+        the dict-schema behaviour of langchain_openai (json_schema, strict
+        falls back to ``False`` per langchain's own default).  Pass
+        ``strict=True`` to get the same hard-schema enforcement a direct
+        ``with_structured_output(PydanticClass)`` call would get.
 
         Returns ``{"structured": {...}}``.
         """
@@ -206,7 +217,12 @@ class ByokLlmClient:
             return HumanMessage(content=content)
 
         llm = self._build_chat_model(model=model, temperature=temperature)
-        structured_llm = llm.with_structured_output(output_schema)
+        structured_kwargs: dict[str, Any] = {}
+        if method is not None:
+            structured_kwargs["method"] = method
+        if strict is not None:
+            structured_kwargs["strict"] = strict
+        structured_llm = llm.with_structured_output(output_schema, **structured_kwargs)
         response = await structured_llm.ainvoke([_to_msg(m) for m in messages])
         if hasattr(response, "model_dump"):
             value = response.model_dump()
