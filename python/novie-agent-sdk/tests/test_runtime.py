@@ -28,6 +28,7 @@ from novie_agent_sdk.runtime import (
     Agent,
     InMemoryTaskStore,
     InvokeContext,
+    RegistrationClient,
     RequestHeaders,
     SqliteOneShotInvocationStore,
     SqliteTaskStore,
@@ -92,6 +93,61 @@ def _tasks_manifest(agent_id: str = "test-tasks") -> AgentManifestV2:
         endpoint="http://localhost:8001",
         execution=ExecutionHints(supports_cancel=True, emits_events=True),
     )
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+@pytest.mark.asyncio
+async def test_registration_client_reregisters_after_heartbeat_404(monkeypatch):
+    import httpx
+
+    calls: list[str] = []
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):
+            calls.append(url)
+            if url.endswith("/agents/register"):
+                return _FakeHttpResponse(201)
+            if url.endswith("/agents/recoverable/heartbeat"):
+                return _FakeHttpResponse(404)
+            return _FakeHttpResponse(500)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    client = RegistrationClient(
+        "http://platform",
+        _simple_manifest("recoverable"),
+        heartbeat_interval=0.01,
+        register_max_attempts=1,
+    )
+
+    await client.start_heartbeat()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if "http://platform/agents/register" in calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await client.stop_heartbeat()
+
+    assert "http://platform/agents/recoverable/heartbeat" in calls
+    assert "http://platform/agents/register" in calls
 
 
 # ─────────────────────────────────────────────────────────────────────────────

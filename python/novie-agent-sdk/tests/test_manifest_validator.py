@@ -47,6 +47,10 @@ def _config(**overrides) -> AgentYamlConfig:
             "version": "0.2.0",
             "type": "artifact_agent",
         },
+        "description": (
+            "Test fixture analyst agent that extracts structured "
+            "requirements from input documents."
+        ),
         "capabilities": ["agent.analyst.do_thing"],
         "outputs": {"provides": ["analysis_artifact"]},
         "runtime": {"port": 8010},

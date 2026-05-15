@@ -1200,6 +1200,13 @@ class RegistrationClient:
                         f"{self._platform_url}/agents/{self._manifest.agent_id}/heartbeat",
                         headers=self._auth_headers(),
                     )
+                    if resp.status_code == 404:
+                        _log.info(
+                            "heartbeat returned 404; re-registering with Platform agent_id=%s",
+                            self._manifest.agent_id,
+                        )
+                        await self.register()
+                        continue
                     if resp.status_code not in (200, 204):
                         _log.debug("heartbeat returned %s", resp.status_code)
             except asyncio.CancelledError:

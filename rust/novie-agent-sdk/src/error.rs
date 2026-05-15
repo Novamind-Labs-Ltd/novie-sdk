@@ -52,6 +52,14 @@ pub enum Error {
         callback_id: Option<String>,
     },
 
+    /// Platform-managed LLM call was denied because the org token pool is exhausted.
+    #[error("quota exceeded: {message} (org_id={org_id:?}, remaining_tokens={remaining_tokens:?})")]
+    QuotaExceeded {
+        message: String,
+        org_id: Option<String>,
+        remaining_tokens: Option<u64>,
+    },
+
     /// `verify_callback_token` rejected because exp ≤ now.
     #[error("callback token expired")]
     TokenExpired,
@@ -94,6 +102,7 @@ impl Error {
             | Error::Protocol { http_status, .. }
             | Error::Unavailable { http_status, .. }
             | Error::Callback { http_status, .. } => *http_status,
+            Error::QuotaExceeded { .. } => Some(403),
             _ => None,
         }
     }
@@ -106,6 +115,7 @@ impl Error {
             | Error::Protocol { code, .. }
             | Error::Unavailable { code, .. }
             | Error::Callback { code, .. } => code.as_deref(),
+            Error::QuotaExceeded { .. } => Some("quota_exceeded"),
             _ => None,
         }
     }

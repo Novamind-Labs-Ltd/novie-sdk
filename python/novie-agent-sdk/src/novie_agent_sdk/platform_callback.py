@@ -89,6 +89,7 @@ def sign_platform_callback_headers(
             _normalize_path(path),
             out.get("x-novie-org-id", ""),
             out.get("x-novie-project-id", ""),
+            out.get("x-novie-workspace-id", ""),
             out.get("x-novie-user-id", ""),
             out.get("x-novie-service-principal", ""),
             out.get("x-novie-session-id", ""),

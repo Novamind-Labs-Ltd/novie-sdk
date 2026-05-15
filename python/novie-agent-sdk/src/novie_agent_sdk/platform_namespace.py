@@ -75,6 +75,11 @@ _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
 _CHECKPOINT_GET_CAP = "platform.external_agent_checkpoint.get"
 _CHECKPOINT_LIST_CAP = "platform.external_agent_checkpoint.list"
+_LLM_CHAT_CAP = "platform.llm.chat"
+_LLM_STRUCTURED_CAP = "platform.llm.structured"
+_LLM_EMBED_CAP = "platform.llm.embed"
+_LLM_BUDGET_CHECK_CAP = "platform.llm.budget_check"
+_LLM_USAGE_SUMMARY_CAP = "platform.llm.usage_summary"
 
 
 # ── Diagnostics ─────────────────────────────────────────────────────────────
@@ -281,11 +286,39 @@ def _safe_text(response: httpx.Response) -> str:
 # ── Namespaces ──────────────────────────────────────────────────────────────
 
 
+class QuotaExceededError(RuntimeError):
+    """Raised when the organisation's token pool is exhausted.
+
+    External agents should catch this at the task boundary and surface
+    a user-visible "organisation token pool exhausted" message rather
+    than retrying — retrying won't help until the pool is refilled.
+
+    Attributes:
+        org_id: Organisation whose pool was exhausted.
+        remaining_tokens: Remaining tokens at the time of the check
+            (will be 0 or very close to 0).
+        reason: Human-readable explanation from the platform.
+    """
+
+    def __init__(
+        self,
+        *,
+        org_id: str = "",
+        remaining_tokens: int = 0,
+        reason: str = "org token pool exhausted",
+    ) -> None:
+        super().__init__(reason)
+        self.org_id = org_id
+        self.remaining_tokens = remaining_tokens
+        self.reason = reason
+
+
 class PlatformNamespaceProtocol(Protocol):
     """The shape of ``ctx.platform`` exposed to handlers."""
 
     knowledge: "KnowledgeNamespace"
     checkpoints: "CheckpointsNamespace"
+    llm: "LlmNamespace"
 
     async def invoke_capability(
         self, capability_id: str, arguments: Mapping[str, Any],
@@ -460,6 +493,160 @@ class CheckpointsNamespace:
         return [dict(entry) for entry in items if isinstance(entry, dict)]
 
 
+class LlmNamespace:
+    """``platform.llm.*`` — platform-managed LLM calls for connected agents.
+
+    When an external agent is connected to the Novie platform it should
+    use these methods instead of calling an LLM provider directly.
+    Benefits:
+    - No provider key required in the agent environment.
+    - Usage is metered against the org token pool.
+    - Hard stop when the pool is exhausted (``QuotaExceededError``).
+    - Full audit trail and cost reporting in the Novie UI.
+
+    All methods raise ``QuotaExceededError`` when the platform returns
+    ``error_code="quota_exceeded"`` so the agent can surface a clear
+    message and stop processing, rather than receiving an opaque error.
+    """
+
+    def __init__(self, parent: "PlatformNamespace") -> None:  # noqa: F821
+        self._parent = parent
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """Invoke the platform chat LLM.
+
+        Args:
+            messages: List of ``{"role": ..., "content": ...}`` dicts.
+            model: Optional model override (e.g. ``"anthropic/claude-opus-4.6"``).
+                   Defaults to the platform-configured model.
+            temperature: Sampling temperature override.
+
+        Returns:
+            ``{"content": str, "usage_metadata": {...}}`` on success.
+
+        Raises:
+            QuotaExceededError: Org token pool is exhausted.
+        """
+        args: dict[str, Any] = {"messages": messages}
+        if model:
+            args["model"] = model
+        if temperature is not None:
+            args["temperature"] = temperature
+        diagnostics = await self._parent.invoke_capability(_LLM_CHAT_CAP, args)
+        return self._unwrap(diagnostics, _LLM_CHAT_CAP)
+
+    async def structured(
+        self,
+        messages: list[dict[str, str]],
+        output_schema: dict[str, Any],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """Invoke the platform chat LLM with a JSON-schema structured output.
+
+        Args:
+            messages: Conversation messages.
+            output_schema: JSON Schema dict describing the expected output.
+            model: Optional model override.
+            temperature: Sampling temperature override.
+
+        Returns:
+            ``{"structured": {...}}`` on success.
+
+        Raises:
+            QuotaExceededError: Org token pool is exhausted.
+        """
+        args: dict[str, Any] = {
+            "messages": messages,
+            "output_schema": output_schema,
+        }
+        if model:
+            args["model"] = model
+        if temperature is not None:
+            args["temperature"] = temperature
+        diagnostics = await self._parent.invoke_capability(_LLM_STRUCTURED_CAP, args)
+        return self._unwrap(diagnostics, _LLM_STRUCTURED_CAP)
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str | None = None,
+    ) -> list[list[float]]:
+        """Generate embeddings with the platform embedding model.
+
+        Returns:
+            List of embedding vectors (one per input text).  Returns
+            ``[]`` on non-quota errors (degraded mode).
+
+        Raises:
+            QuotaExceededError: Org token pool is exhausted.
+        """
+        args: dict[str, Any] = {"texts": texts}
+        if model:
+            args["model"] = model
+        diagnostics = await self._parent.invoke_capability(_LLM_EMBED_CAP, args)
+        result = self._unwrap(diagnostics, _LLM_EMBED_CAP)
+        embeddings = result.get("embeddings") or []
+        return [list(v) for v in embeddings if isinstance(v, (list, tuple))]
+
+    async def budget_check(self) -> dict[str, Any]:
+        """Check the current org token pool status without consuming tokens.
+
+        Returns a dict with at minimum ``{"remaining_tokens": int,
+        "total_tokens": int, "exhausted": bool}``.  Returns an empty
+        dict on error (non-raising).
+        """
+        diagnostics = await self._parent.invoke_capability(_LLM_BUDGET_CHECK_CAP, {})
+        if not diagnostics.ok:
+            return {}
+        return dict(diagnostics.result or {})
+
+    async def usage_summary(self, *, scope: str = "session") -> dict[str, Any]:
+        """Fetch the cumulative LLM usage summary for the given scope.
+
+        Args:
+            scope: One of ``"session"``, ``"org"``, ``"project"``, ``"user"``.
+
+        Returns:
+            Summary dict on success, ``{}`` on error (non-raising).
+        """
+        diagnostics = await self._parent.invoke_capability(
+            _LLM_USAGE_SUMMARY_CAP, {"scope": scope},
+        )
+        if not diagnostics.ok:
+            return {}
+        return dict(diagnostics.result or {})
+
+    def _unwrap(
+        self, diagnostics: CapabilityCallDiagnostics, capability_id: str
+    ) -> dict[str, Any]:
+        if not diagnostics.ok:
+            if diagnostics.error_code == "quota_exceeded":
+                result = diagnostics.result or {}
+                raise QuotaExceededError(
+                    org_id=result.get("org_id", ""),
+                    remaining_tokens=int(result.get("remaining_tokens", 0)),
+                    reason=result.get("reason", "org token pool exhausted"),
+                )
+            return {}
+        result = diagnostics.result or {}
+        if result.get("error") == "quota_exceeded":
+            raise QuotaExceededError(
+                org_id=result.get("org_id", ""),
+                remaining_tokens=int(result.get("remaining_tokens", 0)),
+                reason=result.get("reason", "org token pool exhausted"),
+            )
+        return result
+
+
 # ── Top-level namespace ─────────────────────────────────────────────────────
 
 
@@ -475,6 +662,7 @@ class PlatformNamespace:
 
     knowledge: KnowledgeNamespace
     checkpoints: CheckpointsNamespace
+    llm: LlmNamespace
 
     def __init__(
         self,
@@ -487,6 +675,7 @@ class PlatformNamespace:
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self.knowledge = KnowledgeNamespace(self)
         self.checkpoints = CheckpointsNamespace(self)
+        self.llm = LlmNamespace(self)
 
     @property
     def is_available(self) -> bool:
@@ -524,6 +713,7 @@ class _UnavailablePlatformNamespace:
 
     knowledge: KnowledgeNamespace
     checkpoints: CheckpointsNamespace
+    llm: LlmNamespace
 
     def __init__(self, *, reason: str) -> None:
         self._reason = reason
@@ -531,6 +721,7 @@ class _UnavailablePlatformNamespace:
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self.knowledge = KnowledgeNamespace(self)  # type: ignore[arg-type]
         self.checkpoints = CheckpointsNamespace(self)  # type: ignore[arg-type]
+        self.llm = LlmNamespace(self)  # type: ignore[arg-type]
 
     @property
     def is_available(self) -> bool:
@@ -613,8 +804,10 @@ __all__ = [
     "CheckpointsNamespace",
     "DegradationKind",
     "KnowledgeNamespace",
+    "LlmNamespace",
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
+    "QuotaExceededError",
     "build_platform_namespace",
     "classify_envelope_error",
 ]

@@ -48,6 +48,7 @@ def test_sign_callback_headers_matches_gateway_canonical_shape() -> None:
         {
             "x-novie-org-id": "tenant-1",
             "x-novie-project-id": "project-1",
+            "x-novie-workspace-id": "workspace-1",
             "x-novie-user-id": "user-1",
             "x-novie-session-id": "session-1",
             "x-novie-request-id": "request-1",
@@ -60,6 +61,8 @@ def test_sign_callback_headers_matches_gateway_canonical_shape() -> None:
 
     assert headers["x-novie-timestamp"] == "100"
     assert headers["x-novie-sig"].startswith("sha256=")
+    # Signature includes workspace_id to match gateway trusted-header canonical.
+    assert headers["x-novie-workspace-id"] == "workspace-1"
 
 
 @pytest.mark.asyncio

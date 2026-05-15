@@ -92,8 +92,10 @@ from .platform_namespace import (
     CheckpointsNamespace,
     DegradationKind,
     KnowledgeNamespace,
+    LlmNamespace,
     PlatformNamespace,
     PlatformNamespaceProtocol,
+    QuotaExceededError,
     build_platform_namespace,
     classify_envelope_error,
 )
@@ -127,6 +129,13 @@ from .openapi_provider import (
     generate_provider_files,
     load_semantics,
     operation_ids,
+)
+from .byok_llm import (
+    BYOK_API_KEY_ENV,
+    BYOK_BASE_URL_ENV,
+    BYOK_EMBED_MODEL_ENV,
+    BYOK_MODEL_ENV,
+    ByokLlmClient,
 )
 from .worker_facade import (
     HumanWaitRequest,
@@ -177,13 +186,15 @@ __all__ = [
     "TaskContext",
     "TaskRecord",
     "PlatformCallbackClient",
-    # Platform callback namespace (EXPERT_AGENT_SDK W4)
+    # Platform callback namespace (EXPERT_AGENT_SDK W4) + platform LLM API
     "CapabilityCallDiagnostics",
     "CheckpointsNamespace",
     "DegradationKind",
     "KnowledgeNamespace",
+    "LlmNamespace",
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
+    "QuotaExceededError",
     "build_platform_namespace",
     "classify_envelope_error",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)
@@ -233,6 +244,12 @@ __all__ = [
     "load_semantics",
     "operation_ids",
     "render_brief_for_prompt",
+    # BYOK (standalone mode) LLM wrapper
+    "BYOK_API_KEY_ENV",
+    "BYOK_BASE_URL_ENV",
+    "BYOK_EMBED_MODEL_ENV",
+    "BYOK_MODEL_ENV",
+    "ByokLlmClient",
     "sign_platform_callback_headers",
     "assert_http_json_agent_card",
     "assert_http_json_healthcheck",

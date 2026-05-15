@@ -85,6 +85,7 @@ pub mod error;
 pub mod long_task;
 pub mod memory;
 pub mod payload;
+pub mod platform_llm;
 pub mod platform_services;
 pub mod session;
 pub mod token;
@@ -95,6 +96,10 @@ pub use call_scope::{AgentCallScope, extract_call_scope};
 pub use error::{Error, Result};
 pub use long_task::{LongTaskCompletion, LongTaskStatus, notify_long_task_complete};
 pub use payload::{AgentInvokePayload, AgentStatusCallbackConfig, PlatformCallbackConfig};
+pub use platform_llm::{
+    ChatMessage, ChatOptions, EmbedOptions, PlatformLlmClient, PlatformLlmIdentity,
+    StructuredOptions,
+};
 pub use platform_services::PlatformServicesClient;
 pub use token::{
     CallbackTokenClaims, MintContext, mint_callback_token, mint_with_clock, verify_callback_token,
