@@ -5,6 +5,9 @@
   GET  /.well-known/agent.json
   POST /invoke              (simple mode)
   POST /stream              (stream mode)
+  GET  /invocations/{invocation_id}
+  GET  /invocations/{invocation_id}/events
+  GET  /invocations/{invocation_id}/result
   POST /tasks               (tasks mode)
   GET  /tasks/{task_id}
   GET  /tasks/{task_id}/events
@@ -665,6 +668,7 @@ _DEFAULT_INVOCATION_HEARTBEAT_EVENTS = _env_int(
 class OneShotInvocationRecord:
     idempotency_key: str
     mode: str
+    invocation_id: str = field(default_factory=lambda: f"inv-{uuid.uuid4().hex}")
     status: str = "in_progress"
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
@@ -705,6 +709,11 @@ class OneShotInvocationStore(Protocol):
     ) -> None: ...
 
     async def fail(self, idempotency_key: str, mode: str, error: str) -> None: ...
+
+    async def get_by_invocation_id(
+        self,
+        invocation_id: str,
+    ) -> OneShotInvocationRecord | None: ...
 
     async def touch(self, idempotency_key: str, mode: str) -> None:
         """Renew the lease on an ``in_progress`` record. No-op if record is
@@ -781,6 +790,16 @@ class InMemoryOneShotInvocationStore:
             record.updated_at = _now_iso()
             record.error = error
 
+    async def get_by_invocation_id(
+        self,
+        invocation_id: str,
+    ) -> OneShotInvocationRecord | None:
+        async with self._lock:
+            for record in self._records.values():
+                if record.invocation_id == invocation_id:
+                    return record
+        return None
+
     async def touch(self, idempotency_key: str, mode: str) -> None:
         """Renew the lease on an ``in_progress`` record. Silent no-op for
         absent records or those already in a terminal state."""
@@ -842,6 +861,7 @@ class SqliteOneShotInvocationStore:
                         """
                         UPDATE sdk_one_shot_invocations
                         SET status = 'in_progress',
+                            invocation_id = ?,
                             created_at = ?,
                             updated_at = ?,
                             response_json = NULL,
@@ -849,16 +869,19 @@ class SqliteOneShotInvocationStore:
                             error = NULL
                         WHERE mode = ? AND idempotency_key = ?
                         """,
-                        (now, now, mode, idempotency_key),
+                        (f"inv-{uuid.uuid4().hex}", now, now, mode, idempotency_key),
                     )
                     conn.commit()
-                    return True, OneShotInvocationRecord(
-                        idempotency_key=idempotency_key,
-                        mode=mode,
-                        status="in_progress",
-                        created_at=now,
-                        updated_at=now,
+                    refreshed = self._row_to_record(
+                        conn.execute(
+                            """
+                            SELECT * FROM sdk_one_shot_invocations
+                            WHERE mode = ? AND idempotency_key = ?
+                            """,
+                            (mode, idempotency_key),
+                        ).fetchone()
                     )
+                    return True, refreshed
                 return False, existing
             record = OneShotInvocationRecord(
                 idempotency_key=idempotency_key,
@@ -867,13 +890,14 @@ class SqliteOneShotInvocationStore:
             conn.execute(
                 """
                 INSERT INTO sdk_one_shot_invocations (
-                    mode, idempotency_key, status, created_at, updated_at,
+                    mode, idempotency_key, invocation_id, status, created_at, updated_at,
                     response_json, events_json, error
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     mode,
                     idempotency_key,
+                    record.invocation_id,
                     record.status,
                     record.created_at,
                     record.updated_at,
@@ -941,6 +965,27 @@ class SqliteOneShotInvocationStore:
             )
             conn.commit()
 
+    async def get_by_invocation_id(
+        self,
+        invocation_id: str,
+    ) -> OneShotInvocationRecord | None:
+        return await asyncio.to_thread(self._get_by_invocation_id_sync, invocation_id)
+
+    def _get_by_invocation_id_sync(
+        self,
+        invocation_id: str,
+    ) -> OneShotInvocationRecord | None:
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT * FROM sdk_one_shot_invocations
+                WHERE invocation_id = ?
+                """,
+                (invocation_id,),
+            ).fetchone()
+            return self._row_to_record(row) if row is not None else None
+
     async def touch(self, idempotency_key: str, mode: str) -> None:
         await asyncio.to_thread(self._touch_sync, idempotency_key, mode)
 
@@ -963,6 +1008,7 @@ class SqliteOneShotInvocationStore:
         return OneShotInvocationRecord(
             idempotency_key=str(row["idempotency_key"]),
             mode=str(row["mode"]),
+            invocation_id=str(row["invocation_id"] or f"inv-{uuid.uuid4().hex}"),
             status=str(row["status"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
@@ -978,6 +1024,7 @@ class SqliteOneShotInvocationStore:
                 CREATE TABLE IF NOT EXISTS sdk_one_shot_invocations (
                     mode TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
+                    invocation_id TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -987,6 +1034,22 @@ class SqliteOneShotInvocationStore:
                     PRIMARY KEY (mode, idempotency_key)
                 )
                 """,
+            )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(sdk_one_shot_invocations)")
+            }
+            if "invocation_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE sdk_one_shot_invocations "
+                    "ADD COLUMN invocation_id TEXT"
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                ix_sdk_one_shot_invocations_invocation_id
+                ON sdk_one_shot_invocations(invocation_id)
+                """
             )
             conn.commit()
 
@@ -1007,10 +1070,57 @@ def _duplicate_one_shot_response(record: OneShotInvocationRecord) -> Any:
                     "idempotency_key": record.idempotency_key,
                     "mode": record.mode,
                     "status": record.status,
+                    "invocation_id": record.invocation_id,
+                    "resume_ref": {
+                        "type": (
+                            "stream_invocation"
+                            if record.mode == "stream"
+                            else "invoke_invocation"
+                        ),
+                        "id": record.invocation_id,
+                    },
                 },
             }
         },
     )
+
+
+def _one_shot_invocation_view(record: OneShotInvocationRecord) -> dict[str, Any]:
+    return {
+        "invocation_id": record.invocation_id,
+        "idempotency_key": record.idempotency_key,
+        "mode": record.mode,
+        "status": record.status,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "error": record.error,
+    }
+
+
+def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    chunks: list[str] = []
+    final_output: dict[str, Any] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or event.get("type") or "")
+        if kind == "content":
+            text = str(event.get("content") or event.get("text") or "")
+            if text:
+                chunks.append(text)
+        if kind in {"done", "final", "task_completed"}:
+            output = event.get("output")
+            if isinstance(output, dict) and output:
+                final_output = dict(output)
+    transcript = "".join(chunks)
+    return {
+        "status": "completed",
+        "output": {
+            "content": transcript,
+            **final_output,
+            "transcript": transcript,
+        },
+    }
 
 
 _INVOKE_RESPONSE_STATUSES = {
@@ -1975,6 +2085,56 @@ class Agent:
         async def agent_json():
             return JSONResponse(m.to_dict())
 
+        @app.get("/invocations/{invocation_id}")
+        async def get_invocation(invocation_id: str, request: Request):
+            hdrs = RequestHeaders.from_request(request.headers)
+            _verify_agent_request_headers(hdrs)
+            validate_tenant_context(hdrs)
+            record = await self._invocation_store.get_by_invocation_id(invocation_id)
+            if record is None:
+                raise HTTPException(404, f"Invocation {invocation_id!r} not found")
+            return _one_shot_invocation_view(record)
+
+        @app.get("/invocations/{invocation_id}/events")
+        async def get_invocation_events(invocation_id: str, request: Request):
+            hdrs = RequestHeaders.from_request(request.headers)
+            _verify_agent_request_headers(hdrs)
+            validate_tenant_context(hdrs)
+            record = await self._invocation_store.get_by_invocation_id(invocation_id)
+            if record is None:
+                raise HTTPException(404, f"Invocation {invocation_id!r} not found")
+            return {
+                **_one_shot_invocation_view(record),
+                "events": list(record.events or []),
+            }
+
+        @app.get("/invocations/{invocation_id}/result")
+        async def get_invocation_result(invocation_id: str, request: Request):
+            hdrs = RequestHeaders.from_request(request.headers)
+            _verify_agent_request_headers(hdrs)
+            validate_tenant_context(hdrs)
+            record = await self._invocation_store.get_by_invocation_id(invocation_id)
+            if record is None:
+                raise HTTPException(404, f"Invocation {invocation_id!r} not found")
+            if record.status != "completed":
+                raise HTTPException(
+                    409,
+                    detail={
+                        "error": "invocation_not_terminal",
+                        "invocation_id": invocation_id,
+                        "status": record.status,
+                    },
+                )
+            response = (
+                record.response
+                if record.response is not None
+                else _stream_response_from_events(list(record.events or []))
+            )
+            return {
+                **_one_shot_invocation_view(record),
+                **response,
+            }
+
         # simple mode
         if m.protocol_mode == "simple" or self._invoke_handler is not None:
             @app.post("/invoke")
@@ -2163,6 +2323,11 @@ class Agent:
                                     await self._invocation_store.complete(
                                         hdrs.idempotency_key,
                                         "stream",
+                                        response={
+                                            "status": "failed",
+                                            "error": str(payload),
+                                            "output": {},
+                                        },
                                         events=emitted_events,
                                     )
                                     invocation_resolved = True
@@ -2194,6 +2359,7 @@ class Agent:
                                 await self._invocation_store.complete(
                                     hdrs.idempotency_key,
                                     "stream",
+                                    response=_stream_response_from_events(emitted_events),
                                     events=emitted_events,
                                 )
                                 invocation_resolved = True
