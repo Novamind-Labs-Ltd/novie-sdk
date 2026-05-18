@@ -18,8 +18,8 @@ This is a monorepo with two SDKs, so releases are tagged with a language prefix:
 
 | SDK | Tag pattern | Example |
 | --- | --- | --- |
-| Python | `python-v<semver>` | `python-v0.3.0` |
-| Rust | `rust-v<semver>` | `rust-v0.2.0` |
+| Python | `python-v<semver>` | `python-v0.3.2` |
+| Rust | `rust-v<semver>` | `rust-v0.3.2` |
 
 Consumers pin to a specific tag. The release workflow at [`.github/workflows/release.yml`](../.github/workflows/release.yml) creates these tags automatically.
 

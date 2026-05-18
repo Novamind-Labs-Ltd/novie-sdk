@@ -8,9 +8,9 @@ license = { text = "Proprietary" }
 
 dependencies = [
     # Canonical consumer declaration — pulls the SDK from the private monorepo.
-    # Pin to a language-prefixed tag. Swap `@python-v0.3.0` to a commit SHA
+    # Pin to a language-prefixed tag. Swap `@python-v0.3.2` to a commit SHA
     # if you need an even tighter lock.
-    "novie-agent-sdk[server] @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@python-v0.3.0#subdirectory=python/novie-agent-sdk",
+    "novie-agent-sdk[server] @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@python-v0.3.2#subdirectory=python/novie-agent-sdk",
 ]
 
 # Local-development override (do NOT commit):

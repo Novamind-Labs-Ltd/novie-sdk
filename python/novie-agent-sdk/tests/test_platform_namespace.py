@@ -198,6 +198,29 @@ async def test_knowledge_search_records_no_results_diagnostic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mid_run_ask_blocks_inline_write_capability() -> None:
+    called = False
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json=_ok_envelope({"ok": True}))
+
+    ns = _build_with_responder(responder)
+    ns.set_mid_run_ask_active(True)
+
+    diagnostics = await ns.invoke_capability(
+        "platform.pms.issue.update_status",
+        {"issue_id": "issue-1", "state": "Todo"},
+    )
+
+    assert diagnostics.ok is False
+    assert diagnostics.kind == "binding_denied"
+    assert diagnostics.error_code == "mid_run_ask_inline_write_denied"
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_knowledge_search_records_schema_violation_when_results_not_list() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_ok_envelope({"results": "not-a-list"}))

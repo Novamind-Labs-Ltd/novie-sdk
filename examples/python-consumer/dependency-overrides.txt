@@ -1,0 +1,1 @@
+novie-protocol @ git+https://github.com/Novamind-Labs-Ltd/novie-protocol.git@v0.1.1

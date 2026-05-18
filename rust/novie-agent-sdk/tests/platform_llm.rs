@@ -128,3 +128,151 @@ async fn budget_check_returns_result_map() {
     assert_eq!(result["allow"], true);
     assert_eq!(result["org_pool"]["remaining_tokens"], 500);
 }
+
+// ---------------------------------------------------------------------------
+// LlmBudgetGuard tests
+// ---------------------------------------------------------------------------
+
+use novie_agent_sdk::{LlmBudgetGuard, TokenUsage};
+
+fn make_budget_guard(server: &MockServer) -> LlmBudgetGuard {
+    LlmBudgetGuard::new(make_client(server))
+}
+
+#[tokio::test]
+async fn budget_guard_preflight_allows_when_budget_ok() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "result": {
+                "allow": true,
+                "exhausted": false,
+                "remaining_tokens": 5000,
+                "total_tokens": 10000
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = make_budget_guard(&server);
+    guard.preflight().await.expect("preflight should pass when allow=true");
+    assert!(!guard.should_stop());
+}
+
+#[tokio::test]
+async fn budget_guard_preflight_denies_when_exhausted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "result": {
+                "allow": false,
+                "exhausted": true,
+                "remaining_tokens": 0,
+                "total_tokens": 10000,
+                "reason": "org token pool exhausted"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = make_budget_guard(&server);
+    let err = guard.preflight().await.expect_err("preflight should fail when exhausted");
+    match err {
+        Error::BudgetExceeded { message, .. } => {
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected BudgetExceeded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn budget_guard_preflight_returns_governance_unavailable_on_503() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "detail": "service unavailable"
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = make_budget_guard(&server);
+    let result = guard.preflight().await;
+    match result {
+        Err(Error::GovernanceUnavailable { .. }) | Ok(()) => {
+            // Either is acceptable: SDK returns GovernanceUnavailable or degrades gracefully.
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn budget_guard_report_usage_sets_exceeded_on_exhausted_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/capabilities/platform.llm.report_usage/invoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "result": {
+                "recorded": true,
+                "exhausted": true
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = make_budget_guard(&server);
+    assert!(!guard.should_stop(), "should not stop before reporting usage");
+
+    guard
+        .report_usage(&TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            total_tokens: 1500,
+            provider: "anthropic".to_owned(),
+            model: "claude-opus".to_owned(),
+        })
+        .await;
+
+    assert!(guard.should_stop(), "should stop after platform reports exhausted");
+}
+
+#[tokio::test]
+async fn structured_uses_output_schema_field_not_schema() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/capabilities/platform.llm.structured/invoke"))
+        .and(body_json(json!({
+            "arguments": {
+                "messages": [{"role": "user", "content": "extract"}],
+                "output_schema": {"type": "object"},
+            },
+            "caller_type": "agent",
+            "caller_id": "agent:rust-agent",
+            "caller_mode": "execute",
+            "mode": "execute"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ok",
+            "result": {
+                "structured": {"answer": 42}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = make_client(&server);
+    let result = client
+        .structured(
+            vec![ChatMessage::user("extract")],
+            json!({"type": "object"}),
+            novie_agent_sdk::StructuredOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["structured"]["answer"], 42);
+}

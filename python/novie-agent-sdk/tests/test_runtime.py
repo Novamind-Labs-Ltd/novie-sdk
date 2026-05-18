@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent / "novi
 
 from novie_agent_sdk.runtime import (
     Agent,
+    AskBudgetExceeded,
+    AskTimedOut,
     InMemoryTaskStore,
     InvokeContext,
     RegistrationClient,
@@ -294,6 +296,156 @@ async def test_task_context_report_llm_usage_emits_platform_token_usage_event():
         "total_tokens": 150,
     }
     assert usage_event["payload"]["phase"] == "analysis"
+
+
+@pytest.mark.asyncio
+async def test_task_context_ask_times_out_with_continue_alias():
+    store = InMemoryTaskStore()
+    await store.create_task("ask-task", {"q": "hello"})
+    await store.update_task_status("ask-task", "running")
+    ctx = TaskContext(
+        task_id="ask-task",
+        input={},
+        headers=RequestHeaders(session_id="sess-1", step_id="step-1"),
+        agent_manifest=_tasks_manifest("ask-agent"),
+        observability=AgentObservability(agent_id="ask-agent"),
+        _store=store,
+    )
+
+    result = await ctx.ask(
+        "Should I continue?",
+        timeout=0.01,
+        default_action="continue",
+    )
+
+    assert result["resolution_type"] == "skipped"
+    assert result["default_action"] == "skip"
+    record = await store.get_task("ask-task")
+    assert record is not None
+    assert record.status == "running"
+    events = await store.get_events("ask-task")
+    kinds = [event["kind"] for event in events]
+    assert "mid_run_ask" in kinds
+    assert "mid_run_ask_timeout" in kinds
+    ask_event = next(event for event in events if event["kind"] == "mid_run_ask")
+    assert ask_event["timeout_seconds"] == 0.01
+    assert ask_event["default_action_on_timeout"] == "skip"
+    assert ask_event["envelope"]["question"] == "Should I continue?"
+
+
+@pytest.mark.asyncio
+async def test_task_context_ask_resumes_with_human_resolution():
+    store = InMemoryTaskStore()
+    await store.create_task("ask-resume-task", {})
+    await store.update_task_status("ask-resume-task", "running")
+    ctx = TaskContext(
+        task_id="ask-resume-task",
+        input={},
+        headers=RequestHeaders(session_id="sess-1", step_id="step-1"),
+        agent_manifest=_tasks_manifest("ask-resume-agent"),
+        observability=AgentObservability(agent_id="ask-resume-agent"),
+        _store=store,
+    )
+
+    ask_task = asyncio.create_task(
+        ctx.ask("Pick one?", timeout=1.0, default_action="continue")
+    )
+    for _ in range(20):
+        events = await store.get_events("ask-resume-task")
+        ask_events = [event for event in events if event["kind"] == "mid_run_ask"]
+        if ask_events:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("mid_run_ask event was not emitted")
+
+    gate_id = ask_events[0]["gate_id"]
+    accepted = await store.resolve_ask(
+        "ask-resume-task",
+        gate_id,
+        {"resolution_type": "answered", "freeform_answer": "Use option A"},
+    )
+
+    assert accepted is True
+    result = await ask_task
+    assert result["gate_id"] == gate_id
+    assert result["timed_out"] is False
+    assert result["freeform_answer"] == "Use option A"
+    events = await store.get_events("ask-resume-task")
+    assert any(event["kind"] == "mid_run_ask_resumed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_task_context_ask_fail_implementation_raises():
+    store = InMemoryTaskStore()
+    await store.create_task("ask-fail-task", {})
+    await store.update_task_status("ask-fail-task", "running")
+    ctx = TaskContext(
+        task_id="ask-fail-task",
+        input={},
+        headers=RequestHeaders(session_id="sess-1", step_id="step-1"),
+        agent_manifest=_tasks_manifest("ask-fail-agent"),
+        observability=AgentObservability(agent_id="ask-fail-agent"),
+        _store=store,
+    )
+
+    with pytest.raises(AskTimedOut):
+        await ctx.ask(
+            "Cannot proceed without approval",
+            timeout=0.01,
+            default_action="fail_implementation",
+        )
+
+    events = await store.get_events("ask-fail-task")
+    assert any(event["kind"] == "mid_run_ask_timeout" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_task_context_ask_rejects_fourth_default_ask():
+    store = InMemoryTaskStore()
+    await store.create_task("ask-cap-task", {})
+    await store.update_task_status("ask-cap-task", "running")
+    ctx = TaskContext(
+        task_id="ask-cap-task",
+        input={"lifecycle": {"max_mid_run_asks": 3}},
+        headers=RequestHeaders(session_id="sess-1", step_id="step-1"),
+        agent_manifest=_tasks_manifest("ask-cap-agent"),
+        observability=AgentObservability(agent_id="ask-cap-agent"),
+        _store=store,
+    )
+
+    for index in range(3):
+        await ctx.ask(f"Question {index}?", timeout=0.01, default_action="continue")
+
+    with pytest.raises(AskBudgetExceeded):
+        await ctx.ask("Question 4?", timeout=0.01, default_action="continue")
+
+    events = await store.get_events("ask-cap-task")
+    rejected = [event for event in events if event["kind"] == "mid_run_ask_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == "max_mid_run_asks_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_task_context_heartbeat_emits_agent_heartbeat_event():
+    store = InMemoryTaskStore()
+    await store.create_task("heartbeat-task", {})
+    ctx = TaskContext(
+        task_id="heartbeat-task",
+        input={},
+        headers=RequestHeaders(session_id="sess-1", step_id="step-1"),
+        agent_manifest=_tasks_manifest("heartbeat-agent"),
+        observability=AgentObservability(agent_id="heartbeat-agent"),
+        _store=store,
+    )
+
+    await ctx.heartbeat(phase="working", message="Still running", interval_seconds=0.5)
+
+    events = await store.get_events("heartbeat-task")
+    assert events[-1]["kind"] == "heartbeat"
+    assert events[-1]["agent_event_kind"] == "heartbeat"
+    assert events[-1]["phase"] == "working"
+    assert events[-1]["interval_seconds"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -720,6 +872,46 @@ async def test_stream_endpoint_multiplexes_observability_events():
     assert payload["usage"]["output_tokens"] == 20
     assert payload["usage"]["total_tokens"] == 30
     assert payload["model"] == "claude-sonnet-4.5"
+
+
+def test_stream_endpoint_appends_done_when_handler_finishes_without_terminal():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-sentinel"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "body"}
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    assert [event.get("kind") for event in events] == ["content", "done"]
+    assert events[-1]["metadata"]["terminal_source"] == "sdk_sentinel"
+
+
+def test_stream_endpoint_emits_terminal_error_when_handler_raises():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-terminal-error"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "body"}
+        raise RuntimeError("boom")
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    assert [event.get("kind") for event in events] == ["content", "terminal_error"]
+    assert events[-1]["error"] == "boom"
+    assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
 
 
 @pytest.mark.asyncio

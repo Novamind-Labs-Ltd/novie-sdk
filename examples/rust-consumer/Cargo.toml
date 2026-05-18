@@ -11,7 +11,7 @@ rust-version = "1.85"
 # Canonical consumer declaration — pulls the SDK from the private monorepo.
 # cargo scans the whole repo and matches by package name, so NO subdirectory
 # path is needed (unlike pip). Pin via `tag` (or `rev = "<sha>"` for a tighter lock).
-novie-agent-sdk = { git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "rust-v0.2.0" }
+novie-agent-sdk = { git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "rust-v0.3.2" }
 
 # Runtime deps used by the demo itself.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

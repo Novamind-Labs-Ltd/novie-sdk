@@ -6,7 +6,7 @@ The interesting part is the dependency declaration in [`pyproject.toml`](./pypro
 
 ```toml
 dependencies = [
-    "novie-agent-sdk[server] @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@python-v0.3.0#subdirectory=python/novie-agent-sdk",
+    "novie-agent-sdk[server] @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@python-v0.3.2#subdirectory=python/novie-agent-sdk",
 ]
 ```
 
@@ -15,7 +15,7 @@ Three things make this work:
 | Piece | Why |
 | --- | --- |
 | `git+ssh://git@github.com/…` | Uses your local SSH key. For HTTPS + token, swap the URL — see [`../README.md`](../README.md). |
-| `@python-v0.3.0` | Pins the **language-prefixed** tag. Bumping = change this string. |
+| `@python-v0.3.2` | Pins the **language-prefixed** tag. Bumping = change this string. |
 | `#subdirectory=python/novie-agent-sdk` | The SDK lives in a subdirectory; without this, pip looks in the repo root and fails. |
 | `[server]` | Pulls in FastAPI (needed for `agent.serve()`). Drop if you only need the contract types. |
 
@@ -26,7 +26,8 @@ Three things make this work:
 ```bash
 cd examples/python-consumer
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install uv
+uv pip install --overrides ./dependency-overrides.txt -e .
 novie-demo                       # uvicorn binds to 0.0.0.0:8000
 ```
 
@@ -43,7 +44,7 @@ When you're iterating on the SDK and the demo at the same time, the Git URL is t
 
 ```bash
 pip install -e ../../python/novie-agent-sdk
-pip install -e . --no-deps    # keep the demo install, skip re-resolving the SDK
+uv pip install --overrides ./dependency-overrides.txt -e . --no-deps
 ```
 
 Or temporarily edit `pyproject.toml`:
@@ -71,7 +72,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - run: pip install -e .
+      - run: pip install uv
+      - run: uv pip install --system --overrides ./dependency-overrides.txt -e .
       - run: python -c "from novie_python_consumer_demo import build_agent; build_agent()"
 ```
 

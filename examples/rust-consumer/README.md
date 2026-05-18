@@ -6,7 +6,7 @@ The interesting part is the dependency declaration in [`Cargo.toml`](./Cargo.tom
 
 ```toml
 [dependencies]
-novie-agent-sdk = { git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "rust-v0.2.0" }
+novie-agent-sdk = { git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "rust-v0.3.2" }
 ```
 
 Three things worth noting:
@@ -14,7 +14,7 @@ Three things worth noting:
 | Piece | Why |
 | --- | --- |
 | `git = "ssh://git@github.com/…"` | Uses your local SSH key. For HTTPS + token, see [`../README.md`](../README.md). |
-| `tag = "rust-v0.2.0"` | Pins the **language-prefixed** tag. Use `rev = "<sha>"` to lock to a commit. |
+| `tag = "rust-v0.3.2"` | Pins the **language-prefixed** tag. Use `rev = "<sha>"` to lock to a commit. |
 | _No subdirectory field_ | cargo scans the whole git repo and matches by package name, so `rust/novie-agent-sdk/Cargo.toml` is found automatically. This differs from pip. |
 
 `Cargo.lock` records the resolved commit SHA, so builds remain reproducible even if the tag is later moved (don't do that).

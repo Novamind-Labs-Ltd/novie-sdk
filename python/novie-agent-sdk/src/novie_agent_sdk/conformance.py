@@ -462,11 +462,11 @@ async def _probe_stream_artifact_lifecycle(
             url=url,
         ), events
     kinds = {e.get("kind") for e in events}
-    if not (kinds & {"final", "done", "artifact"}):
+    if not (kinds & {"final", "done", "artifact", "terminal_error"}):
         return _failed(
             "stream_artifact_lifecycle",
-            f"stream did not emit a terminal event (final/done/artifact); kinds={sorted(k for k in kinds if k)}",
-            hint="The SDK auto-appends ``{kind: 'done'}``; check that the handler isn't crashing.",
+            f"stream did not emit a terminal event (final/done/artifact/terminal_error); kinds={sorted(k for k in kinds if k)}",
+            hint="The SDK auto-appends ``{kind: 'done'}`` and converts handler exceptions to ``terminal_error``.",
             url=url,
         ), events
     return _passed(

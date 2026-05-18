@@ -287,6 +287,34 @@ def _extract_envelope_code(response: httpx.Response) -> str | None:
     return None
 
 
+def _is_high_risk_inline_capability(capability_id: str) -> bool:
+    value = capability_id.strip().lower()
+    if not value:
+        return False
+    read_suffixes = (
+        ".get",
+        ".list",
+        ".search",
+        ".status",
+        ".summary",
+        ".usage_summary",
+    )
+    if any(value.endswith(suffix) for suffix in read_suffixes):
+        return False
+    write_markers = (
+        ".create",
+        ".update",
+        ".delete",
+        ".move",
+        ".recover",
+        ".retry",
+        ".invoke",
+        ".put",
+        ".comment",
+    )
+    return any(marker in value for marker in write_markers)
+
+
 def _safe_text(response: httpx.Response) -> str:
     try:
         return response.text[:500]
@@ -806,6 +834,7 @@ class PlatformNamespace:
         self._llm_caller = llm_caller or caller
         self.default_project_id = default_project_id
         self._diagnostics: list[CapabilityCallDiagnostics] = []
+        self._mid_run_ask_active = False
         self.knowledge = KnowledgeNamespace(self)
         self.checkpoints = CheckpointsNamespace(self)
         self.llm = LlmNamespace(self)
@@ -819,6 +848,19 @@ class PlatformNamespace:
         capability_id: str,
         arguments: Mapping[str, Any],
     ) -> CapabilityCallDiagnostics:
+        if self._mid_run_ask_active and _is_high_risk_inline_capability(capability_id):
+            diagnostics = CapabilityCallDiagnostics(
+                ok=False,
+                capability_id=capability_id,
+                kind="binding_denied",
+                error_code="mid_run_ask_inline_write_denied",
+                detail=(
+                    "write/high-risk platform capability calls are refused while "
+                    "a mid-run ask is active"
+                ),
+            )
+            self._diagnostics.append(diagnostics)
+            return diagnostics
         diagnostics = await self._caller.invoke_with_diagnostics(
             capability_id, arguments,
         )
@@ -850,6 +892,9 @@ class PlatformNamespace:
 
     def _record_diagnostics(self, diagnostics: CapabilityCallDiagnostics) -> None:
         self._diagnostics.append(diagnostics)
+
+    def set_mid_run_ask_active(self, active: bool) -> None:
+        self._mid_run_ask_active = bool(active)
 
 
 class _UnavailablePlatformNamespace:

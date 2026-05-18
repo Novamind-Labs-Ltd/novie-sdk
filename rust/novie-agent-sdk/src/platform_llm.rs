@@ -235,7 +235,7 @@ impl PlatformLlmClient {
     ) -> Result<Map<String, Value>> {
         let mut args = json!({
             "messages": messages,
-            "schema": output_schema,
+            "output_schema": output_schema,
         });
         if let Some(model) = opts.model {
             args["model"] = Value::String(model.to_owned());
@@ -293,6 +293,21 @@ impl PlatformLlmClient {
     pub async fn usage_summary(&self, scope: &str) -> Result<Map<String, Value>> {
         self.invoke("platform.llm.usage_summary", json!({ "scope": scope }))
             .await
+    }
+
+    /// Fetch the platform model catalog (default chat / embedding models and
+    /// available model list).
+    pub async fn model_catalog(&self) -> Result<Map<String, Value>> {
+        self.invoke("platform.llm.model_catalog", json!({})).await
+    }
+
+    /// Public-within-crate invoke for use by governance helpers.
+    pub(crate) async fn invoke_raw(
+        &self,
+        capability_id: &str,
+        arguments: Value,
+    ) -> Result<Map<String, Value>> {
+        self.invoke(capability_id, arguments).await
     }
 
     async fn invoke(&self, capability_id: &str, arguments: Value) -> Result<Map<String, Value>> {
@@ -485,5 +500,201 @@ fn map_capability_error(status: u16, envelope: &Value) -> Error {
         code,
         http_status: Some(status),
         callback_id: None,
+    }
+}
+
+// ── Token usage & reporting types ────────────────────────────────────────────
+
+/// Parsed token usage from a single provider turn.
+///
+/// Populated from provider events (e.g. Claude Code NDJSON, Codex JSON-RPC)
+/// and passed to [`LlmBudgetGuard::report_usage`] for platform accounting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Input (prompt) tokens consumed.
+    pub input_tokens: u64,
+    /// Output (completion) tokens generated.
+    pub output_tokens: u64,
+    /// Total tokens (input + output); compute if zero.
+    pub total_tokens: u64,
+    /// Provider identifier (e.g. ``"claude_code"``, ``"codex"``).
+    pub provider: String,
+    /// Model identifier (e.g. ``"claude-opus-4-5"``).
+    pub model: String,
+}
+
+impl TokenUsage {
+    /// Merge another usage record into self (accumulate).
+    pub fn merge(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+        if self.provider.is_empty() {
+            self.provider = other.provider.clone();
+        }
+        if self.model.is_empty() {
+            self.model = other.model.clone();
+        }
+    }
+
+    /// True when no meaningful token data has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.total_tokens == 0 && self.input_tokens == 0 && self.output_tokens == 0
+    }
+
+    /// Effective total: prefers explicit `total_tokens`, otherwise sums.
+    pub fn effective_total(&self) -> u64 {
+        if self.total_tokens > 0 {
+            self.total_tokens
+        } else {
+            self.input_tokens + self.output_tokens
+        }
+    }
+}
+
+/// Usage summary for a complete task run; passed to the platform at task end.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageReport {
+    /// Accumulated token usage for the run.
+    pub usage: TokenUsage,
+    /// Provider identifier.
+    pub provider: String,
+    /// Model identifier.
+    pub model: String,
+    /// True when platform usage reporting was successful.
+    pub reported: bool,
+}
+
+// ── LlmBudgetGuard ─────────────────────────────────────────────────────────
+
+/// Guard that wraps [`PlatformLlmClient`] for worker-agent budget governance.
+///
+/// Typical usage in a Cortex-style worker:
+///
+/// ```text
+/// let guard = LlmBudgetGuard::new(llm_client.clone());
+/// // 1. Preflight before spawning the provider process.
+/// guard.preflight().await?;
+/// // 2. After each provider token-usage event:
+/// guard.report_usage(&usage).await;
+/// if guard.should_stop() {
+///     // Kill provider session and surface quota_exceeded.
+/// }
+/// ```
+#[derive(Debug)]
+pub struct LlmBudgetGuard {
+    client: PlatformLlmClient,
+    accumulated: std::sync::Mutex<TokenUsage>,
+    exceeded: std::sync::atomic::AtomicBool,
+}
+
+impl LlmBudgetGuard {
+    /// Create a new guard backed by a [`PlatformLlmClient`].
+    pub fn new(client: PlatformLlmClient) -> Self {
+        Self {
+            client,
+            accumulated: std::sync::Mutex::new(TokenUsage::default()),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Preflight budget check — call before spawning the provider process.
+    ///
+    /// Returns:
+    /// - `Ok(())` — budget allows proceeding.
+    /// - `Err(Error::BudgetExceeded)` — budget is exhausted; do not spawn.
+    /// - `Err(Error::GovernanceUnavailable)` — quota service unavailable;
+    ///   caller decides whether to proceed without enforcement.
+    pub async fn preflight(&self) -> crate::error::Result<()> {
+        let result = self.client.budget_check().await;
+        match result {
+            Err(Error::Unavailable { message, .. }) | Err(Error::Protocol { message, .. }) => {
+                return Err(Error::GovernanceUnavailable { message });
+            }
+            Err(e) => return Err(e),
+            Ok(budget) => {
+                let allow = budget
+                    .get("allow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let exhausted = budget
+                    .get("exhausted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !allow || exhausted {
+                    let reason = budget
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("budget exhausted")
+                        .to_owned();
+                    self.exceeded
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(Error::BudgetExceeded {
+                        message: reason,
+                        task_id: None,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Report token usage from a provider event.
+    ///
+    /// Accumulates usage and re-checks the budget asynchronously. Sets the
+    /// internal `exceeded` flag when the platform reports exhaustion so
+    /// [`LlmBudgetGuard::should_stop`] returns `true` on the next call.
+    pub async fn report_usage(&self, usage: &TokenUsage) {
+        if !usage.is_empty() {
+            let total = usage.effective_total();
+            // Accumulate locally (best-effort; mutex should never be poisoned
+            // in normal operation, but we ignore poisoning defensively).
+            if let Ok(mut acc) = self.accumulated.lock() {
+                acc.merge(usage);
+            }
+            // Report to platform asynchronously; errors are logged, not raised.
+            let report_args = json!({
+                "provider": usage.provider,
+                "model": usage.model,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": total,
+            });
+            match self
+                .client
+                .invoke_raw("platform.llm.report_usage", report_args)
+                .await
+            {
+                Ok(result) => {
+                    let exhausted = result
+                        .get("exhausted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if exhausted {
+                        self.exceeded
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("LlmBudgetGuard: usage report failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Returns `true` when accumulated usage has exceeded the budget.
+    ///
+    /// Worker loops should call this after each `report_usage` and stop the
+    /// provider session when it returns `true`.
+    pub fn should_stop(&self) -> bool {
+        self.exceeded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Return a snapshot of accumulated usage.
+    pub fn accumulated_usage(&self) -> TokenUsage {
+        self.accumulated
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }

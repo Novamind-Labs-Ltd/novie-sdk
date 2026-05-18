@@ -1,7 +1,7 @@
 """Minimal A2A agent demonstrating consumer-side usage of novie-agent-sdk.
 
 Run:
-    pip install -e .
+    uv pip install --overrides ./dependency-overrides.txt -e .
     novie-demo
     # …or…
     python -m novie_python_consumer_demo.main

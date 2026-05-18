@@ -3,7 +3,7 @@ name: Release SDK
 # Manually triggered. Picks one SDK (python | rust) and a semver version, then:
 #   1. Verifies the SDK builds / tests cleanly.
 #   2. Verifies the version string matches what's declared in pyproject.toml / Cargo.toml.
-#   3. Creates an annotated tag `<lang>-v<version>` (e.g. python-v0.3.1, rust-v0.2.1).
+#   3. Creates an annotated tag `<lang>-v<version>` (e.g. python-v0.3.2, rust-v0.3.2).
 #   4. Pushes the tag.
 #   5. Drafts a GitHub Release pointing at the tag.
 #

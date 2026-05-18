@@ -21,6 +21,11 @@ def test_build_callback_headers_forward_user_identity() -> None:
             user_id="user-1",
             session_id="session-1",
             trace_id="trace-1",
+            step_id="step-1",
+            raw={
+                "x-novie-workflow-id": "workflow-1",
+                "x-novie-thread-id": "thread-1",
+            },
         ),
         agent_id="analyst",
     )
@@ -31,6 +36,9 @@ def test_build_callback_headers_forward_user_identity() -> None:
     assert headers["x-novie-user-id"] == "user-1"
     assert "x-novie-service-principal" not in headers
     assert headers["x-novie-request-id"] == "trace-1"
+    assert headers["x-novie-workflow-id"] == "workflow-1"
+    assert headers["x-novie-thread-id"] == "thread-1"
+    assert headers["x-novie-step-id"] == "step-1"
 
 
 def test_build_callback_headers_falls_back_to_service_principal() -> None:

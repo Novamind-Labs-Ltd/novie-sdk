@@ -60,6 +60,23 @@ pub enum Error {
         remaining_tokens: Option<u64>,
     },
 
+    /// LLM call was denied because the task-level budget pre-check failed.
+    #[error("budget exceeded: {message} (task_id={task_id:?})")]
+    BudgetExceeded {
+        message: String,
+        task_id: Option<String>,
+    },
+
+    /// The governance / quota service is not configured or unavailable.
+    ///
+    /// This is a soft error in preflight: tasks can choose to proceed
+    /// without budget enforcement when governance is unavailable, or fail-safe
+    /// depending on their policy.
+    #[error("governance unavailable: {message}")]
+    GovernanceUnavailable {
+        message: String,
+    },
+
     /// `verify_callback_token` rejected because exp ≤ now.
     #[error("callback token expired")]
     TokenExpired,
@@ -103,6 +120,8 @@ impl Error {
             | Error::Unavailable { http_status, .. }
             | Error::Callback { http_status, .. } => *http_status,
             Error::QuotaExceeded { .. } => Some(403),
+            Error::BudgetExceeded { .. } => Some(429),
+            Error::GovernanceUnavailable { .. } => Some(503),
             _ => None,
         }
     }

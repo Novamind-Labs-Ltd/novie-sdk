@@ -9,6 +9,7 @@
   GET  /tasks/{task_id}
   GET  /tasks/{task_id}/events
   GET  /tasks/{task_id}/result
+  POST /tasks/{task_id}/asks/{gate_id}/resolve
   POST /tasks/{task_id}/cancel
 
 开发者体验：
@@ -40,14 +41,15 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from typing import Protocol
 
 _log = logging.getLogger(__name__)
 _SAFE_AGENT_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+_MidRunAskTimeoutAction = Literal["skip", "auto_recommended", "fail_implementation"]
 
 # FastAPI is an optional dependency. Import at module level so that FastAPI's
 # type-annotation resolver (get_type_hints) can find Request/BackgroundTasks
@@ -74,8 +76,13 @@ from novie_protocol.contracts.agent_sdk_v2 import (
     TERMINAL_STATUSES,
     is_valid_transition,
 )
+from novie_protocol.contracts.decision_gate import (
+    DecisionGateEnvelope,
+    DecisionGateOption,
+)
 
 from .observability import AgentObservability, ObservabilitySink, build_default_sinks
+from .tenant_scoping import validate_tenant_context
 
 
 def _build_ctx_platform_and_llm(
@@ -211,6 +218,25 @@ def _a2a_header_signature(headers: RequestHeaders, secret: str) -> str:
     ).hexdigest()
 
 
+class AskTimedOut(TimeoutError):
+    """Raised when ``ctx.ask`` times out with a fail action."""
+
+    def __init__(self, gate_id: str, *, default_action: str) -> None:
+        super().__init__(
+            f"mid-run ask {gate_id!r} timed out with default_action={default_action!r}"
+        )
+        self.gate_id = gate_id
+        self.default_action = default_action
+
+
+class AskBudgetExceeded(RuntimeError):
+    """Raised when a task exceeds its configured mid-run ask budget."""
+
+    def __init__(self, *, cap: int) -> None:
+        super().__init__(f"mid-run ask budget exceeded: max_mid_run_asks={cap}")
+        self.cap = cap
+
+
 @dataclass
 class InvokeContext:
     """simple protocol handler 上下文。"""
@@ -297,6 +323,7 @@ class TaskContext:
     _cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     _platform: Any = field(default=None, repr=False)
     _llm: Any = field(default=None, repr=False)
+    _mid_run_ask_count: int = 0
 
     @property
     def brief(self) -> dict[str, Any]:
@@ -336,6 +363,146 @@ class TaskContext:
 
     async def emit_artifact(self, artifact: dict[str, Any]) -> None:
         await self.emit_event("artifact_created", artifact)
+
+    async def heartbeat(
+        self,
+        *,
+        phase: str = "",
+        message: str = "",
+        interval_seconds: float | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "agent_event_kind": "heartbeat",
+        }
+        if phase:
+            payload["phase"] = phase
+        if message:
+            payload["message"] = message
+        if interval_seconds is not None:
+            payload["interval_seconds"] = interval_seconds
+        await self.emit_event("heartbeat", payload, summary=message or phase or "heartbeat")
+
+    async def ask(
+        self,
+        question: str,
+        *,
+        timeout: float | None = None,
+        default_action: str = "skip",
+        options: tuple[DecisionGateOption, ...] | list[DecisionGateOption] = (),
+        recommended_option: str | None = None,
+        gate_type: str = "missing_inputs",
+        title: str = "Need input",
+        allow_freeform: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Raise a mid-run user question and resume via timeout fallback.
+
+        This is the SDK-side ADR-017 primitive. Until platform resume wiring
+        can feed a human answer back into the running task, the local contract
+        is timeout-driven: emit the decision gate, wait ``timeout`` seconds,
+        then apply ``default_action``.
+        """
+        timeout_action = _normalize_ask_default_action(default_action)
+        cap = _max_mid_run_asks(self.input)
+        if self._mid_run_ask_count >= cap:
+            await self.emit_event(
+                "mid_run_ask_rejected",
+                {
+                    "agent_event_kind": "mid_run_ask_rejected",
+                    "reason_code": "max_mid_run_asks_exceeded",
+                    "max_mid_run_asks": cap,
+                    "current_count": self._mid_run_ask_count,
+                    "question": question,
+                },
+                summary=f"mid-run ask budget exceeded ({cap})",
+            )
+            raise AskBudgetExceeded(cap=cap)
+        self._mid_run_ask_count += 1
+        gate_id = f"ask-{uuid.uuid4().hex[:20]}"
+        envelope = DecisionGateEnvelope(
+            gate_id=gate_id,
+            gate_type=gate_type,
+            title=title,
+            question=question,
+            options=tuple(options),
+            recommended_option=recommended_option,
+            allow_freeform=allow_freeform,
+            raised_by_agent_id=self.agent_manifest.agent_id,
+            agent_metadata=dict(metadata or {}),
+        )
+        envelope_payload = asdict(envelope)
+        envelope_payload["timeout_seconds"] = timeout
+        envelope_payload["default_action_on_timeout"] = timeout_action
+        await self.emit_event(
+            "mid_run_ask",
+            {
+                "agent_event_kind": "mid_run_ask",
+                "gate_id": gate_id,
+                "gate_class": "decision_gate",
+                "question": question,
+                "timeout_seconds": timeout,
+                "default_action_on_timeout": timeout_action,
+                "envelope": envelope_payload,
+            },
+            summary=question[:200],
+        )
+        if hasattr(self._platform, "set_mid_run_ask_active"):
+            self._platform.set_mid_run_ask_active(True)
+        await self.set_status("waiting_for_human")
+        wait_task = asyncio.create_task(
+            self._store.wait_for_ask_resolution(self.task_id, gate_id, timeout)
+        )
+        cancel_task = asyncio.create_task(self._cancelled.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {wait_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if cancel_task in done and self.is_cancelled:
+                raise asyncio.CancelledError()
+            resolved = await wait_task if wait_task in done else None
+        finally:
+            if hasattr(self._platform, "set_mid_run_ask_active"):
+                self._platform.set_mid_run_ask_active(False)
+            for task in (wait_task, cancel_task):
+                if not task.done():
+                    task.cancel()
+
+        await self.set_status("running")
+        if resolved is not None:
+            resolved_payload = {
+                "gate_id": gate_id,
+                "timed_out": False,
+                **dict(resolved),
+            }
+            await self.emit_event(
+                "mid_run_ask_resumed",
+                {
+                    "agent_event_kind": "mid_run_ask_resumed",
+                    **resolved_payload,
+                },
+                summary=f"mid-run ask resolved: {gate_id}",
+            )
+            return resolved_payload
+
+        resolution = _timeout_resolution(
+            gate_id,
+            timeout_action,
+            recommended_option=recommended_option,
+        )
+        await self.emit_event(
+            "mid_run_ask_timeout",
+            {
+                "agent_event_kind": "mid_run_ask_timeout",
+                **resolution,
+            },
+            summary=f"mid-run ask timed out: {gate_id}",
+        )
+        if timeout_action == "fail_implementation":
+            raise AskTimedOut(gate_id, default_action=timeout_action)
+        return resolution
 
     async def report_llm_usage(
         self,
@@ -399,6 +566,49 @@ def _env_float(name: str, *, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _normalize_ask_default_action(value: str) -> _MidRunAskTimeoutAction:
+    action = (value or "").strip().lower()
+    if action == "continue":
+        action = "skip"
+    if action not in {"skip", "auto_recommended", "fail_implementation"}:
+        raise ValueError(
+            "ctx.ask default_action must be one of: "
+            "skip, continue, auto_recommended, fail_implementation"
+        )
+    return action  # type: ignore[return-value]
+
+
+def _timeout_resolution(
+    gate_id: str,
+    default_action: _MidRunAskTimeoutAction,
+    *,
+    recommended_option: str | None,
+) -> dict[str, Any]:
+    resolution_type = "auto_policy" if default_action == "auto_recommended" else "skipped"
+    return {
+        "gate_id": gate_id,
+        "resolution_type": resolution_type,
+        "selected_option_id": (
+            recommended_option if default_action == "auto_recommended" else None
+        ),
+        "freeform_answer": "",
+        "timed_out": True,
+        "default_action": default_action,
+    }
+
+
+def _max_mid_run_asks(inputs: dict[str, Any]) -> int:
+    lifecycle = inputs.get("lifecycle")
+    value = lifecycle.get("max_mid_run_asks") if isinstance(lifecycle, dict) else None
+    if value in (None, ""):
+        value = os.getenv("NOVIE_SDK_MAX_MID_RUN_ASKS", "3")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 3
+    return max(0, parsed)
 
 
 def _make_event(task_id: str, kind: str, payload: dict[str, Any], summary: str = "") -> dict[str, Any]:
@@ -743,6 +953,18 @@ class TaskStore(Protocol):
     async def append_event(self, task_id: str, event: dict[str, Any]) -> None: ...
     async def get_events(self, task_id: str) -> list[dict[str, Any]]: ...
     async def get_result(self, task_id: str) -> dict[str, Any] | None: ...
+    async def resolve_ask(
+        self,
+        task_id: str,
+        gate_id: str,
+        resolution: dict[str, Any],
+    ) -> bool: ...
+    async def wait_for_ask_resolution(
+        self,
+        task_id: str,
+        gate_id: str,
+        timeout: float | None,
+    ) -> dict[str, Any] | None: ...
 
 
 class InMemoryTaskStore:
@@ -774,8 +996,10 @@ class InMemoryTaskStore:
     ) -> None:
         self._tasks: dict[str, TaskRecord] = {}
         self._events: dict[str, list[dict[str, Any]]] = {}
+        self._ask_resolutions: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._status_waiters: dict[str, asyncio.Condition] = {}
+        self._ask_waiters: dict[tuple[str, str], asyncio.Condition] = {}
         self._max_tasks = max_tasks if max_tasks is not None else _env_int(
             "NOVIE_SDK_TASK_STORE_MAX_TASKS", default=0
         ) or None
@@ -807,6 +1031,10 @@ class InMemoryTaskStore:
             self._tasks.pop(task_id, None)
             self._events.pop(task_id, None)
             self._status_waiters.pop(task_id, None)
+            for key in tuple(self._ask_resolutions):
+                if key[0] == task_id:
+                    self._ask_resolutions.pop(key, None)
+                    self._ask_waiters.pop(key, None)
 
     def _evict_oldest_locked(self) -> None:
         """Drop the single oldest task (FIFO insertion order).
@@ -820,6 +1048,10 @@ class InMemoryTaskStore:
         self._tasks.pop(oldest, None)
         self._events.pop(oldest, None)
         self._status_waiters.pop(oldest, None)
+        for key in tuple(self._ask_resolutions):
+            if key[0] == oldest:
+                self._ask_resolutions.pop(key, None)
+                self._ask_waiters.pop(key, None)
 
     async def evict_expired(self) -> int:
         """Public TTL sweep — returns the count of evicted tasks.
@@ -961,6 +1193,71 @@ class InMemoryTaskStore:
         if task is None or task.result is None:
             return None
         return task.result
+
+    async def resolve_ask(
+        self,
+        task_id: str,
+        gate_id: str,
+        resolution: dict[str, Any],
+    ) -> bool:
+        key = (task_id, gate_id)
+        async with self._lock:
+            if task_id not in self._tasks:
+                return False
+            payload = {
+                "gate_id": gate_id,
+                **dict(resolution),
+                "resolved_at": _now_iso(),
+            }
+            self._ask_resolutions[key] = payload
+            cond = self._ask_waiters.setdefault(key, asyncio.Condition())
+        async with cond:
+            cond.notify_all()
+        await self.append_event(
+            task_id,
+            _make_event(
+                task_id,
+                "mid_run_ask_resolved",
+                {
+                    "agent_event_kind": "mid_run_ask_resolved",
+                    **payload,
+                },
+                f"mid-run ask resolved: {gate_id}",
+            ),
+        )
+        return True
+
+    async def wait_for_ask_resolution(
+        self,
+        task_id: str,
+        gate_id: str,
+        timeout: float | None,
+    ) -> dict[str, Any] | None:
+        key = (task_id, gate_id)
+        async with self._lock:
+            existing = self._ask_resolutions.get(key)
+            if existing is not None:
+                return dict(existing)
+            cond = self._ask_waiters.setdefault(key, asyncio.Condition())
+
+        async def _wait() -> dict[str, Any] | None:
+            while True:
+                async with self._lock:
+                    resolved = self._ask_resolutions.get(key)
+                    if resolved is not None:
+                        return dict(resolved)
+                    task = self._tasks.get(task_id)
+                    if task is None or task.status in TERMINAL_STATUSES:
+                        return None
+                async with cond:
+                    await cond.wait()
+
+        if timeout is None:
+            return await _wait()
+        try:
+            return await asyncio.wait_for(_wait(), timeout=max(0.0, float(timeout)))
+        except TimeoutError:
+            return None
 
 
 class SqliteTaskStore:
@@ -1134,6 +1431,107 @@ class SqliteTaskStore:
                 return None
             return json.loads(str(row["result_json"]))
 
+    async def resolve_ask(
+        self,
+        task_id: str,
+        gate_id: str,
+        resolution: dict[str, Any],
+    ) -> bool:
+        resolved = await asyncio.to_thread(
+            self._resolve_ask_sync,
+            task_id,
+            gate_id,
+            dict(resolution),
+        )
+        if resolved:
+            await self.append_event(
+                task_id,
+                _make_event(
+                    task_id,
+                    "mid_run_ask_resolved",
+                    {
+                        "agent_event_kind": "mid_run_ask_resolved",
+                        "gate_id": gate_id,
+                        **dict(resolution),
+                    },
+                    f"mid-run ask resolved: {gate_id}",
+                ),
+            )
+        return resolved
+
+    def _resolve_ask_sync(
+        self,
+        task_id: str,
+        gate_id: str,
+        resolution: dict[str, Any],
+    ) -> bool:
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT task_id FROM sdk_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            payload = {
+                "gate_id": gate_id,
+                **dict(resolution),
+                "resolved_at": _now_iso(),
+            }
+            conn.execute(
+                """
+                INSERT INTO sdk_task_ask_resolutions (
+                    task_id, gate_id, resolution_json, resolved_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id, gate_id)
+                DO UPDATE SET
+                    resolution_json = excluded.resolution_json,
+                    resolved_at = excluded.resolved_at
+                """,
+                (task_id, gate_id, json.dumps(payload), payload["resolved_at"]),
+            )
+            conn.commit()
+            return True
+
+    async def wait_for_ask_resolution(
+        self,
+        task_id: str,
+        gate_id: str,
+        timeout: float | None,
+    ) -> dict[str, Any] | None:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            resolution = await asyncio.to_thread(
+                self._get_ask_resolution_sync,
+                task_id,
+                gate_id,
+            )
+            if resolution is not None:
+                return resolution
+            task = await self.get_task(task_id)
+            if task is None or task.status in TERMINAL_STATUSES:
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
+
+    def _get_ask_resolution_sync(
+        self,
+        task_id: str,
+        gate_id: str,
+    ) -> dict[str, Any] | None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT resolution_json FROM sdk_task_ask_resolutions
+                WHERE task_id = ? AND gate_id = ?
+                """,
+                (task_id, gate_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(str(row["resolution_json"]))
+
     def _row_to_task_record(self, row: sqlite3.Row) -> TaskRecord:
         return TaskRecord(
             task_id=str(row["task_id"]),
@@ -1172,6 +1570,17 @@ class SqliteTaskStore:
                     task_id TEXT NOT NULL,
                     event_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """,
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sdk_task_ask_resolutions (
+                    task_id TEXT NOT NULL,
+                    gate_id TEXT NOT NULL,
+                    resolution_json TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, gate_id)
                 )
                 """,
             )
@@ -1449,6 +1858,7 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(hdrs)
+                validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
                     started_invocation, invocation = await self._invocation_store.start_or_get(
@@ -1498,6 +1908,7 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(hdrs)
+                validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
                     started_invocation, invocation = await self._invocation_store.start_or_get(
@@ -1543,6 +1954,7 @@ class Agent:
 
                 async def _gen() -> AsyncIterator[bytes]:
                     emitted_events: list[dict[str, Any]] = []
+                    terminal_error_emitted = False
 
                     async def _runner() -> None:
                         try:
@@ -1560,13 +1972,25 @@ class Agent:
                             if kind == "done":
                                 break
                             if kind == "error":
+                                terminal_error_emitted = True
+                                error_event = {
+                                    "kind": "terminal_error",
+                                    "error": str(payload),
+                                    "output": {},
+                                    "metadata": {
+                                        "terminal_source": "sdk_exception_guard",
+                                        "agent_id": m.agent_id,
+                                    },
+                                }
+                                emitted_events.append(error_event)
                                 if started_invocation and hdrs.idempotency_key:
-                                    await self._invocation_store.fail(
+                                    await self._invocation_store.complete(
                                         hdrs.idempotency_key,
                                         "stream",
-                                        str(payload),
+                                        events=emitted_events,
                                     )
-                                raise payload  # type: ignore[misc]
+                                yield (json.dumps(error_event) + "\n").encode()
+                                break
                             if kind == "obs":
                                 # Already a fully-formed dict (UsageReport.
                                 # to_platform_task_event); forward verbatim.
@@ -1580,15 +2004,20 @@ class Agent:
                                 event = {"kind": "content", "text": str(payload)}
                             emitted_events.append(event)
                             yield (json.dumps(event) + "\n").encode()
-                        done_event = {"kind": "done", "output": {}}
-                        emitted_events.append(done_event)
-                        if started_invocation and hdrs.idempotency_key:
-                            await self._invocation_store.complete(
-                                hdrs.idempotency_key,
-                                "stream",
-                                events=emitted_events,
-                            )
-                        yield (json.dumps(done_event) + "\n").encode()
+                        if not terminal_error_emitted:
+                            done_event = {
+                                "kind": "done",
+                                "output": {},
+                                "metadata": {"terminal_source": "sdk_sentinel"},
+                            }
+                            emitted_events.append(done_event)
+                            if started_invocation and hdrs.idempotency_key:
+                                await self._invocation_store.complete(
+                                    hdrs.idempotency_key,
+                                    "stream",
+                                    events=emitted_events,
+                                )
+                            yield (json.dumps(done_event) + "\n").encode()
                     finally:
                         if not runner_task.done():
                             runner_task.cancel()
@@ -1608,6 +2037,7 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(hdrs)
+                validate_tenant_context(hdrs)
                 task_id = f"task-{uuid.uuid4().hex}"
                 record = await self._store.create_task(
                     task_id,
@@ -1647,7 +2077,9 @@ class Agent:
 
             @app.get("/tasks/{task_id}")
             async def get_task_status(task_id: str, request: Request):
-                _verify_agent_request_headers(RequestHeaders.from_request(request.headers))
+                _hdrs_local = RequestHeaders.from_request(request.headers)
+                _verify_agent_request_headers(_hdrs_local)
+                validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
                     raise HTTPException(404, f"Task {task_id!r} not found")
@@ -1661,16 +2093,52 @@ class Agent:
 
             @app.get("/tasks/{task_id}/events")
             async def get_task_events(task_id: str, request: Request):
-                _verify_agent_request_headers(RequestHeaders.from_request(request.headers))
+                _hdrs_local = RequestHeaders.from_request(request.headers)
+                _verify_agent_request_headers(_hdrs_local)
+                validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
                     raise HTTPException(404, f"Task {task_id!r} not found")
                 events = await self._store.get_events(task_id)
                 return {"task_id": task_id, "events": events}
 
+            @app.post("/tasks/{task_id}/asks/{gate_id}/resolve", status_code=202)
+            async def resolve_task_ask(task_id: str, gate_id: str, request: Request):
+                _hdrs_local = RequestHeaders.from_request(request.headers)
+                _verify_agent_request_headers(_hdrs_local)
+                validate_tenant_context(_hdrs_local)
+                record = await self._store.get_task(task_id)
+                if record is None:
+                    raise HTTPException(404, f"Task {task_id!r} not found")
+                if record.status in TERMINAL_STATUSES:
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "error": "task_already_terminal",
+                            "task_id": task_id,
+                            "status": record.status,
+                        },
+                    )
+                body = await _parse_json(request, HTTPException)
+                resolution = body.get("resolution") if isinstance(body.get("resolution"), dict) else body
+                accepted = await self._store.resolve_ask(
+                    task_id,
+                    gate_id,
+                    dict(resolution),
+                )
+                if not accepted:
+                    raise HTTPException(404, f"Task {task_id!r} not found")
+                return {
+                    "task_id": task_id,
+                    "gate_id": gate_id,
+                    "status": "accepted",
+                }
+
             @app.get("/tasks/{task_id}/result")
             async def get_task_result(task_id: str, request: Request):
-                _verify_agent_request_headers(RequestHeaders.from_request(request.headers))
+                _hdrs_local = RequestHeaders.from_request(request.headers)
+                _verify_agent_request_headers(_hdrs_local)
+                validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
                     raise HTTPException(404, f"Task {task_id!r} not found")
@@ -1693,7 +2161,9 @@ class Agent:
             if m.execution.supports_cancel:
                 @app.post("/tasks/{task_id}/cancel", status_code=202)
                 async def cancel_task(task_id: str, request: Request):
-                    _verify_agent_request_headers(RequestHeaders.from_request(request.headers))
+                    _hdrs_local = RequestHeaders.from_request(request.headers)
+                    _verify_agent_request_headers(_hdrs_local)
+                    validate_tenant_context(_hdrs_local)
                     record = await self._store.get_task(task_id)
                     if record is None:
                         raise HTTPException(404, f"Task {task_id!r} not found")

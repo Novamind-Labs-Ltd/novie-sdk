@@ -60,6 +60,14 @@ def build_platform_callback_headers(
         headers["x-novie-user-id"] = user_id
     else:
         headers["x-novie-service-principal"] = service_principal
+    for incoming_name, outgoing_name in (
+        ("x-novie-workflow-id", "x-novie-workflow-id"),
+        ("x-novie-thread-id", "x-novie-thread-id"),
+        ("x-novie-step-id", "x-novie-step-id"),
+    ):
+        value = source.pick(incoming_name)
+        if value:
+            headers[outgoing_name] = value
     return headers
 
 
@@ -176,6 +184,9 @@ class _IncomingHeaders:
                 "x-novie-trace-id": source.trace_id,
                 "x-novie-step-id": source.step_id,
             }
+            self._items.update(
+                {str(k).lower(): str(v) for k, v in source.raw.items()}
+            )
         else:
             self._items = {str(k).lower(): str(v) for k, v in source.items()}
 

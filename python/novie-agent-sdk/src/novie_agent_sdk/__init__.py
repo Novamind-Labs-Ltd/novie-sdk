@@ -57,6 +57,8 @@ from .testing import (
 # A2A runtime SDK — always available (FastAPI required only for .serve())
 from .runtime import (
     Agent,
+    AskBudgetExceeded,
+    AskTimedOut,
     InMemoryTaskStore,
     InvokeContext,
     RegistrationClient,
@@ -72,6 +74,10 @@ from .platform_callback import (
     PlatformCallbackClient,
     build_platform_callback_headers,
     sign_platform_callback_headers,
+)
+from .tenant_scoping import (
+    TenantScopedCache,
+    validate_tenant_context,
 )
 from .conformance import (
     CompatibilityMatrix,
@@ -183,6 +189,8 @@ __all__ = [
     "validate_generated_manifest",
     # A2A runtime SDK (primary path)
     "Agent",
+    "AskBudgetExceeded",
+    "AskTimedOut",
     "InMemoryTaskStore",
     "InvokeContext",
     "RegistrationClient",
@@ -226,6 +234,9 @@ __all__ = [
     "WorkerFailure",
     "WorkerResult",
     "WorkerTaskContext",
+    # ADR-026 SDK middleware for cross-tenant pollution defense
+    "TenantScopedCache",
+    "validate_tenant_context",
     "worker_agent",
     "AgentObservability",
     "LangfuseObservabilitySink",

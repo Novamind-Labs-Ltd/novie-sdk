@@ -29,6 +29,27 @@ pub enum SessionStatus {
     Cancelled,
 }
 
+/// Lifecycle phase distinct from `SessionStatus`. Mirrors
+/// `novie_protocol.contracts.session.SessionLifecycleState` introduced
+/// in protocol v0.1.2.
+///
+/// `#[serde(default)]` on `Session.lifecycle_state` keeps backward-compatible
+/// deserialisation: pre-v0.1.2 payloads (no field) decode as `Active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLifecycleState {
+    Active,
+    Idle,
+    Closed,
+    Archived,
+}
+
+impl Default for SessionLifecycleState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
@@ -38,6 +59,8 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_status")]
     pub status: SessionStatus,
+    #[serde(default)]
+    pub lifecycle_state: SessionLifecycleState,
     #[serde(default)]
     pub thread_id: Option<String>,
     #[serde(default)]

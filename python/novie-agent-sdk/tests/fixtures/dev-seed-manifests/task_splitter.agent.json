@@ -64,19 +64,19 @@
       "capability_id": "agent.task_splitter.ticket_drafting",
       "version": "0.2.0",
       "display_name": "Draft PMS Tickets",
-      "description": "Convert a scoped requirements-analysis-backed task plan into a TicketDraftSet to be written into the PMS Backlog.",
+      "description": "Convert a scoped requirements-analysis-backed task plan into a WorkItemDraftGraph to be written into the PMS Backlog.",
       "input_schema": {"type": "object"},
       "output_schema": {"type": "object"},
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
       "runtime_ref": "agent:task_splitter:ticket_drafting",
-      "tags": ["ticket_drafts", "pms-first"],
+      "tags": ["work_item_draft_graph", "pms-first"],
       "natural_language_aliases": ["拆 ticket", "生成 ticket", "ticket drafting"],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": ["task_plan", "requirements_analysis"],
-      "provides": ["ticket_drafts"],
+      "provides": ["work_item_draft_graph"],
       "execution_lane": "direct",
       "risk_class": "read_only",
       "governance": {
@@ -105,16 +105,16 @@
     "owner_team": "novie-core",
     "durability": "none",
     "protocol_mode": "stream",
-    "role_description": "Converts scoped requirements, designs, or analysis artifacts into TicketDraftSets to be written into the PMS Backlog.",
+    "role_description": "Converts scoped requirements, designs, or analysis artifacts into WorkItemDraftGraphs to be written into the PMS Backlog.",
     "when_to_use": [
       "Build or sprint-planning tasks that need decomposition before tickets can be created.",
-      "Producing a TicketDraftSet for the platform to ingest into PMS Backlog."
+      "Producing a WorkItemDraftGraph for the platform to ingest into PMS Backlog."
     ],
     "when_not_to_use": [
       "Producing final code changes, editing repositories, creating pull requests, or answering status questions.",
       "Raw research or requirements clarification before a scoped artifact exists."
     ],
-    "handoff_contract": "Consumes scoped artifacts and produces TicketDraftSet; platform TicketDraftIngestionService writes the drafts into PMS Backlog. Each ticket then enters the standard Backlog -> Todo -> execution flow per ExecutionPolicy.",
+    "handoff_contract": "Consumes scoped artifacts and produces WorkItemDraftGraph; platform TicketDraftIngestionService writes the drafts into PMS Backlog. Each ticket then enters the standard Backlog -> Todo -> execution flow per ExecutionPolicy.",
     "user_facing_aliases": [
       "task splitting agent",
       "decomposition agent",
@@ -126,7 +126,7 @@
       "analysis",
       "requirements_analysis"
     ],
-    "artifact_output_type": "ticket_drafts",
+    "artifact_output_type": "work_item_draft_graph",
     "input_schema": "schemas/input.schema.json",
     "output_schema": "schemas/output.schema.json"
   }
