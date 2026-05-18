@@ -553,6 +553,38 @@ async def test_inmemory_invocation_store_fresh_in_progress_returns_duplicate():
     assert started_second is False
     assert second.status == "in_progress"
     assert second is first  # same record
+    assert second.invocation_id == first.invocation_id
+    assert second.invocation_id.startswith("inv-")
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_lookup_by_invocation_id():
+    store = InMemoryOneShotInvocationStore()
+    started, record = await store.start_or_get("idem-lookup", "stream")
+    assert started is True
+
+    found = await store.get_by_invocation_id(record.invocation_id)
+
+    assert found is record
+
+
+@pytest.mark.asyncio
+async def test_duplicate_one_shot_response_exposes_invocation_resume_ref():
+    from novie_agent_sdk.runtime import _duplicate_one_shot_response
+
+    store = InMemoryOneShotInvocationStore()
+    started, record = await store.start_or_get("idem-duplicate", "stream")
+    assert started is True
+
+    response = _duplicate_one_shot_response(record)
+    body = json.loads(response.body.decode())
+    details = body["error"]["details"]
+
+    assert details["invocation_id"] == record.invocation_id
+    assert details["resume_ref"] == {
+        "type": "stream_invocation",
+        "id": record.invocation_id,
+    }
 
 
 @pytest.mark.asyncio
@@ -659,6 +691,23 @@ async def test_sqlite_invocation_store_touch_renews_lease(tmp_path: Path):
     _, refreshed = await store.start_or_get("idem-touch", "stream")
     assert refreshed.status == "in_progress"
     assert refreshed.updated_at != initial_updated_at
+    assert refreshed.invocation_id == record.invocation_id
+
+
+@pytest.mark.asyncio
+async def test_sqlite_invocation_store_lookup_by_invocation_id(tmp_path: Path):
+    db_path = str(tmp_path / "invocations.db")
+    store_a = SqliteOneShotInvocationStore(db_path)
+    started, record = await store_a.start_or_get("idem-lookup", "stream")
+    assert started is True
+
+    store_b = SqliteOneShotInvocationStore(db_path)
+    found = await store_b.get_by_invocation_id(record.invocation_id)
+
+    assert found is not None
+    assert found.idempotency_key == "idem-lookup"
+    assert found.mode == "stream"
+    assert found.invocation_id == record.invocation_id
 
 
 # ── Tier A: stream/invoke handlers must transition record on abort ────────────
@@ -1126,6 +1175,57 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
     assert [event.get("kind") for event in events] == ["content", "terminal_error"]
     assert events[-1]["error"] == "boom"
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
+
+
+def test_stream_invocation_status_events_and_result_endpoints():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_stream_manifest("stream-invocation-query"), invocation_store=store)
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "hello "}
+        yield {"kind": "final", "output": {"answer": "world"}}
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        headers={"Idempotency-Key": "stream-invocation-key-1"},
+        json={"input": {"q": "x"}},
+    ) as resp:
+        assert resp.status_code == 200
+        assert [json.loads(line)["kind"] for line in resp.iter_lines() if line.strip()] == [
+            "content",
+            "final",
+            "done",
+        ]
+
+    started, record = asyncio.run(
+        store.start_or_get("stream-invocation-key-1", "stream")
+    )
+    assert started is False
+
+    status = client.get(f"/invocations/{record.invocation_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    assert status.json()["invocation_id"] == record.invocation_id
+
+    events = client.get(f"/invocations/{record.invocation_id}/events")
+    assert events.status_code == 200
+    assert [event["kind"] for event in events.json()["events"]] == [
+        "content",
+        "final",
+        "done",
+    ]
+
+    result = client.get(f"/invocations/{record.invocation_id}/result")
+    assert result.status_code == 200
+    body = result.json()
+    assert body["output"]["answer"] == "world"
+    assert body["output"]["transcript"] == "hello "
 
 
 @pytest.mark.asyncio
