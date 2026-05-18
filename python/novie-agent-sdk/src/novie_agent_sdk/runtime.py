@@ -634,6 +634,33 @@ class TaskRecord:
     error: str | None = None
 
 
+# ── One-shot invocation store: lease + heartbeat defense ──────────────────────
+#
+# The /stream and /invoke endpoints register an idempotency record in
+# ``in_progress`` and only transition it on a terminal event. If the platform
+# disconnects mid-stream — or the agent process dies between ``start_or_get``
+# and the terminal call — the record is stuck at ``in_progress``. Subsequent
+# retries with the same Idempotency-Key would deadlock on 409
+# ``retry_in_progress`` forever. Two defenses:
+#
+#   1. Tier A — stream/invoke handlers wrap their work in try/finally; if
+#      neither ``complete`` nor ``fail`` was called, the finally calls
+#      ``fail("...aborted_before_terminal")`` so the record reaches a terminal
+#      state even on CancelledError / GeneratorExit / client disconnect.
+#   2. Tier B — every ``in_progress`` record carries a lease
+#      (``lease_seconds``). ``start_or_get`` checks ``_is_lease_stale``; if a
+#      record is ``in_progress`` past its lease, it's recycled into a fresh
+#      record so a new request can proceed (covers the agent-process-crash
+#      case where Tier A's finally never ran). The stream handler renews the
+#      lease via ``touch`` every ``NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS``.
+_DEFAULT_INVOCATION_LEASE_SECONDS = _env_int(
+    "NOVIE_AGENT_INVOCATION_LEASE_SECONDS", default=300,
+)
+_DEFAULT_INVOCATION_HEARTBEAT_EVENTS = _env_int(
+    "NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS", default=10,
+)
+
+
 @dataclass
 class OneShotInvocationRecord:
     idempotency_key: str
@@ -644,6 +671,21 @@ class OneShotInvocationRecord:
     response: dict[str, Any] | None = None
     events: list[dict[str, Any]] | None = None
     error: str | None = None
+    lease_seconds: int = field(default_factory=lambda: _DEFAULT_INVOCATION_LEASE_SECONDS)
+
+
+def _is_lease_stale(record: OneShotInvocationRecord) -> bool:
+    """True if record is ``in_progress`` and its lease has lapsed."""
+    if record.status != "in_progress":
+        return False
+    try:
+        updated = datetime.fromisoformat(record.updated_at)
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - updated).total_seconds()
+    return age_seconds > max(record.lease_seconds, 1)
 
 
 class OneShotInvocationStore(Protocol):
@@ -664,6 +706,12 @@ class OneShotInvocationStore(Protocol):
 
     async def fail(self, idempotency_key: str, mode: str, error: str) -> None: ...
 
+    async def touch(self, idempotency_key: str, mode: str) -> None:
+        """Renew the lease on an ``in_progress`` record. No-op if record is
+        absent or already in a terminal state. Adopters can implement this as
+        a no-op if they don't need lease-based recovery."""
+        ...
+
 
 class InMemoryOneShotInvocationStore:
     """In-memory one-shot idempotency cache for invoke/stream endpoints."""
@@ -681,7 +729,24 @@ class InMemoryOneShotInvocationStore:
             key = (mode, idempotency_key)
             existing = self._records.get(key)
             if existing is not None:
-                return False, existing
+                if _is_lease_stale(existing):
+                    # Tier B: previous handler died without reaching a terminal
+                    # state and its lease has elapsed. Mark the stale record
+                    # ``expired`` (for any debug surface that still reads it)
+                    # and let a fresh invocation proceed.
+                    _log.warning(
+                        "recycling stale in_progress invocation record "
+                        "mode=%s idempotency_key=%s updated_at=%s lease=%ds",
+                        mode,
+                        idempotency_key,
+                        existing.updated_at,
+                        existing.lease_seconds,
+                    )
+                    existing.status = "expired"
+                    existing.error = "lease_expired_no_activity"
+                    existing.updated_at = _now_iso()
+                else:
+                    return False, existing
             record = OneShotInvocationRecord(
                 idempotency_key=idempotency_key,
                 mode=mode,
@@ -716,6 +781,15 @@ class InMemoryOneShotInvocationStore:
             record.updated_at = _now_iso()
             record.error = error
 
+    async def touch(self, idempotency_key: str, mode: str) -> None:
+        """Renew the lease on an ``in_progress`` record. Silent no-op for
+        absent records or those already in a terminal state."""
+        async with self._lock:
+            record = self._records.get((mode, idempotency_key))
+            if record is None or record.status != "in_progress":
+                return
+            record.updated_at = _now_iso()
+
 
 class SqliteOneShotInvocationStore:
     """Durable SQLite-backed one-shot idempotency/result cache."""
@@ -749,7 +823,43 @@ class SqliteOneShotInvocationStore:
                 (mode, idempotency_key),
             ).fetchone()
             if row is not None:
-                return False, self._row_to_record(row)
+                existing = self._row_to_record(row)
+                if _is_lease_stale(existing):
+                    # Tier B: stale ``in_progress`` row — agent died between
+                    # ``start_or_get`` and the terminal call. Overwrite the
+                    # row in-place with a fresh ``in_progress`` so a new
+                    # request can proceed.
+                    _log.warning(
+                        "recycling stale in_progress invocation row "
+                        "mode=%s idempotency_key=%s updated_at=%s lease=%ds",
+                        mode,
+                        idempotency_key,
+                        existing.updated_at,
+                        existing.lease_seconds,
+                    )
+                    now = _now_iso()
+                    conn.execute(
+                        """
+                        UPDATE sdk_one_shot_invocations
+                        SET status = 'in_progress',
+                            created_at = ?,
+                            updated_at = ?,
+                            response_json = NULL,
+                            events_json = NULL,
+                            error = NULL
+                        WHERE mode = ? AND idempotency_key = ?
+                        """,
+                        (now, now, mode, idempotency_key),
+                    )
+                    conn.commit()
+                    return True, OneShotInvocationRecord(
+                        idempotency_key=idempotency_key,
+                        mode=mode,
+                        status="in_progress",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                return False, existing
             record = OneShotInvocationRecord(
                 idempotency_key=idempotency_key,
                 mode=mode,
@@ -828,6 +938,22 @@ class SqliteOneShotInvocationStore:
                 WHERE mode = ? AND idempotency_key = ?
                 """,
                 (_now_iso(), error, mode, idempotency_key),
+            )
+            conn.commit()
+
+    async def touch(self, idempotency_key: str, mode: str) -> None:
+        await asyncio.to_thread(self._touch_sync, idempotency_key, mode)
+
+    def _touch_sync(self, idempotency_key: str, mode: str) -> None:
+        with self._lock, sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                UPDATE sdk_one_shot_invocations
+                SET updated_at = ?
+                WHERE mode = ? AND idempotency_key = ?
+                  AND status = 'in_progress'
+                """,
+                (_now_iso(), mode, idempotency_key),
             )
             conn.commit()
 
@@ -1880,24 +2006,52 @@ class Agent:
                     ),
                     **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
                 )
+                invocation_resolved = False
                 try:
-                    result = await self._invoke_handler(ctx)
-                except Exception as exc:
+                    try:
+                        result = await self._invoke_handler(ctx)
+                    except Exception as exc:
+                        if started_invocation and hdrs.idempotency_key:
+                            await self._invocation_store.fail(
+                                hdrs.idempotency_key,
+                                "invoke",
+                                str(exc),
+                            )
+                            invocation_resolved = True
+                        raise
+                    response = _coerce_invoke_response(result)
                     if started_invocation and hdrs.idempotency_key:
-                        await self._invocation_store.fail(
+                        await self._invocation_store.complete(
                             hdrs.idempotency_key,
                             "invoke",
-                            str(exc),
+                            response=response,
                         )
-                    raise
-                response = _coerce_invoke_response(result)
-                if started_invocation and hdrs.idempotency_key:
-                    await self._invocation_store.complete(
-                        hdrs.idempotency_key,
-                        "invoke",
-                        response=response,
-                    )
-                return response
+                        invocation_resolved = True
+                    return response
+                finally:
+                    # Tier A safety net: ``CancelledError`` / ``GeneratorExit``
+                    # / other BaseException bypass the inner ``except Exception``
+                    # handler. Without this, the idempotency record gets
+                    # stranded at ``in_progress`` and subsequent retries hit
+                    # 409 ``retry_in_progress`` forever.
+                    if (
+                        started_invocation
+                        and hdrs.idempotency_key
+                        and not invocation_resolved
+                    ):
+                        try:
+                            await self._invocation_store.fail(
+                                hdrs.idempotency_key,
+                                "invoke",
+                                "invoke_aborted_before_terminal",
+                            )
+                        except Exception:  # noqa: BLE001
+                            _log.exception(
+                                "invocation_store.fail in finally raised; "
+                                "record may stay in_progress until lease expires "
+                                "(idempotency_key=%s)",
+                                hdrs.idempotency_key,
+                            )
 
         # stream mode
         if m.protocol_mode == "stream" or self._stream_handler is not None:
@@ -1955,6 +2109,28 @@ class Agent:
                 async def _gen() -> AsyncIterator[bytes]:
                     emitted_events: list[dict[str, Any]] = []
                     terminal_error_emitted = False
+                    invocation_resolved = False
+                    events_since_touch = 0
+
+                    async def _maybe_heartbeat() -> None:
+                        # Tier B: renew the in_progress lease so a long-running
+                        # handler isn't recycled by ``_is_lease_stale`` while
+                        # it's still actively producing.
+                        nonlocal events_since_touch
+                        events_since_touch += 1
+                        if events_since_touch < _DEFAULT_INVOCATION_HEARTBEAT_EVENTS:
+                            return
+                        events_since_touch = 0
+                        if not (started_invocation and hdrs.idempotency_key):
+                            return
+                        try:
+                            await self._invocation_store.touch(
+                                hdrs.idempotency_key, "stream",
+                            )
+                        except Exception:  # noqa: BLE001
+                            # Heartbeat failure is non-fatal; the lease will
+                            # just expire normally if downstream really did die.
+                            _log.debug("invocation_store.touch raised", exc_info=True)
 
                     async def _runner() -> None:
                         try:
@@ -1989,6 +2165,7 @@ class Agent:
                                         "stream",
                                         events=emitted_events,
                                     )
+                                    invocation_resolved = True
                                 yield (json.dumps(error_event) + "\n").encode()
                                 break
                             if kind == "obs":
@@ -1996,6 +2173,7 @@ class Agent:
                                 # to_platform_task_event); forward verbatim.
                                 emitted_events.append(payload)
                                 yield (json.dumps(payload) + "\n").encode()
+                                await _maybe_heartbeat()
                                 continue
                             # handler event
                             if isinstance(payload, dict):
@@ -2004,6 +2182,7 @@ class Agent:
                                 event = {"kind": "content", "text": str(payload)}
                             emitted_events.append(event)
                             yield (json.dumps(event) + "\n").encode()
+                            await _maybe_heartbeat()
                         if not terminal_error_emitted:
                             done_event = {
                                 "kind": "done",
@@ -2017,6 +2196,7 @@ class Agent:
                                     "stream",
                                     events=emitted_events,
                                 )
+                                invocation_resolved = True
                             yield (json.dumps(done_event) + "\n").encode()
                     finally:
                         if not runner_task.done():
@@ -2025,6 +2205,29 @@ class Agent:
                             await runner_task
                         except (asyncio.CancelledError, Exception):
                             pass
+                        # Tier A safety net: client disconnect /
+                        # GeneratorExit / CancelledError cut the loop before
+                        # the terminal complete() call. Without this, the
+                        # record sits in ``in_progress`` forever and retries
+                        # deadlock on 409 retry_in_progress.
+                        if (
+                            started_invocation
+                            and hdrs.idempotency_key
+                            and not invocation_resolved
+                        ):
+                            try:
+                                await self._invocation_store.fail(
+                                    hdrs.idempotency_key,
+                                    "stream",
+                                    "stream_aborted_before_terminal",
+                                )
+                            except Exception:  # noqa: BLE001
+                                _log.exception(
+                                    "invocation_store.fail in finally raised; "
+                                    "record may stay in_progress until lease "
+                                    "expires (idempotency_key=%s)",
+                                    hdrs.idempotency_key,
+                                )
 
                 return StreamingResponse(_gen(), media_type="application/x-ndjson")
 

@@ -28,6 +28,7 @@ from novie_agent_sdk.runtime import (
     Agent,
     AskBudgetExceeded,
     AskTimedOut,
+    InMemoryOneShotInvocationStore,
     InMemoryTaskStore,
     InvokeContext,
     RegistrationClient,
@@ -533,6 +534,219 @@ async def test_sqlite_one_shot_invocation_store_persists_completed_response(
     assert started is False
     assert replay.status == "completed"
     assert replay.response == {"status": "completed", "output": {"answer": 42}}
+
+
+# ── Tier B: lease + heartbeat regression coverage ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_fresh_in_progress_returns_duplicate():
+    """Fresh in_progress (lease not stale) still returns the cached record so
+    duplicate retries see the existing in-flight invocation."""
+    store = InMemoryOneShotInvocationStore()
+    started_first, first = await store.start_or_get("idem-fresh", "stream")
+    assert started_first is True
+    assert first.status == "in_progress"
+
+    # Second call mid-flight (lease still valid) sees the same record.
+    started_second, second = await store.start_or_get("idem-fresh", "stream")
+    assert started_second is False
+    assert second.status == "in_progress"
+    assert second is first  # same record
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_stale_in_progress_recycled():
+    """A previous in_progress record whose lease has elapsed is recycled —
+    start_or_get returns started=True so a new invocation can proceed."""
+    store = InMemoryOneShotInvocationStore()
+    started, record = await store.start_or_get("idem-stale", "stream")
+    assert started is True
+
+    # Simulate agent crash mid-stream: record is stuck in_progress but the
+    # wall-clock has advanced past the lease.
+    record.updated_at = "2000-01-01T00:00:00+00:00"
+
+    started_again, fresh = await store.start_or_get("idem-stale", "stream")
+    assert started_again is True
+    assert fresh.status == "in_progress"
+    assert fresh is not record  # a brand new record
+    # The recycled old record was marked expired.
+    assert record.status == "expired"
+    assert record.error == "lease_expired_no_activity"
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_touch_renews_lease():
+    """touch() bumps updated_at so a long-running but actively-streaming
+    handler does not get recycled by the stale-lease check."""
+    store = InMemoryOneShotInvocationStore()
+    started, record = await store.start_or_get("idem-touch", "stream")
+    assert started is True
+    initial_updated_at = record.updated_at
+
+    # Wait a millisecond so any monotonic-style clock would advance.
+    await asyncio.sleep(0.01)
+    await store.touch("idem-touch", "stream")
+
+    assert record.updated_at != initial_updated_at  # bumped
+    assert record.status == "in_progress"  # status unchanged
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_touch_noop_on_terminal_records():
+    """touch() must NOT bump updated_at on completed/failed records — a
+    racy heartbeat after the terminal call should be a silent no-op."""
+    store = InMemoryOneShotInvocationStore()
+    await store.start_or_get("idem-done", "invoke")
+    await store.complete("idem-done", "invoke", response={"status": "completed"})
+
+    completed_record = store._records[("invoke", "idem-done")]  # noqa: SLF001
+    locked_updated_at = completed_record.updated_at
+    await asyncio.sleep(0.01)
+    await store.touch("idem-done", "invoke")
+
+    assert completed_record.updated_at == locked_updated_at
+    assert completed_record.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_touch_silent_on_missing_record():
+    """touch() on an unknown key is a silent no-op (never raises)."""
+    store = InMemoryOneShotInvocationStore()
+    await store.touch("never-started", "stream")  # should not raise
+
+
+@pytest.mark.asyncio
+async def test_sqlite_invocation_store_stale_in_progress_recycled(tmp_path: Path):
+    """Sqlite mirror of the in-memory recycle test — persisted in_progress
+    rows whose lease has elapsed are recycled in-place."""
+    db_path = str(tmp_path / "invocations.db")
+    store = SqliteOneShotInvocationStore(db_path)
+    started, record = await store.start_or_get("idem-stale", "stream")
+    assert started is True
+
+    # Backdate the row directly to simulate an agent that crashed mid-stream
+    # ages ago. (In production this would happen by elapsed wall-clock time.)
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE sdk_one_shot_invocations SET updated_at = ? "
+            "WHERE mode = ? AND idempotency_key = ?",
+            ("2000-01-01T00:00:00+00:00", "stream", "idem-stale"),
+        )
+        conn.commit()
+
+    started_again, fresh = await store.start_or_get("idem-stale", "stream")
+    assert started_again is True
+    assert fresh.status == "in_progress"
+    # The recycled row should now show a current (recent) updated_at.
+    assert fresh.updated_at >= record.updated_at
+
+
+@pytest.mark.asyncio
+async def test_sqlite_invocation_store_touch_renews_lease(tmp_path: Path):
+    """Sqlite touch() updates the row's updated_at column."""
+    db_path = str(tmp_path / "invocations.db")
+    store = SqliteOneShotInvocationStore(db_path)
+    started, record = await store.start_or_get("idem-touch", "stream")
+    assert started is True
+    initial_updated_at = record.updated_at
+
+    await asyncio.sleep(0.01)
+    await store.touch("idem-touch", "stream")
+
+    _, refreshed = await store.start_or_get("idem-touch", "stream")
+    assert refreshed.status == "in_progress"
+    assert refreshed.updated_at != initial_updated_at
+
+
+# ── Tier A: stream/invoke handlers must transition record on abort ────────────
+
+
+@pytest.mark.asyncio
+async def test_invoke_handler_cancelled_transitions_record_to_failed():
+    """The /invoke endpoint's finally guard must call fail() when the
+    handler is cancelled mid-await (BaseException path that bypasses the
+    inner ``except Exception`` block)."""
+    from novie_agent_sdk.runtime import OneShotInvocationRecord
+
+    store = InMemoryOneShotInvocationStore()
+
+    # Simulate what the endpoint does: start the record, then have the
+    # handler get cancelled before it can transition the record.
+    started, _ = await store.start_or_get("idem-cancel", "invoke")
+    assert started is True
+
+    invocation_resolved = False
+    try:
+        try:
+            await asyncio.sleep(0.01)
+            raise asyncio.CancelledError("client disconnected")
+        except Exception as exc:  # noqa: BLE001
+            # CancelledError is BaseException in py3.8+, so this branch is NOT
+            # hit — that's exactly the bug Tier A fixes.
+            await store.fail("idem-cancel", "invoke", str(exc))
+            invocation_resolved = True
+            raise
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if not invocation_resolved:
+            await store.fail(
+                "idem-cancel",
+                "invoke",
+                "invoke_aborted_before_terminal",
+            )
+            invocation_resolved = True
+
+    record: OneShotInvocationRecord = store._records[("invoke", "idem-cancel")]  # noqa: SLF001
+    assert record.status == "failed"
+    assert record.error == "invoke_aborted_before_terminal"
+
+
+@pytest.mark.asyncio
+async def test_invoke_handler_exception_still_transitions_via_inner_handler():
+    """Regular Exception path (not BaseException) goes through the inner
+    ``except Exception`` block and the finally guard is a no-op. This is
+    the regression check that the Tier A change doesn't double-fail."""
+    store = InMemoryOneShotInvocationStore()
+
+    started, _ = await store.start_or_get("idem-error", "invoke")
+    assert started is True
+
+    invocation_resolved = False
+    fail_call_count = 0
+    original_fail = store.fail
+
+    async def counting_fail(*args, **kwargs):
+        nonlocal fail_call_count
+        fail_call_count += 1
+        await original_fail(*args, **kwargs)
+
+    store.fail = counting_fail  # type: ignore[method-assign]
+
+    try:
+        try:
+            raise RuntimeError("handler died")
+        except Exception as exc:  # noqa: BLE001
+            await store.fail("idem-error", "invoke", str(exc))
+            invocation_resolved = True
+            raise
+    except RuntimeError:
+        pass
+    finally:
+        if not invocation_resolved:
+            await store.fail(
+                "idem-error",
+                "invoke",
+                "invoke_aborted_before_terminal",
+            )
+
+    assert fail_call_count == 1  # only the inner handler called fail
+    record = store._records[("invoke", "idem-error")]  # noqa: SLF001
+    assert record.status == "failed"
+    assert record.error == "handler died"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
