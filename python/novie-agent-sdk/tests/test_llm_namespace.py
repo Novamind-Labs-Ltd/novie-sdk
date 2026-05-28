@@ -60,6 +60,56 @@ class TestLlmChat:
         result = _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
         assert result["content"] == "Hi there!"
 
+    def test_tool_calling_args_are_forwarded(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Caller:
+            async def invoke_with_diagnostics(
+                self,
+                cap_id: str,
+                args: Any,
+            ) -> CapabilityCallDiagnostics:
+                captured["cap_id"] = cap_id
+                captured["args"] = args
+                return CapabilityCallDiagnostics(
+                    ok=True,
+                    capability_id=cap_id,
+                    result={
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "name": "lookup",
+                                "args": {"query": "hello"},
+                                "id": "call-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    },
+                )
+
+        ns = PlatformNamespace(_Caller())  # type: ignore[arg-type]
+        result = _run(ns.llm.chat(
+            [{"role": "user", "content": "Hello"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Lookup data",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+        ))
+
+        assert captured["cap_id"] == "platform.llm.chat"
+        assert captured["args"]["tools"][0]["function"]["name"] == "lookup"
+        assert captured["args"]["tool_choice"] == "auto"
+        assert captured["args"]["parallel_tool_calls"] is False
+        assert result["tool_calls"][0]["name"] == "lookup"
+
     def test_quota_exceeded_in_result_raises(self) -> None:
         ns = _make_ns(responses={
             "platform.llm.chat": CapabilityCallDiagnostics(

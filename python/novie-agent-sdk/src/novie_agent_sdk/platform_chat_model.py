@@ -8,9 +8,10 @@ First-version capabilities:
 - ``ainvoke(messages)`` — delegates to ``platform.llm.chat``.
 - ``with_structured_output(schema)`` — delegates to ``platform.llm.structured``.
   Accepts a ``dict`` (JSON Schema) or a Pydantic ``BaseModel`` class.
+- ``bind_tools(tools)`` — converts LangChain tools to OpenAI-compatible
+  schemas and delegates tool-call generation to ``platform.llm.chat``.
 
 Not supported in v1:
-- Tool calling / function calling.
 - Streaming (stream returns a single chunk containing the full response).
 - ``batch`` / ``abatch``.
 
@@ -25,18 +26,24 @@ Usage::
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any, Iterator, Optional, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .platform_namespace import PlatformNamespace
 
+try:
+    from langchain_core.language_models.chat_models import BaseChatModel as _BaseChatModel
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import ConfigDict, Field
+except ImportError:  # pragma: no cover - exercised only without langchain-core
+    _BaseChatModel = object  # type: ignore[assignment]
+    ChatGeneration = None  # type: ignore[assignment]
+    ChatResult = None  # type: ignore[assignment]
+    ConfigDict = dict  # type: ignore[assignment]
+    Field = lambda default=None, **_kwargs: default  # type: ignore[assignment]
+
 _log = logging.getLogger(__name__)
-
-_TOOL_CALLING_NOT_SUPPORTED_MSG = (
-    "PlatformChatModel v1 does not support tool calling. "
-    "Use a BYOK ChatOpenAI model for tool-calling workflows."
-)
-
 
 def _require_langchain() -> None:
     try:
@@ -48,14 +55,22 @@ def _require_langchain() -> None:
         ) from exc
 
 
-class PlatformChatModel:
+class PlatformChatModel(_BaseChatModel):
     """Thin LangChain-compatible wrapper around ``ctx.platform.llm``.
 
-    Implements enough of the ``BaseChatModel`` protocol for use with
-    basic LangGraph nodes and ``ainvoke`` / ``with_structured_output``
-    workflows.  Full BaseChatModel inheritance is avoided to keep this
-    module dependency-free when langchain_core is not installed.
+    Implements enough of the Runnable chat-model protocol for use with
+    LangGraph nodes and ``ainvoke`` / ``astream`` /
+    ``with_structured_output`` workflows.
     """
+
+    platform_ns: Any = Field(exclude=True)
+    model: str | None = None
+    temperature: float | None = None
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __init__(
         self,
@@ -63,12 +78,19 @@ class PlatformChatModel:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> None:
         _require_langchain()
-        self._platform_ns = platform_ns
-        self._model = model
-        self._temperature = temperature
-        self._output_schema: dict[str, Any] | None = None
+        super().__init__(
+            platform_ns=platform_ns,
+            model=model,
+            temperature=temperature,
+            tools=list(tools or []),
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
 
     # ── LangChain BaseChatModel duck-typing ──────────────────────────────
 
@@ -76,17 +98,57 @@ class PlatformChatModel:
     def _llm_type(self) -> str:
         return "novie_platform"
 
-    def _message_to_dict(self, message: Any) -> dict[str, str]:
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    def _generate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        raise NotImplementedError(
+            "PlatformChatModel does not support synchronous invoke. Use ainvoke."
+        )
+
+    async def _agenerate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        msg = await self.ainvoke(messages, **kwargs)
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+    def _message_to_dict(self, message: Any) -> dict[str, Any]:
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
         if isinstance(message, SystemMessage):
             return {"role": "system", "content": str(message.content)}
         if isinstance(message, AIMessage):
-            return {"role": "assistant", "content": str(message.content)}
+            payload: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls:
+                payload["tool_calls"] = [dict(item) for item in tool_calls]
+            invalid_tool_calls = getattr(message, "invalid_tool_calls", None)
+            if invalid_tool_calls:
+                payload["invalid_tool_calls"] = [dict(item) for item in invalid_tool_calls]
+            additional_kwargs = getattr(message, "additional_kwargs", None)
+            if additional_kwargs:
+                payload["additional_kwargs"] = dict(additional_kwargs)
+            return payload
         if isinstance(message, HumanMessage):
             return {"role": "user", "content": str(message.content)}
+        if isinstance(message, ToolMessage):
+            payload = {
+                "role": "tool",
+                "content": str(message.content),
+                "tool_call_id": str(message.tool_call_id),
+            }
+            if getattr(message, "name", None):
+                payload["name"] = str(message.name)
+            return payload
         role = getattr(message, "type", "user")
-        content = str(getattr(message, "content", ""))
+        content = getattr(message, "content", "")
         return {"role": role, "content": content}
 
     async def ainvoke(
@@ -102,18 +164,23 @@ class PlatformChatModel:
         """
         from langchain_core.messages import AIMessage
 
-        if self._output_schema is not None:
-            return await self._invoke_structured(input)
-
         messages = self._normalise_input(input)
-        result = await self._platform_ns.llm.chat(
+        result = await self.platform_ns.llm.chat(
             messages,
-            model=self._model,
-            temperature=self._temperature,
+            model=self.model,
+            temperature=self.temperature,
+            tools=self.tools or None,
+            tool_choice=self.tool_choice,
+            parallel_tool_calls=self.parallel_tool_calls,
         )
         content = result.get("content") or ""
         usage_metadata = result.get("usage_metadata") or {}
-        msg = AIMessage(content=content)
+        msg = AIMessage(
+            content=content,
+            tool_calls=list(result.get("tool_calls") or []),
+            invalid_tool_calls=list(result.get("invalid_tool_calls") or []),
+            additional_kwargs=dict(result.get("additional_kwargs") or {}),
+        )
         msg.usage_metadata = usage_metadata  # type: ignore[assignment]
         return msg
 
@@ -124,8 +191,21 @@ class PlatformChatModel:
         )
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> "PlatformChatModel":
-        """Tool binding is not supported in PlatformChatModel v1."""
-        raise NotImplementedError(_TOOL_CALLING_NOT_SUPPORTED_MSG)
+        """Return a model variant with OpenAI-compatible tool schemas bound."""
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        if tools is None:
+            tool_schemas: list[dict[str, Any]] = []
+        else:
+            tool_schemas = [convert_to_openai_tool(tool) for tool in tools]
+        return PlatformChatModel(
+            self.platform_ns,
+            model=self.model,
+            temperature=self.temperature,
+            tools=tool_schemas,
+            tool_choice=kwargs.get("tool_choice"),
+            parallel_tool_calls=kwargs.get("parallel_tool_calls"),
+        )
 
     def with_structured_output(
         self,
@@ -143,24 +223,12 @@ class PlatformChatModel:
         """
         json_schema = _resolve_schema(schema)
         return _StructuredPlatformModel(
-            platform_ns=self._platform_ns,
+            platform_ns=self.platform_ns,
             output_schema=json_schema,
             pydantic_class=schema if _is_pydantic_class(schema) else None,
-            model=self._model,
-            temperature=self._temperature,
+            model=self.model,
+            temperature=self.temperature,
         )
-
-    async def _invoke_structured(self, input: Any) -> Any:
-        """Internal path when output_schema is bound."""
-        assert self._output_schema is not None
-        messages = self._normalise_input(input)
-        result = await self._platform_ns.llm.structured(
-            messages,
-            self._output_schema,
-            model=self._model,
-            temperature=self._temperature,
-        )
-        return result.get("structured") or result
 
     def _normalise_input(self, input: Any) -> list[dict[str, str]]:
         if isinstance(input, str):
@@ -172,9 +240,25 @@ class PlatformChatModel:
     # ── Streaming stub (single-chunk) ─────────────────────────────────────
 
     async def astream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        """Streaming — returns a single-chunk async generator (no true streaming)."""
+        """Streaming — returns one chunk preserving content and tool-call chunks."""
+        from langchain_core.messages import AIMessageChunk
+
         result = await self.ainvoke(input, config, **kwargs)
-        yield result
+        tool_call_chunks = []
+        for index, call in enumerate(getattr(result, "tool_calls", None) or []):
+            tool_call_chunks.append(
+                {
+                    "name": call.get("name"),
+                    "args": json.dumps(call.get("args") or {}),
+                    "id": call.get("id"),
+                    "index": index,
+                }
+            )
+        yield AIMessageChunk(
+            content=result.content or "",
+            tool_call_chunks=tool_call_chunks,
+            response_metadata=dict(getattr(result, "response_metadata", None) or {}),
+        )
 
 
 class _StructuredPlatformModel:

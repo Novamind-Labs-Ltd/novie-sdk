@@ -42,10 +42,12 @@ The SDK never imports from ``novie_platform``; only from
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -81,6 +83,7 @@ _DEFAULT_TIMEOUT_SECONDS = 8.0
 # stream collapsed.  Treat LLM as its own latency tier so callers don't have
 # to second-guess the SDK default.
 _DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
+_DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
@@ -267,6 +270,181 @@ class _CapabilityCaller:
             capability_id=capability_id,
             result=result if isinstance(result, dict) else None,
         )
+
+    async def invoke_stream_with_diagnostics(
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
+    ) -> CapabilityCallDiagnostics:
+        path = f"/capabilities/{capability_id}/invoke-stream"
+        headers = sign_platform_callback_headers(
+            self._headers, method="POST", path=path,
+        )
+        body: dict[str, Any] = {
+            "arguments": dict(arguments),
+            "caller_type": "agent",
+            "caller_id": f"agent:{self._agent_id}",
+            "caller_mode": "execute",
+            "mode": "execute",
+        }
+
+        async def consume(client: httpx.AsyncClient) -> CapabilityCallDiagnostics:
+            async with client.stream("POST", path, json=body, headers=headers) as response:
+                if response.status_code == 404:
+                    await response.aread()
+                    return CapabilityCallDiagnostics(
+                        ok=False,
+                        capability_id=capability_id,
+                        kind="platform_unavailable",
+                        error_code="stream_endpoint_not_found",
+                        detail=_safe_text(response),
+                    )
+                if response.status_code >= 400:
+                    await response.aread()
+                    envelope_code = _extract_envelope_code(response)
+                    return CapabilityCallDiagnostics(
+                        ok=False,
+                        capability_id=capability_id,
+                        kind=classify_envelope_error(envelope_code, response.status_code),
+                        error_code=envelope_code or "",
+                        detail=_safe_text(response),
+                    )
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        return CapabilityCallDiagnostics(
+                            ok=False,
+                            capability_id=capability_id,
+                            kind="schema_violation",
+                            error_code="non_json_stream_event",
+                            detail=line[:200],
+                        )
+                    if not isinstance(event, dict):
+                        return CapabilityCallDiagnostics(
+                            ok=False,
+                            capability_id=capability_id,
+                            kind="schema_violation",
+                            error_code="non_object_stream_event",
+                        )
+
+                    event_type = str(event.get("type") or "")
+                    if not event_type and "status" in event:
+                        if str(event.get("status")) == "ok":
+                            result = event.get("result")
+                            if result is not None and not isinstance(result, dict):
+                                return CapabilityCallDiagnostics(
+                                    ok=False,
+                                    capability_id=capability_id,
+                                    kind="schema_violation",
+                                    error_code="non_object_result",
+                                )
+                            return CapabilityCallDiagnostics(
+                                ok=True,
+                                capability_id=capability_id,
+                                result=result if isinstance(result, dict) else None,
+                            )
+                        envelope_code = str(event.get("error_code") or "") or None
+                        return CapabilityCallDiagnostics(
+                            ok=False,
+                            capability_id=capability_id,
+                            kind=classify_envelope_error(envelope_code, http_status=None),
+                            error_code=envelope_code or "",
+                            detail=str(event.get("explanation") or ""),
+                        )
+
+                    if event_type in {"accepted", "heartbeat", "progress"}:
+                        continue
+                    if event_type == "completed":
+                        result = event.get("result")
+                        if result is not None and not isinstance(result, dict):
+                            return CapabilityCallDiagnostics(
+                                ok=False,
+                                capability_id=capability_id,
+                                kind="schema_violation",
+                                error_code="non_object_stream_result",
+                            )
+                        return CapabilityCallDiagnostics(
+                            ok=True,
+                            capability_id=capability_id,
+                            result=result if isinstance(result, dict) else None,
+                        )
+                    if event_type in {"error", "cancelled"}:
+                        envelope = event.get("envelope")
+                        envelope_code = str(event.get("error_code") or "") or None
+                        if isinstance(envelope, dict) and not envelope_code:
+                            envelope_code = str(envelope.get("error_code") or "") or None
+                        return CapabilityCallDiagnostics(
+                            ok=False,
+                            capability_id=capability_id,
+                            kind=classify_envelope_error(envelope_code, http_status=None),
+                            error_code=envelope_code or "",
+                            detail=str(
+                                event.get("explanation")
+                                or event.get("reason")
+                                or ""
+                            ),
+                        )
+                    return CapabilityCallDiagnostics(
+                        ok=False,
+                        capability_id=capability_id,
+                        kind="schema_violation",
+                        error_code="unknown_stream_event",
+                        detail=event_type,
+                    )
+
+                return CapabilityCallDiagnostics(
+                    ok=False,
+                    capability_id=capability_id,
+                    kind="transport_error",
+                    error_code="stream_closed_without_completion",
+                )
+
+        heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
+        try:
+            async with asyncio.timeout(max(float(self._timeout), heartbeat_timeout)):
+                if self._client is not None:
+                    return await consume(self._client)
+                timeout = httpx.Timeout(
+                    timeout=float(self._timeout),
+                    read=heartbeat_timeout,
+                )
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=timeout,
+                ) as client:
+                    return await consume(client)
+        except TimeoutError as exc:
+            _log.warning(
+                "platform capability stream timed out capability=%s reason=%r",
+                capability_id,
+                exc,
+            )
+            return CapabilityCallDiagnostics(
+                ok=False,
+                capability_id=capability_id,
+                kind="transport_error",
+                error_code="stream_heartbeat_timeout",
+                detail=str(exc),
+            )
+        except httpx.TransportError as exc:
+            _log.warning(
+                "platform capability stream transport error capability=%s reason=%r",
+                capability_id,
+                exc,
+            )
+            return CapabilityCallDiagnostics(
+                ok=False,
+                capability_id=capability_id,
+                kind="transport_error",
+                detail=str(exc),
+            )
 
 
 def _extract_envelope_code(response: httpx.Response) -> str | None:
@@ -635,21 +813,27 @@ class LlmNamespace:
 
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM.
 
         Args:
-            messages: List of ``{"role": ..., "content": ...}`` dicts.
+            messages: List of OpenAI-compatible chat message dicts.
             model: Optional model override (e.g. ``"anthropic/claude-opus-4.6"``).
                    Defaults to the platform-configured model.
             temperature: Sampling temperature override.
+            tools: Optional OpenAI-compatible tool definitions.
+            tool_choice: Optional provider tool-choice directive.
+            parallel_tool_calls: Optional provider parallel-tool-calling toggle.
 
         Returns:
-            ``{"content": str, "usage_metadata": {...}}`` on success.
+            ``{"content": str, "tool_calls": [...], "usage_metadata": {...}}`` on success.
 
         Raises:
             QuotaExceededError: Org token pool is exhausted.
@@ -659,6 +843,12 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
+        if tools:
+            args["tools"] = tools
+        if tool_choice is not None:
+            args["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            args["parallel_tool_calls"] = parallel_tool_calls
         diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
         return self._unwrap(diagnostics, _LLM_CHAT_CAP)
 
@@ -832,6 +1022,7 @@ class PlatformNamespace:
         # ``build_platform_namespace`` always provides a dedicated long-
         # timeout caller in production.
         self._llm_caller = llm_caller or caller
+        self._stream_llm_chat = llm_caller is not None
         self.default_project_id = default_project_id
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self._mid_run_ask_active = False
@@ -880,6 +1071,17 @@ class PlatformNamespace:
         share the 8 s default that's appropriate for short capabilities
         like knowledge / checkpoints.
         """
+        invoke_stream = getattr(self._llm_caller, "invoke_stream_with_diagnostics", None)
+        if self._stream_llm_chat and capability_id == _LLM_CHAT_CAP and callable(invoke_stream):
+            diagnostics = await invoke_stream(capability_id, arguments)
+            if not (
+                not diagnostics.ok
+                and diagnostics.error_code == "stream_endpoint_not_found"
+            ):
+                if not diagnostics.ok:
+                    self._diagnostics.append(diagnostics)
+                return diagnostics
+
         diagnostics = await self._llm_caller.invoke_with_diagnostics(
             capability_id, arguments,
         )

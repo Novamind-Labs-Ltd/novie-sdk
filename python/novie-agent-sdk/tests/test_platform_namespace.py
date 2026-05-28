@@ -548,6 +548,54 @@ async def test_llm_chat_raises_call_error_on_envelope_5xx() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_chat_uses_streaming_capability_endpoint() -> None:
+    captured_paths: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured_paths.append(request.url.path)
+        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        return httpx.Response(
+            200,
+            content=(
+                b'{"type":"accepted","invocation_id":"i1"}\n'
+                b'{"type":"heartbeat","invocation_id":"i1","seq":1}\n'
+                b'{"type":"completed","invocation_id":"i1",'
+                b'"result":{"content":"hello","usage_metadata":{"total_tokens":7}}}\n'
+            ),
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    result = await ns.llm.chat([{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "hello"
+    assert result["usage_metadata"]["total_tokens"] == 7
+    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_falls_back_to_legacy_invoke_when_stream_endpoint_missing() -> None:
+    captured_paths: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured_paths.append(request.url.path)
+        if request.url.path.endswith("/invoke-stream"):
+            return httpx.Response(404, json={"error_code": "not_found"})
+        return httpx.Response(200, json=_ok_envelope({"content": "legacy"}))
+
+    ns = _build_with_responder(responder)
+
+    result = await ns.llm.chat([{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "legacy"
+    assert captured_paths == [
+        "/capabilities/platform.llm.chat/invoke-stream",
+        "/capabilities/platform.llm.chat/invoke",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_llm_structured_still_raises_quota_exceeded_separately() -> None:
     """``QuotaExceededError`` is the one exception that should NOT be
     folded into ``PlatformLlmCallError`` — handlers branch on it to surface
@@ -654,6 +702,6 @@ async def test_invoke_llm_capability_routes_through_llm_caller() -> None:
     ns._llm_caller.invoke_with_diagnostics = llm_wrapper  # type: ignore[method-assign]  # noqa: SLF001
 
     await ns.invoke_capability("platform.knowledge.search", {"query": "x"})
-    await ns.invoke_llm_capability("platform.llm.chat", {"messages": []})
+    await ns.invoke_llm_capability("platform.llm.structured", {"messages": []})
 
     assert counts == {"default": 1, "llm": 1}

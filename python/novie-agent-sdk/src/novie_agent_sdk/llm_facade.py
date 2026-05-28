@@ -69,10 +69,13 @@ class LlmFacade:
 
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict[str, Any]:
         """Send a chat request.
 
@@ -88,11 +91,21 @@ class LlmFacade:
         """
         if self.platform_available:
             result = await self._platform_ns.llm.chat(
-                messages, model=model, temperature=temperature,
+                messages,
+                model=model,
+                temperature=temperature,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
             )
             return {**result, "llm_mode": "platform"}
 
         if self._byok is not None:
+            if tools:
+                raise RuntimeError(
+                    "LlmFacade BYOK chat does not support tool-calling through "
+                    "the facade. Use a LangChain ChatModel for tool workflows."
+                )
             result = await self._byok.chat(messages, model=model, temperature=temperature)
             return {**result, "llm_mode": "byok"}
 
