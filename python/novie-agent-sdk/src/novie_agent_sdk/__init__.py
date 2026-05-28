@@ -104,6 +104,7 @@ from .platform_namespace import (
     PlatformNamespace,
     PlatformNamespaceProtocol,
     QuotaExceededError,
+    WebNamespace,
     build_platform_namespace,
     classify_envelope_error,
 )
@@ -213,6 +214,7 @@ __all__ = [
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
     "QuotaExceededError",
+    "WebNamespace",
     "build_platform_namespace",
     "classify_envelope_error",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)

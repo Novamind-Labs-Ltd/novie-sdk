@@ -245,6 +245,66 @@ async def test_knowledge_search_overrides_project_id_argument() -> None:
     assert captured["body"]["arguments"]["project_id"] == "custom-project"
 
 
+# ── Live namespace: web.search ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_web_search_returns_platform_result_on_ok() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "provider": "tavily",
+                    "answer": "Use the platform capability.",
+                    "results": [{"title": "Result", "url": "https://example.test"}],
+                    "count": 1,
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    out = await ns.web.search("widgets", max_results=3, search_depth="basic")
+
+    assert out["provider"] == "tavily"
+    assert out["results"] == [{"title": "Result", "url": "https://example.test"}]
+    assert "/capabilities/platform.web.search/invoke" in captured["url"]
+    assert captured["body"]["arguments"]["query"] == "widgets"
+    assert captured["body"]["arguments"]["max_results"] == 3
+    assert captured["body"]["arguments"]["search_depth"] == "basic"
+    assert ns.last_diagnostics() == ()
+
+
+@pytest.mark.asyncio
+async def test_web_search_records_no_results_diagnostic() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": False,
+                    "provider": "tavily",
+                    "error": "web_search_unconfigured",
+                    "results": [],
+                    "count": 0,
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    out = await ns.web.search("widgets")
+    assert out["results"] == []
+    assert any(
+        d.capability_id == "platform.web.search" and d.kind == "no_results"
+        for d in ns.last_diagnostics()
+    )
+
+
 # ── Live namespace: binding denial / transport failure ──────────────────────
 
 

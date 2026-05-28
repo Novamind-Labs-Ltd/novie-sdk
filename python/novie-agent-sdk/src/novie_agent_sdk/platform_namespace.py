@@ -86,6 +86,7 @@ _DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
+_WEB_SEARCH_CAP = "platform.web.search"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
 _CHECKPOINT_GET_CAP = "platform.external_agent_checkpoint.get"
 _CHECKPOINT_LIST_CAP = "platform.external_agent_checkpoint.list"
@@ -607,6 +608,7 @@ class PlatformNamespaceProtocol(Protocol):
     """The shape of ``ctx.platform`` exposed to handlers."""
 
     knowledge: "KnowledgeNamespace"
+    web: "WebNamespace"
     checkpoints: "CheckpointsNamespace"
     llm: "LlmNamespace"
 
@@ -673,6 +675,77 @@ class KnowledgeNamespace:
                 )
             )
         return out
+
+
+class WebNamespace:
+    """``platform.web.search`` — platform-managed public web search.
+
+    Agents should use this namespace instead of depending on provider-specific
+    environment variables (for example ``TAVILY_API_KEY``). The platform owns
+    provider credentials, audit, policy, and future provider routing.
+    """
+
+    def __init__(self, parent: "PlatformNamespace") -> None:
+        self._parent = parent
+
+    async def search(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        search_depth: str = "advanced",
+        include_answer: bool = True,
+        include_raw_content: bool = False,
+        topic: str = "general",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "query": query,
+            "max_results": int(max_results),
+            "search_depth": search_depth,
+            "include_answer": bool(include_answer),
+            "include_raw_content": bool(include_raw_content),
+            "topic": topic,
+        }
+        diagnostics = await self._parent.invoke_capability(
+            _WEB_SEARCH_CAP, payload,
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "provider": "",
+                "error": diagnostics.error_code or diagnostics.kind or "web_search_failed",
+                "message": diagnostics.detail,
+                "results": [],
+                "count": 0,
+            }
+        result = diagnostics.result or {}
+        results_raw = result.get("results")
+        if not isinstance(results_raw, list):
+            self._parent._record_diagnostics(  # noqa: SLF001
+                CapabilityCallDiagnostics(
+                    ok=False,
+                    capability_id=_WEB_SEARCH_CAP,
+                    kind="schema_violation",
+                    error_code="missing_results_list",
+                )
+            )
+            return {
+                "available": False,
+                "provider": str(result.get("provider") or ""),
+                "error": "missing_results_list",
+                "results": [],
+                "count": 0,
+            }
+        if not results_raw:
+            self._parent._record_diagnostics(  # noqa: SLF001
+                CapabilityCallDiagnostics(
+                    ok=True,
+                    capability_id=_WEB_SEARCH_CAP,
+                    kind="no_results",
+                    error_code=str(result.get("error") or ""),
+                )
+            )
+        return dict(result)
 
 
 class CheckpointsNamespace:
@@ -1006,6 +1079,7 @@ class PlatformNamespace:
     """
 
     knowledge: KnowledgeNamespace
+    web: WebNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1027,6 +1101,7 @@ class PlatformNamespace:
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self._mid_run_ask_active = False
         self.knowledge = KnowledgeNamespace(self)
+        self.web = WebNamespace(self)
         self.checkpoints = CheckpointsNamespace(self)
         self.llm = LlmNamespace(self)
 
@@ -1111,6 +1186,7 @@ class _UnavailablePlatformNamespace:
     """
 
     knowledge: KnowledgeNamespace
+    web: WebNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1119,6 +1195,7 @@ class _UnavailablePlatformNamespace:
         self.default_project_id = ""
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self.knowledge = KnowledgeNamespace(self)  # type: ignore[arg-type]
+        self.web = WebNamespace(self)  # type: ignore[arg-type]
         self.checkpoints = CheckpointsNamespace(self)  # type: ignore[arg-type]
         self.llm = LlmNamespace(self)  # type: ignore[arg-type]
 
