@@ -86,6 +86,30 @@ class _ToolStreamingLlmStub(_LlmStub):
         yield {"type": "completed", "result": {"content": ""}}
 
 
+class _ToolBoundStreamingLlmStub(_LlmStub):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_calls = 0
+
+    async def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any):  # type: ignore[no-untyped-def]
+        self.stream_calls += 1
+        self.calls.append({"messages": messages, **kwargs, "stream": True})
+        yield {
+            "type": "chunk",
+            "delta": {
+                "content": "",
+                "tool_call_chunks": [
+                    {
+                        "id": "toolu_1",
+                        "name": "lookup",
+                        "args": "{}",
+                    },
+                    {"id": None, "name": None, "args": 'ry":"hello"}'},
+                ],
+            },
+        }
+
+
 class _StreamingPlatformNamespaceStub:
     def __init__(self) -> None:
         self.llm = _StreamingLlmStub()
@@ -94,6 +118,11 @@ class _StreamingPlatformNamespaceStub:
 class _ToolStreamingPlatformNamespaceStub:
     def __init__(self) -> None:
         self.llm = _ToolStreamingLlmStub()
+
+
+class _ToolBoundStreamingPlatformNamespaceStub:
+    def __init__(self) -> None:
+        self.llm = _ToolBoundStreamingLlmStub()
 
 
 @tool
@@ -127,6 +156,28 @@ def test_astream_preserves_tool_call_chunks() -> None:
     assert len(chunks) == 1
     assert chunks[0].tool_call_chunks[0]["name"] == "lookup"
     assert chunks[0].tool_call_chunks[0]["args"] == '{"query": "hello"}'
+
+
+def test_astream_bound_tools_uses_terminal_result_not_tool_delta_stream() -> None:
+    platform = _ToolBoundStreamingPlatformNamespaceStub()
+    model = PlatformChatModel(platform).bind_tools([lookup])
+
+    async def _collect() -> list[Any]:
+        return [chunk async for chunk in model.astream([HumanMessage(content="hello")])]
+
+    chunks = _run(_collect())
+
+    assert platform.llm.stream_calls == 0
+    assert platform.llm.calls[0]["tools"][0]["function"]["name"] == "lookup"
+    assert chunks[0].tool_call_chunks == [
+        {
+            "name": "lookup",
+            "args": '{"query": "hello"}',
+            "id": "call-1",
+            "index": 0,
+            "type": "tool_call_chunk",
+        }
+    ]
 
 
 def test_astream_uses_platform_stream_chat_chunks() -> None:

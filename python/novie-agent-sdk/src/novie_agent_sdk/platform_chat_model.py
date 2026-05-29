@@ -255,6 +255,31 @@ class PlatformChatModel(_BaseChatModel):
         """Stream platform chat chunks when the namespace supports it."""
         from langchain_core.messages import AIMessageChunk
 
+        if self.tools:
+            # Provider streaming formats are not reliable for ReAct tool calls:
+            # some gateways emit placeholder args (for example "{}") followed
+            # by id-less/name-less argument fragments. LangChain may replay the
+            # placeholder as a real empty tool call before the fragments can be
+            # reconstructed. For tool-bound calls, use the terminal chat result
+            # and emit a single complete tool-call chunk.
+            result = await self.ainvoke(input, config, **kwargs)
+            tool_call_chunks = []
+            for index, call in enumerate(getattr(result, "tool_calls", None) or []):
+                tool_call_chunks.append(
+                    {
+                        "name": call.get("name"),
+                        "args": json.dumps(call.get("args") or {}),
+                        "id": call.get("id") or f"call_{index}",
+                        "index": index,
+                    }
+                )
+            yield AIMessageChunk(
+                content=result.content or "",
+                tool_call_chunks=tool_call_chunks,
+                response_metadata=dict(getattr(result, "response_metadata", None) or {}),
+            )
+            return
+
         stream_chat = getattr(getattr(self.platform_ns, "llm", None), "stream_chat", None)
         if callable(stream_chat):
             tool_call_stream_state: dict[Any, Any] = {}
