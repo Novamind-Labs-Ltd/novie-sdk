@@ -94,6 +94,7 @@ from .conformance import (
     verify_compatibility,
 )
 from .platform_namespace import (
+    ArtifactsNamespace,
     CapabilityCallDiagnostics,
     CheckpointsNamespace,
     DegradationKind,
@@ -112,6 +113,14 @@ from .llm_facade import (
     LlmFacade,
     LlmMode,
     build_llm_facade,
+)
+from .llm_contract import (
+    ToolCallAccumulator,
+    normalise_llm_result,
+    normalise_stream_event,
+    normalise_tool_call_chunks,
+    normalise_tool_calls,
+    sanitize_additional_kwargs,
 )
 from .platform_chat_model import PlatformChatModel
 from .provider_authoring import (
@@ -204,6 +213,7 @@ __all__ = [
     "TaskRecord",
     "PlatformCallbackClient",
     # Platform callback namespace (EXPERT_AGENT_SDK W4) + platform LLM API
+    "ArtifactsNamespace",
     "CapabilityCallDiagnostics",
     "CheckpointsNamespace",
     "DegradationKind",
@@ -217,6 +227,12 @@ __all__ = [
     "WebNamespace",
     "build_platform_namespace",
     "classify_envelope_error",
+    "normalise_llm_result",
+    "normalise_stream_event",
+    "normalise_tool_call_chunks",
+    "normalise_tool_calls",
+    "sanitize_additional_kwargs",
+    "ToolCallAccumulator",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)
     "CompatibilityMatrix",
     "ConformanceProbe",

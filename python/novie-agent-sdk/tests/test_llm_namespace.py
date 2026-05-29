@@ -110,6 +110,38 @@ class TestLlmChat:
         assert captured["args"]["parallel_tool_calls"] is False
         assert result["tool_calls"][0]["name"] == "lookup"
 
+    def test_chat_returns_canonical_tool_calls_from_provider_shape(self) -> None:
+        ns = _make_ns(responses={
+            "platform.llm.chat": CapabilityCallDiagnostics(
+                ok=True,
+                capability_id="platform.llm.chat",
+                result={
+                    "content": "",
+                    "additional_kwargs": {
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "id": "toolu_1",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"query":"hello"}',
+                                },
+                            },
+                            {"id": "call_1", "name": "", "args": {}},
+                        ],
+                        "keep": "metadata",
+                    },
+                },
+            ),
+        })
+
+        result = _run(ns.llm.chat([{"role": "user", "content": "Hello"}]))
+
+        assert result["tool_calls"] == [
+            {"id": "toolu_1", "name": "lookup", "args": {"query": "hello"}}
+        ]
+        assert result["additional_kwargs"] == {"keep": "metadata"}
+
     def test_quota_exceeded_in_result_raises(self) -> None:
         ns = _make_ns(responses={
             "platform.llm.chat": CapabilityCallDiagnostics(

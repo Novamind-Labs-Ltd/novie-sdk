@@ -519,9 +519,7 @@ async def test_stream_endpoint_emits_progress_then_artifact_then_done() -> None:
 
 @pytest.mark.asyncio
 async def test_stream_handler_exception_propagates_as_500() -> None:
-    """A handler that raises should fail the stream — the SDK's
-    runtime layer surfaces it as an HTTP 500 with the exception
-    message in the body."""
+    """A handler that raises should fail the stream with a terminal_error."""
     from fastapi.testclient import TestClient
 
     app = artifact_agent(manifest=_manifest_dict(protocol_mode="stream"))
@@ -531,12 +529,19 @@ async def test_stream_handler_exception_propagates_as_500() -> None:
         raise RuntimeError("boom")
 
     client = TestClient(app.build_app())
-    with pytest.raises(RuntimeError, match="boom"):
-        with client.stream(
-            "POST", "/stream", json={"input": {"inputs": {}}},
-        ) as resp:
-            for _ in resp.iter_lines():
-                pass
+    events: list[dict[str, Any]] = []
+    with client.stream(
+        "POST", "/stream", json={"input": {"inputs": {}}},
+    ) as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            events.append(json.loads(line))
+
+    assert events[-1]["kind"] == "terminal_error"
+    assert events[-1]["error"] == "boom"
+    assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
 
 
 @pytest.mark.asyncio

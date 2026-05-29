@@ -42,11 +42,10 @@ The SDK never imports from ``novie_platform``; only from
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -56,6 +55,7 @@ from .platform_callback import (
     build_platform_callback_headers,
     sign_platform_callback_headers,
 )
+from .llm_contract import normalise_llm_result, normalise_stream_event
 from .runtime import RequestHeaders
 
 
@@ -87,6 +87,8 @@ _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _WEB_SEARCH_CAP = "platform.web.search"
+_ARTIFACT_READ_CAP = "platform.artifacts.read"
+_ARTIFACT_SEARCH_CAP = "platform.artifacts.search"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
 _CHECKPOINT_GET_CAP = "platform.external_agent_checkpoint.get"
 _CHECKPOINT_LIST_CAP = "platform.external_agent_checkpoint.list"
@@ -362,6 +364,12 @@ class _CapabilityCaller:
 
                     if event_type in {"accepted", "heartbeat", "progress"}:
                         continue
+                    if event_type == "chunk":
+                        # ``llm.chat`` uses the streaming endpoint for long-running
+                        # calls but still returns one final ChatResult. Intermediate
+                        # token/tool deltas belong to ``llm.stream_chat`` callers;
+                        # wait for the terminal ``completed`` event here.
+                        continue
                     if event_type == "completed":
                         result = event.get("result")
                         if result is not None and not isinstance(result, dict):
@@ -407,20 +415,19 @@ class _CapabilityCaller:
                     error_code="stream_closed_without_completion",
                 )
 
-        heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
         try:
-            async with asyncio.timeout(max(float(self._timeout), heartbeat_timeout)):
-                if self._client is not None:
-                    return await consume(self._client)
-                timeout = httpx.Timeout(
-                    timeout=float(self._timeout),
-                    read=heartbeat_timeout,
-                )
-                async with httpx.AsyncClient(
-                    base_url=self._base_url,
-                    timeout=timeout,
-                ) as client:
-                    return await consume(client)
+            heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
+            if self._client is not None:
+                return await consume(self._client)
+            timeout = httpx.Timeout(
+                timeout=float(self._timeout),
+                read=heartbeat_timeout,
+            )
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=timeout,
+            ) as client:
+                return await consume(client)
         except TimeoutError as exc:
             _log.warning(
                 "platform capability stream timed out capability=%s reason=%r",
@@ -446,6 +453,92 @@ class _CapabilityCaller:
                 kind="transport_error",
                 detail=str(exc),
             )
+
+    async def invoke_event_stream(
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield raw NDJSON capability stream events.
+
+        This is used by platform LLM chat streaming where intermediate
+        ``chunk`` events are meaningful to LangChain's ``astream`` contract.
+        """
+        path = f"/capabilities/{capability_id}/invoke-stream"
+        headers = sign_platform_callback_headers(
+            self._headers, method="POST", path=path,
+        )
+        body: dict[str, Any] = {
+            "arguments": dict(arguments),
+            "caller_type": "agent",
+            "caller_id": f"agent:{self._agent_id}",
+            "caller_mode": "execute",
+            "mode": "execute",
+        }
+
+        async def consume(client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
+            async with client.stream("POST", path, json=body, headers=headers) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    envelope_code = _extract_envelope_code(response)
+                    yield {
+                        "type": "error",
+                        "error_code": envelope_code or "",
+                        "explanation": _safe_text(response),
+                    }
+                    return
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        yield {
+                            "type": "error",
+                            "error_code": "non_json_stream_event",
+                            "explanation": line[:200],
+                        }
+                        return
+                    if not isinstance(event, dict):
+                        yield {
+                            "type": "error",
+                            "error_code": "non_object_stream_event",
+                        }
+                        return
+                    yield event
+
+        try:
+            heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
+            stream_state: dict[Any, Any] = {}
+            if self._client is not None:
+                async for event in consume(self._client):
+                    yield normalise_stream_event(event, stream_state)
+                return
+            timeout = httpx.Timeout(
+                timeout=float(self._timeout),
+                read=heartbeat_timeout,
+            )
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=timeout,
+            ) as client:
+                async for event in consume(client):
+                    yield normalise_stream_event(event, stream_state)
+        except TimeoutError as exc:
+            yield {
+                "type": "error",
+                "error_code": "stream_heartbeat_timeout",
+                "explanation": str(exc),
+            }
+        except httpx.TransportError as exc:
+            yield {
+                "type": "error",
+                "error_code": "transport_error",
+                "explanation": str(exc),
+            }
 
 
 def _extract_envelope_code(response: httpx.Response) -> str | None:
@@ -609,6 +702,7 @@ class PlatformNamespaceProtocol(Protocol):
 
     knowledge: "KnowledgeNamespace"
     web: "WebNamespace"
+    artifacts: "ArtifactsNamespace"
     checkpoints: "CheckpointsNamespace"
     llm: "LlmNamespace"
 
@@ -746,6 +840,146 @@ class WebNamespace:
                 )
             )
         return dict(result)
+
+
+class ArtifactsNamespace:
+    """Budgeted artifact retrieval for connected agents.
+
+    Full artifact payloads may be downloadable through platform HTTP APIs for
+    frontends/offline tools, but SDK agents should use this namespace so every
+    read carries a purpose and byte budget. The platform can then return a
+    stored summary, bounded search excerpts, or bounded chunks instead of
+    blindly injecting a large blob into model context.
+    """
+
+    def __init__(self, parent: "PlatformNamespace") -> None:
+        self._parent = parent
+
+    async def describe(self, artifact_id: str, *, purpose: str = "") -> dict[str, Any]:
+        return await self.read(
+            artifact_id,
+            mode="describe",
+            purpose=purpose or "inspect artifact metadata",
+        )
+
+    async def summarize(self, artifact_id: str, *, purpose: str = "") -> dict[str, Any]:
+        return await self.read(
+            artifact_id,
+            mode="summary",
+            purpose=purpose or "inspect artifact summary",
+        )
+
+    async def search(
+        self,
+        artifact_id: str,
+        query: str,
+        *,
+        purpose: str = "",
+        max_bytes: int = 12000,
+    ) -> dict[str, Any]:
+        return await self.read(
+            artifact_id,
+            mode="search",
+            query=query,
+            purpose=purpose or "find relevant artifact excerpts",
+            max_bytes=max_bytes,
+        )
+
+    async def read_chunks(
+        self,
+        artifact_id: str,
+        *,
+        purpose: str = "",
+        offset: int = 0,
+        max_bytes: int = 12000,
+    ) -> dict[str, Any]:
+        return await self.read(
+            artifact_id,
+            mode="chunks",
+            purpose=purpose or "read bounded artifact chunk",
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+
+    async def read(
+        self,
+        artifact_id: str,
+        *,
+        mode: str = "summary",
+        purpose: str = "",
+        query: str | None = None,
+        offset: int = 0,
+        max_bytes: int = 12000,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "artifact_id": artifact_id,
+            "mode": mode,
+            "purpose": purpose,
+            "offset": int(offset),
+            "max_bytes": int(max_bytes),
+            # SDK intentionally does not expose allow_full=true. Agents should
+            # use summary/search/chunks and let prompt assembly enforce budget.
+            "allow_full": False,
+        }
+        if query is not None:
+            payload["query"] = query
+        diagnostics = await self._parent.invoke_capability(
+            _ARTIFACT_READ_CAP, payload,
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "artifact_id": artifact_id,
+                "error": diagnostics.error_code or diagnostics.kind or "artifact_read_failed",
+                "message": diagnostics.detail,
+            }
+        result = diagnostics.result or {}
+        if result.get("available") is False:
+            self._parent._record_diagnostics(  # noqa: SLF001
+                CapabilityCallDiagnostics(
+                    ok=True,
+                    capability_id=_ARTIFACT_READ_CAP,
+                    kind="no_results",
+                    error_code=str(result.get("error") or ""),
+                )
+            )
+        return dict(result)
+
+    async def search_index(
+        self,
+        *,
+        thread_id: str | None = None,
+        workflow_id: str | None = None,
+        artifact_type_prefix: str | None = None,
+        summary_contains: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "thread_id": thread_id,
+            "workflow_id": workflow_id,
+            "artifact_type_prefix": artifact_type_prefix,
+            "summary_contains": summary_contains,
+            "limit": int(limit),
+        }
+        diagnostics = await self._parent.invoke_capability(
+            _ARTIFACT_SEARCH_CAP,
+            {key: value for key, value in payload.items() if value not in (None, "")},
+        )
+        if not diagnostics.ok:
+            return []
+        result = diagnostics.result or {}
+        items = result.get("items")
+        if not isinstance(items, list):
+            self._parent._record_diagnostics(  # noqa: SLF001
+                CapabilityCallDiagnostics(
+                    ok=False,
+                    capability_id=_ARTIFACT_SEARCH_CAP,
+                    kind="schema_violation",
+                    error_code="missing_items_list",
+                )
+            )
+            return []
+        return [item for item in items if isinstance(item, dict)]
 
 
 class CheckpointsNamespace:
@@ -923,7 +1157,38 @@ class LlmNamespace:
         if parallel_tool_calls is not None:
             args["parallel_tool_calls"] = parallel_tool_calls
         diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
-        return self._unwrap(diagnostics, _LLM_CHAT_CAP)
+        return normalise_llm_result(self._unwrap(diagnostics, _LLM_CHAT_CAP))
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the platform chat LLM as raw platform events."""
+        args: dict[str, Any] = {"messages": messages}
+        if model:
+            args["model"] = model
+        if temperature is not None:
+            args["temperature"] = temperature
+        if tools:
+            args["tools"] = tools
+        if tool_choice is not None:
+            args["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            args["parallel_tool_calls"] = parallel_tool_calls
+
+        stream = getattr(self._parent._llm_caller, "invoke_event_stream", None)
+        if not callable(stream):
+            diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
+            yield {"type": "completed", "result": self._unwrap(diagnostics, _LLM_CHAT_CAP)}
+            return
+        async for event in stream(_LLM_CHAT_CAP, args):
+            yield event
 
     async def structured(
         self,
@@ -1080,6 +1345,7 @@ class PlatformNamespace:
 
     knowledge: KnowledgeNamespace
     web: WebNamespace
+    artifacts: ArtifactsNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1102,6 +1368,7 @@ class PlatformNamespace:
         self._mid_run_ask_active = False
         self.knowledge = KnowledgeNamespace(self)
         self.web = WebNamespace(self)
+        self.artifacts = ArtifactsNamespace(self)
         self.checkpoints = CheckpointsNamespace(self)
         self.llm = LlmNamespace(self)
 
@@ -1187,6 +1454,7 @@ class _UnavailablePlatformNamespace:
 
     knowledge: KnowledgeNamespace
     web: WebNamespace
+    artifacts: ArtifactsNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1196,6 +1464,7 @@ class _UnavailablePlatformNamespace:
         self._diagnostics: list[CapabilityCallDiagnostics] = []
         self.knowledge = KnowledgeNamespace(self)  # type: ignore[arg-type]
         self.web = WebNamespace(self)  # type: ignore[arg-type]
+        self.artifacts = ArtifactsNamespace(self)  # type: ignore[arg-type]
         self.checkpoints = CheckpointsNamespace(self)  # type: ignore[arg-type]
         self.llm = LlmNamespace(self)  # type: ignore[arg-type]
 
@@ -1302,6 +1571,7 @@ def build_platform_namespace(
 
 
 __all__ = [
+    "ArtifactsNamespace",
     "CapabilityCallDiagnostics",
     "CheckpointsNamespace",
     "DegradationKind",

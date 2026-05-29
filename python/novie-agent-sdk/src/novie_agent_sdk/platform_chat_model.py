@@ -29,6 +29,12 @@ import logging
 import json
 from typing import Any, Iterator, Optional, Sequence, TYPE_CHECKING
 
+from .llm_contract import (
+    normalise_tool_call_chunks,
+    normalise_tool_calls,
+    sanitize_additional_kwargs,
+)
+
 if TYPE_CHECKING:
     from .platform_namespace import PlatformNamespace
 
@@ -127,14 +133,20 @@ class PlatformChatModel(_BaseChatModel):
         if isinstance(message, AIMessage):
             payload: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
             tool_calls = getattr(message, "tool_calls", None)
+            additional_kwargs = getattr(message, "additional_kwargs", None)
+            if not tool_calls and isinstance(additional_kwargs, dict):
+                tool_calls = additional_kwargs.get("tool_calls")
             if tool_calls:
-                payload["tool_calls"] = [dict(item) for item in tool_calls]
+                normalised_tool_calls = normalise_tool_calls(tool_calls)
+                if normalised_tool_calls:
+                    payload["tool_calls"] = normalised_tool_calls
             invalid_tool_calls = getattr(message, "invalid_tool_calls", None)
             if invalid_tool_calls:
                 payload["invalid_tool_calls"] = [dict(item) for item in invalid_tool_calls]
-            additional_kwargs = getattr(message, "additional_kwargs", None)
             if additional_kwargs:
-                payload["additional_kwargs"] = dict(additional_kwargs)
+                sanitized = sanitize_additional_kwargs(additional_kwargs)
+                if sanitized:
+                    payload["additional_kwargs"] = sanitized
             return payload
         if isinstance(message, HumanMessage):
             return {"role": "user", "content": str(message.content)}
@@ -177,9 +189,9 @@ class PlatformChatModel(_BaseChatModel):
         usage_metadata = result.get("usage_metadata") or {}
         msg = AIMessage(
             content=content,
-            tool_calls=list(result.get("tool_calls") or []),
+            tool_calls=normalise_tool_calls(result.get("tool_calls") or []),
             invalid_tool_calls=list(result.get("invalid_tool_calls") or []),
-            additional_kwargs=dict(result.get("additional_kwargs") or {}),
+            additional_kwargs=sanitize_additional_kwargs(result.get("additional_kwargs") or {}),
         )
         msg.usage_metadata = usage_metadata  # type: ignore[assignment]
         return msg
@@ -237,11 +249,44 @@ class PlatformChatModel(_BaseChatModel):
             return [self._message_to_dict(m) for m in input]
         return [self._message_to_dict(input)]
 
-    # ── Streaming stub (single-chunk) ─────────────────────────────────────
+    # ── Streaming ─────────────────────────────────────────────────────────
 
     async def astream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        """Streaming — returns one chunk preserving content and tool-call chunks."""
+        """Stream platform chat chunks when the namespace supports it."""
         from langchain_core.messages import AIMessageChunk
+
+        stream_chat = getattr(getattr(self.platform_ns, "llm", None), "stream_chat", None)
+        if callable(stream_chat):
+            tool_call_stream_state: dict[Any, Any] = {}
+            async for event in stream_chat(
+                self._normalise_input(input),
+                model=self.model,
+                temperature=self.temperature,
+                tools=self.tools or None,
+                tool_choice=self.tool_choice,
+                parallel_tool_calls=self.parallel_tool_calls,
+            ):
+                event_type = str(event.get("type") or "")
+                if event_type in {"accepted", "heartbeat", "progress"}:
+                    continue
+                if event_type == "chunk":
+                    delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                    yield AIMessageChunk(
+                        content=delta.get("content") or "",
+                        tool_call_chunks=normalise_tool_call_chunks(
+                            delta.get("tool_call_chunks") or [],
+                            tool_call_stream_state,
+                        ),
+                        response_metadata=dict(delta.get("response_metadata") or {}),
+                    )
+                    continue
+                if event_type == "completed":
+                    return
+                if event_type in {"error", "cancelled"}:
+                    raise RuntimeError(
+                        "platform.llm.chat stream failed: "
+                        f"{event.get('error_code') or event.get('reason') or event.get('explanation') or 'unknown'}"
+                    )
 
         result = await self.ainvoke(input, config, **kwargs)
         tool_call_chunks = []

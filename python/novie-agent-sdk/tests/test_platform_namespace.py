@@ -33,6 +33,7 @@ from novie_agent_sdk import (
     PlatformLlmTransportError,
     PlatformNamespace,
     QuotaExceededError,
+    ToolCallAccumulator,
     build_platform_namespace,
     classify_envelope_error,
 )
@@ -301,6 +302,94 @@ async def test_web_search_records_no_results_diagnostic() -> None:
     assert out["results"] == []
     assert any(
         d.capability_id == "platform.web.search" and d.kind == "no_results"
+        for d in ns.last_diagnostics()
+    )
+
+
+# ── Live namespace: artifacts.read ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_artifacts_read_uses_budgeted_platform_capability() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "artifact_id": "artifact-1",
+                    "mode": "search",
+                    "content": [{"offset": 12, "text": "bounded excerpt"}],
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    out = await ns.artifacts.search(
+        "artifact-1",
+        "pricing",
+        purpose="compare pricing evidence",
+        max_bytes=4096,
+    )
+
+    assert out["content"] == [{"offset": 12, "text": "bounded excerpt"}]
+    assert "/capabilities/platform.artifacts.read/invoke" in captured["url"]
+    assert captured["body"]["arguments"] == {
+        "artifact_id": "artifact-1",
+        "mode": "search",
+        "purpose": "compare pricing evidence",
+        "offset": 0,
+        "max_bytes": 4096,
+        "allow_full": False,
+        "query": "pricing",
+    }
+    assert ns.last_diagnostics() == ()
+
+
+@pytest.mark.asyncio
+async def test_artifacts_read_does_not_expose_full_read_allow_flag() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": False,
+                    "artifact_id": "artifact-1",
+                    "error": "artifact_full_read_requires_explicit_allow",
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    out = await ns.artifacts.read("artifact-1", mode="full", max_bytes=4096)
+
+    assert out["available"] is False
+    assert captured["body"]["arguments"]["allow_full"] is False
+    assert any(
+        d.capability_id == "platform.artifacts.read" and d.kind == "no_results"
+        for d in ns.last_diagnostics()
+    )
+
+
+@pytest.mark.asyncio
+async def test_artifacts_search_index_requires_items_list() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ok_envelope({"items": "bad"}))
+
+    ns = _build_with_responder(responder)
+    out = await ns.artifacts.search_index(workflow_id="wf-1")
+
+    assert out == []
+    assert any(
+        d.capability_id == "platform.artifacts.search"
+        and d.kind == "schema_violation"
         for d in ns.last_diagnostics()
     )
 
@@ -632,6 +721,71 @@ async def test_llm_chat_uses_streaming_capability_endpoint() -> None:
     assert result["content"] == "hello"
     assert result["usage_metadata"]["total_tokens"] == 7
     assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_ignores_intermediate_stream_chunks() -> None:
+    """``llm.chat`` consumes the stream endpoint but returns the final result.
+
+    The platform emits ``chunk`` events before ``completed`` for live token
+    streaming. Those chunks are for ``llm.stream_chat`` callers and must not
+    make non-streaming ``llm.chat`` fail with ``unknown_stream_event``.
+    """
+    captured_paths: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured_paths.append(request.url.path)
+        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        return httpx.Response(
+            200,
+            content=(
+                b'{"type":"accepted","invocation_id":"i1"}\n'
+                b'{"type":"chunk","invocation_id":"i1","delta":{"content":"hel"}}\n'
+                b'{"type":"chunk","invocation_id":"i1","delta":{"content":"lo"}}\n'
+                b'{"type":"completed","invocation_id":"i1",'
+                b'"result":{"content":"hello","usage_metadata":{"total_tokens":7}}}\n'
+            ),
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    result = await ns.llm.chat([{"role": "user", "content": "hi"}])
+
+    assert result["content"] == "hello"
+    assert result["usage_metadata"]["total_tokens"] == 7
+    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_chat_normalises_tool_chunks_for_non_langchain_agents() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        return httpx.Response(
+            200,
+            content=(
+                b'{"type":"chunk","delta":{"content":"","tool_call_chunks":['
+                b'{"type":"function","id":"toolu_1","function":'
+                b'{"name":"lookup","arguments":"{\\"quer"}}]}}\n'
+                b'{"type":"chunk","delta":{"content":"","tool_call_chunks":['
+                b'{"type":"function","id":null,"function":'
+                b'{"name":null,"arguments":"y\\":\\"hello\\"}"}}]}}\n'
+                b'{"type":"completed","result":{"content":"","usage_metadata":{"total_tokens":7}}}\n'
+            ),
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    ns = _build_with_responder(responder)
+    accumulator = ToolCallAccumulator()
+    chunks: list[dict[str, Any]] = []
+
+    async for event in ns.llm.stream_chat([{"role": "user", "content": "hi"}]):
+        chunks.extend(accumulator.add_event(event))
+
+    assert [chunk["id"] for chunk in chunks] == ["toolu_1", "toolu_1"]
+    assert accumulator.tool_calls() == [
+        {"id": "toolu_1", "name": "lookup", "args": {"query": "hello"}}
+    ]
 
 
 @pytest.mark.asyncio

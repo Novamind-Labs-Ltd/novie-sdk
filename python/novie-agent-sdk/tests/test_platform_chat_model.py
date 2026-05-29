@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import tool
 
@@ -39,6 +39,63 @@ class _PlatformNamespaceStub:
         self.llm = _LlmStub()
 
 
+class _StreamingLlmStub(_LlmStub):
+    async def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any):  # type: ignore[no-untyped-def]
+        self.calls.append({"messages": messages, **kwargs})
+        yield {"type": "accepted"}
+        yield {"type": "chunk", "delta": {"content": "hel"}}
+        yield {"type": "chunk", "delta": {"content": "lo"}}
+        yield {"type": "completed", "result": {"content": "hello"}}
+
+
+class _ToolStreamingLlmStub(_LlmStub):
+    async def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any):  # type: ignore[no-untyped-def]
+        self.calls.append({"messages": messages, **kwargs})
+        yield {
+            "type": "chunk",
+            "delta": {
+                "content": "",
+                "tool_call_chunks": [
+                    {
+                        "type": "function",
+                        "id": "toolu_1",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"quer',
+                        },
+                    }
+                ],
+            },
+        }
+        yield {
+            "type": "chunk",
+            "delta": {
+                "content": "",
+                "tool_call_chunks": [
+                    {
+                        "type": "function",
+                        "id": None,
+                        "function": {
+                            "name": None,
+                            "arguments": 'y":"hello"}',
+                        },
+                    }
+                ],
+            },
+        }
+        yield {"type": "completed", "result": {"content": ""}}
+
+
+class _StreamingPlatformNamespaceStub:
+    def __init__(self) -> None:
+        self.llm = _StreamingLlmStub()
+
+
+class _ToolStreamingPlatformNamespaceStub:
+    def __init__(self) -> None:
+        self.llm = _ToolStreamingLlmStub()
+
+
 @tool
 def lookup(query: str) -> str:
     """Lookup a query."""
@@ -70,3 +127,79 @@ def test_astream_preserves_tool_call_chunks() -> None:
     assert len(chunks) == 1
     assert chunks[0].tool_call_chunks[0]["name"] == "lookup"
     assert chunks[0].tool_call_chunks[0]["args"] == '{"query": "hello"}'
+
+
+def test_astream_uses_platform_stream_chat_chunks() -> None:
+    platform = _StreamingPlatformNamespaceStub()
+    model = PlatformChatModel(platform)
+
+    async def _collect() -> list[Any]:
+        return [chunk async for chunk in model.astream([HumanMessage(content="hello")])]
+
+    chunks = _run(_collect())
+
+    assert [chunk.content for chunk in chunks] == ["hel", "lo"]
+    assert platform.llm.calls[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_ai_message_raw_additional_tool_calls_are_canonicalised() -> None:
+    platform = _PlatformNamespaceStub()
+    model = PlatformChatModel(platform)
+
+    _run(
+        model.ainvoke(
+            [
+                AIMessage(
+                    content="",
+                    additional_kwargs={
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "id": "toolu_1",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": '{"query":"hello"}',
+                                },
+                            },
+                            {"id": "call_1", "name": "", "args": {}},
+                        ],
+                        "keep": "metadata",
+                    },
+                )
+            ]
+        )
+    )
+
+    assert platform.llm.calls[0]["messages"][0] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "toolu_1",
+                "name": "lookup",
+                "args": {"query": "hello"},
+            }
+        ],
+        "additional_kwargs": {"keep": "metadata"},
+    }
+
+
+def test_astream_normalises_openai_function_tool_chunks() -> None:
+    platform = _ToolStreamingPlatformNamespaceStub()
+    model = PlatformChatModel(platform)
+
+    async def _collect() -> list[Any]:
+        return [chunk async for chunk in model.astream([HumanMessage(content="hello")])]
+
+    chunks = _run(_collect())
+    pieces = [
+        piece
+        for chunk in chunks
+        for piece in getattr(chunk, "tool_call_chunks", None) or []
+    ]
+
+    assert [piece["id"] for piece in pieces] == ["toolu_1", "toolu_1"]
+    assert [piece["index"] for piece in pieces] == [0, 0]
+    assert pieces[0]["name"] == "lookup"
+    assert pieces[0]["args"] == '{"quer'
+    assert pieces[1]["args"] == 'y":"hello"}'
