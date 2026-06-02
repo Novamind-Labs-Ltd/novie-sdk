@@ -54,8 +54,14 @@ GovernanceRisk = Literal["read", "write", "dangerous"]
 GovernanceSideEffect = Literal[
     "none", "session", "tenant", "external", "irreversible"
 ]
-RuntimeDuration = Literal["<1s", "<1min", "<1h", ">1h"]
+RuntimeDuration = Literal["<1s", "<1min", "<5min", "<1h", ">1h"]
 RuntimeDurability = Literal["none", "result_cache", "task_store"]
+InputContractSource = Literal[
+    "user_input",
+    "upstream_capability",
+    "runtime_context",
+    "platform_projection",
+]
 
 
 _AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_\-\.]{1,63}$")
@@ -129,17 +135,34 @@ class AgentYamlIdentity(_StrictModel):
         return value
 
 
+class AgentYamlInputContract(_StrictModel):
+    """Source semantics for one consumed artifact."""
+
+    artifact: str = Field(..., min_length=1)
+    source: InputContractSource = "upstream_capability"
+    provider: str = ""
+    required: bool = True
+
+
 class AgentYamlInputs(_StrictModel):
     """``inputs`` block — what the agent consumes."""
 
-    consumes: list[str] = Field(
+    consumes: list[str] | dict[str, list[str]] = Field(
         default_factory=list,
         description=(
             "Resource type names the agent reads as inputs (e.g. "
             "``project_document`` / ``analysis_artifact``). Plain "
-            "list of strings; the platform's W3 ResourceGraph "
-            "matches these against ``CapabilityContract."
-            "consumes_resources``."
+            "list of strings, or a map keyed by capability suffix for "
+            "multi-capability agents."
+        ),
+    )
+    input_contracts: list[AgentYamlInputContract] = Field(
+        default_factory=list,
+        description=(
+            "Optional typed source declarations for consumed artifacts. "
+            "Use this when an input is supplied by user input, platform "
+            "runtime context, or a platform projection instead of an "
+            "upstream capability."
         ),
     )
 
@@ -147,13 +170,13 @@ class AgentYamlInputs(_StrictModel):
 class AgentYamlOutputs(_StrictModel):
     """``outputs`` block — what the agent produces."""
 
-    provides: list[str] = Field(
+    provides: list[str] | dict[str, list[str]] = Field(
         default_factory=list,
         description=(
             "Resource type names the agent produces (e.g. "
             "``analysis_artifact`` / ``task_bundle`` / ``code_diff``). "
-            "Mapped onto ``CapabilityContract.produces_resources`` so "
-            "Planner can wire the agent into a multi-step plan."
+            "Plain list of strings, or a map keyed by capability suffix for "
+            "multi-capability agents."
         ),
     )
 
@@ -253,6 +276,16 @@ class AgentYamlGovernance(_StrictModel):
     )
 
 
+class AgentYamlCapabilityOverride(_StrictModel):
+    """Per-capability contract overrides for multi-capability agents."""
+
+    consumes: list[str] | None = None
+    provides: list[str] | None = None
+    input_contracts: list[AgentYamlInputContract] | None = None
+    caller_types: list[str] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentYamlAdvanced(_StrictModel):
     """``advanced`` block — escape hatch for fields the simplified
     schema doesn't surface yet.
@@ -271,6 +304,15 @@ class AgentYamlAdvanced(_StrictModel):
             "manifest-v2 field names exactly. The generator does not "
             "validate the override values — that's the manifest "
             "validator's job."
+        ),
+    )
+    capability_overrides: dict[str, AgentYamlCapabilityOverride] = Field(
+        default_factory=dict,
+        description=(
+            "Optional per-capability contract overrides. Keys are "
+            "capability ids. Values can override consumes, provides, "
+            "input_contracts, caller_types, and metadata for that one "
+            "capability entry."
         ),
     )
 
@@ -355,8 +397,10 @@ __all__ = [
     "AgentType",
     "AgentYamlAdvanced",
     "AgentYamlConfig",
+    "AgentYamlCapabilityOverride",
     "AgentYamlGovernance",
     "AgentYamlIdentity",
+    "AgentYamlInputContract",
     "AgentYamlInputs",
     "AgentYamlOutputs",
     "AgentYamlRouting",

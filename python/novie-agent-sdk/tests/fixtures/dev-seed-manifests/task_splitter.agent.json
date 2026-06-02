@@ -16,74 +16,150 @@
       "version": "0.1.0",
       "display_name": "Decompose Tasks",
       "description": "Break requirements analysis into implementation tasks.",
-      "input_schema": {"type": "object"},
-      "output_schema": {"type": "object"},
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
       "runtime_ref": "agent:task_splitter:task_decomposition",
-      "tags": ["planning", "tasks"],
-      "natural_language_aliases": ["拆任务", "task decomposition"],
+      "tags": [
+        "planning",
+        "tasks"
+      ],
+      "natural_language_aliases": [
+        "拆任务",
+        "task decomposition"
+      ],
       "idempotent": true,
       "expected_duration_class": "<1min",
-      "consumes": ["requirements_analysis"],
-      "provides": ["task_plan"],
+      "consumes": [
+        "requirements_analysis"
+      ],
+      "provides": [
+        "task_plan"
+      ],
       "execution_lane": "direct",
       "risk_class": "read_only",
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": false,
         "requires_human_gate": false
-      }
+      },
+      "input_contracts": [
+        {
+          "artifact": "requirements_analysis",
+          "source": "upstream_capability",
+          "required": true
+        }
+      ],
+      "caller_types": [
+        "planner",
+        "executor",
+        "agent"
+      ]
     },
     {
       "capability_id": "agent.task_splitter.issue_planning",
       "version": "0.1.0",
       "display_name": "Plan Issues",
       "description": "Convert scoped work into reviewable issue-sized implementation units.",
-      "input_schema": {"type": "object"},
-      "output_schema": {"type": "object"},
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
       "runtime_ref": "agent:task_splitter:issue_planning",
-      "tags": ["planning", "issues"],
-      "natural_language_aliases": ["规划 issue", "issue planning"],
+      "tags": [
+        "planning",
+        "issues"
+      ],
+      "natural_language_aliases": [
+        "规划 issue",
+        "issue planning"
+      ],
       "idempotent": true,
       "expected_duration_class": "<1min",
-      "provides": ["issue_plan"],
+      "provides": [
+        "issue_plan"
+      ],
       "execution_lane": "direct",
       "risk_class": "read_only",
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": false,
         "requires_human_gate": false
-      }
+      },
+      "caller_types": [
+        "planner",
+        "executor",
+        "agent"
+      ]
     },
     {
       "capability_id": "agent.task_splitter.ticket_drafting",
       "version": "0.2.0",
       "display_name": "Draft PMS Tickets",
       "description": "Convert a scoped requirements-analysis-backed task plan into a WorkItemDraftGraph to be written into the PMS Backlog.",
-      "input_schema": {"type": "object"},
-      "output_schema": {"type": "object"},
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
       "runtime_ref": "agent:task_splitter:ticket_drafting",
-      "tags": ["work_item_draft_graph", "pms-first"],
-      "natural_language_aliases": ["拆 ticket", "生成 ticket", "ticket drafting"],
+      "tags": [
+        "work_item_draft_graph",
+        "pms-first"
+      ],
+      "natural_language_aliases": [
+        "拆 ticket",
+        "生成 ticket",
+        "ticket drafting"
+      ],
       "idempotent": true,
       "expected_duration_class": "<1min",
-      "consumes": ["task_plan", "requirements_analysis"],
-      "provides": ["work_item_draft_graph"],
+      "consumes": [
+        "task_plan",
+        "requirements_analysis"
+      ],
+      "provides": [
+        "work_item_draft_graph"
+      ],
       "execution_lane": "direct",
       "risk_class": "read_only",
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": false,
         "requires_human_gate": false
-      }
+      },
+      "input_contracts": [
+        {
+          "artifact": "task_plan",
+          "source": "upstream_capability",
+          "required": true
+        },
+        {
+          "artifact": "requirements_analysis",
+          "source": "upstream_capability",
+          "required": true
+        }
+      ],
+      "caller_types": [
+        "planner",
+        "executor",
+        "agent"
+      ]
     }
   ],
   "declared_gates": [],

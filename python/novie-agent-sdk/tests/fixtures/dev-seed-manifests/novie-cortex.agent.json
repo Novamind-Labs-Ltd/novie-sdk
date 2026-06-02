@@ -19,28 +19,64 @@
       "version": "0.2.2",
       "display_name": "Execute Task Bundle",
       "description": "Execute a validated task bundle against a project repository.",
-      "input_schema": {"type": "object"},
-      "output_schema": {"type": "object"},
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
       "risk": "write",
       "side_effect": "external",
       "exec_kind": "async",
       "runtime_ref": "agent:novie-cortex:execute_task_bundle",
-      "tags": ["task_bundle", "implementation", "cortex"],
-      "natural_language_aliases": ["执行 task bundle", "开始编码", "execute task bundle"],
+      "tags": [
+        "task_bundle",
+        "implementation",
+        "cortex"
+      ],
+      "natural_language_aliases": [
+        "执行 task bundle",
+        "开始编码",
+        "execute task bundle"
+      ],
       "expected_duration_class": ">1h",
       "streamable": false,
       "cancellation_supported": true,
       "progress_events": true,
       "requires_confirmation": true,
-      "consumes": ["task_bundle", "project.repo.default"],
-      "provides": ["implementation_result", "code_changes"],
+      "consumes": [
+        "task_bundle",
+        "project.repo.default"
+      ],
+      "provides": [
+        "implementation_result",
+        "code_changes"
+      ],
       "execution_lane": "board_controlled",
       "risk_class": "repo_mutation",
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": true,
         "requires_human_gate": true
-      }
+      },
+      "input_contracts": [
+        {
+          "artifact": "task_bundle",
+          "source": "runtime_context",
+          "required": true,
+          "provider": "platform.pms.ticket_execution"
+        },
+        {
+          "artifact": "project.repo.default",
+          "source": "runtime_context",
+          "required": true,
+          "provider": "platform.project_context.repo_default"
+        }
+      ],
+      "caller_types": [
+        "executor",
+        "agent"
+      ]
     }
   ],
   "declared_gates": [],

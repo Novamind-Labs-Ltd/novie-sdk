@@ -92,12 +92,21 @@ _EXEC_KIND_FROM_TYPE: dict[AgentType, str] = {
 _DURATION_SECONDS: dict[RuntimeDuration, tuple[int, int]] = {
     "<1s": (1, 30),
     "<1min": (30, 300),
+    "<5min": (300, 1800),
     "<1h": (1800, 3600),
     ">1h": (3600, 14400),
 }
 
 
 _MANIFEST_SCHEMA_URL = "https://novie.dev/schemas/agent-manifest-v2.json"
+_STANDARD_INPUT_PROVIDERS = {
+    "task_brief": ("user_input", "platform.user_input.task_brief"),
+    "user_goal": ("user_input", "platform.user_input.user_goal"),
+    "brief": ("user_input", "platform.user_input.brief"),
+    "task_bundle": ("runtime_context", "platform.pms.ticket_execution"),
+    "project.repo.default": ("runtime_context", "platform.project_context.repo_default"),
+    "tracker_issue": ("platform_projection", "platform.tracker.ingestion"),
+}
 
 
 def _set_dotted_path(target: dict[str, Any], key: str, value: Any) -> None:
@@ -116,6 +125,40 @@ def _set_dotted_path(target: dict[str, Any], key: str, value: Any) -> None:
     cursor[parts[-1]] = value
 
 
+def _consumes_for_capability(config: AgentYamlConfig, capability_id: str) -> list[str]:
+    consumes = config.inputs.consumes
+    if isinstance(consumes, dict):
+        suffix = capability_id.rsplit(".", 1)[-1]
+        return list(consumes.get(capability_id) or consumes.get(suffix) or [])
+    return list(consumes)
+
+
+def _provides_for_capability(config: AgentYamlConfig, capability_id: str) -> list[str]:
+    provides = config.outputs.provides
+    if isinstance(provides, dict):
+        suffix = capability_id.rsplit(".", 1)[-1]
+        return list(provides.get(capability_id) or provides.get(suffix) or [])
+    return list(provides)
+
+
+def _input_contracts_for_consumes(consumes: list[str]) -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = []
+    for artifact in consumes:
+        source, provider = _STANDARD_INPUT_PROVIDERS.get(
+            artifact,
+            ("upstream_capability", ""),
+        )
+        contract: dict[str, Any] = {
+            "artifact": artifact,
+            "source": source,
+            "required": True,
+        }
+        if provider:
+            contract["provider"] = provider
+        contracts.append(contract)
+    return contracts
+
+
 def _generate_capability_entry(
     *,
     capability_id: str,
@@ -124,7 +167,31 @@ def _generate_capability_entry(
     """Project one capability id from ``capabilities[]`` onto the
     ``AgentCapabilityManifestEntry`` shape."""
     expected_seconds, _max_seconds = _DURATION_SECONDS[config.runtime.duration]
-    return {
+    override = config.advanced.capability_overrides.get(capability_id)
+    consumes = (
+        list(override.consumes)
+        if override is not None and override.consumes is not None
+        else _consumes_for_capability(config, capability_id)
+    )
+    provides = (
+        list(override.provides)
+        if override is not None and override.provides is not None
+        else _provides_for_capability(config, capability_id)
+    )
+    input_contracts = []
+    if override is not None and override.input_contracts is not None:
+        input_contracts = [
+            contract.model_dump(exclude_none=True)
+            for contract in override.input_contracts
+        ]
+    elif config.inputs.input_contracts:
+        input_contracts = [
+            contract.model_dump(exclude_none=True)
+            for contract in config.inputs.input_contracts
+        ]
+    else:
+        input_contracts = _input_contracts_for_consumes(consumes)
+    entry = {
         "capability_id": capability_id,
         "version": config.agent.version,
         "display_name": _humanize_capability_id(capability_id),
@@ -154,14 +221,23 @@ def _generate_capability_entry(
         ),
         "requires": [],
         "conflicts": [],
-        "provides": list(config.outputs.provides),
-        "consumes": list(config.inputs.consumes),
+        "provides": provides,
+        "consumes": consumes,
+        "input_contracts": input_contracts,
         "execution_lane": "direct",
         "risk_class": _risk_class_from_governance(config),
         "requires_plan_review": False,
         "requires_tracker_issue": config.governance.requires_tracker_issue,
         "requires_human_gate": config.governance.requires_human_gate,
     }
+    if override is not None:
+        if override.caller_types is not None:
+            entry["caller_types"] = list(override.caller_types)
+        if override.metadata:
+            metadata = dict(entry.get("metadata") or {})
+            metadata.update(override.metadata)
+            entry["metadata"] = metadata
+    return entry
 
 
 def _humanize_capability_id(capability_id: str) -> str:
