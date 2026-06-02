@@ -11,36 +11,9 @@ permissions:
 jobs:
   python-sdk:
     name: Python SDK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      # novie-agent-sdk depends on novie-protocol pulled via git from a
-      # separate private repo. The default GITHUB_TOKEN can't reach it, so
-      # we mint a short-lived installation token from an org-level GitHub
-      # App scoped to read novie-protocol, then rewrite github.com URLs in
-      # pyproject.toml to HTTPS + token at clone time. We rewrite both the
-      # ssh:// form (legacy) and the bare https:// form (current) since the
-      # dep URL has flipped between the two over time.
-      #
-      # Required repo secrets:
-      #   - NOVIE_PROTOCOL_APP_ID            (numeric App ID)
-      #   - NOVIE_PROTOCOL_APP_PRIVATE_KEY   (full PEM contents, including BEGIN/END lines)
-      - name: Mint GitHub App token for novie-protocol
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.NOVIE_PROTOCOL_APP_ID }}
-          private-key: ${{ secrets.NOVIE_PROTOCOL_APP_PRIVATE_KEY }}
-          owner: Novamind-Labs-Ltd
-          repositories: novie-protocol
-
-      - name: Rewrite github.com URLs to HTTPS + App token
-        env:
-          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
-          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - uses: actions/setup-python@v5
         with:
