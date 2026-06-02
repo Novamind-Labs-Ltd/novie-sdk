@@ -178,6 +178,7 @@ def test_tool_agent_type_maps_to_simple_basic() -> None:
     [
         ("<1s", 1, 30),
         ("<1min", 30, 300),
+        ("<5min", 300, 1800),
         ("<1h", 1800, 3600),
         (">1h", 3600, 14400),
     ],
@@ -261,6 +262,143 @@ def test_capability_entry_carries_per_entry_projection() -> None:
     assert entry["requires_tracker_issue"] is True
     assert entry["requires_human_gate"] is False
     assert entry["exec_kind"] == "stream"  # artifact_agent default
+
+
+def test_capability_entry_carries_input_contracts() -> None:
+    config = AgentYamlConfig.model_validate({
+        "agent": {
+            "id": "analyst",
+            "name": "Analyst",
+            "version": "0.2.0",
+            "type": "artifact_agent",
+        },
+        "capabilities": ["agent.analyst.product_brief"],
+        "inputs": {
+            "consumes": ["task_brief"],
+            "input_contracts": [
+                {
+                    "artifact": "task_brief",
+                    "source": "user_input",
+                    "provider": "platform.user_input.task_brief",
+                }
+            ],
+        },
+        "outputs": {"provides": ["product_brief"]},
+        "runtime": {"port": 8010},
+    })
+
+    manifest = generate_agent_manifest(config)
+    entry = manifest["capability_manifest"][0]
+
+    assert entry["input_contracts"] == [
+        {
+            "artifact": "task_brief",
+            "source": "user_input",
+            "provider": "platform.user_input.task_brief",
+            "required": True,
+        }
+    ]
+
+
+def test_capability_overrides_replace_per_entry_contract() -> None:
+    config = AgentYamlConfig.model_validate({
+        "agent": {
+            "id": "pm",
+            "name": "PM",
+            "version": "0.2.0",
+            "type": "artifact_agent",
+        },
+        "capabilities": ["agent.pm.prd_create", "agent.pm.prd_edit"],
+        "inputs": {"consumes": ["task_brief"]},
+        "outputs": {"provides": ["prd_document"]},
+        "runtime": {"port": 8012},
+        "advanced": {
+            "capability_overrides": {
+                "agent.pm.prd_edit": {
+                    "consumes": ["prd_document", "prd_validation_report"],
+                    "provides": ["prd_document"],
+                    "caller_types": ["planner"],
+                    "input_contracts": [
+                        {
+                            "artifact": "prd_document",
+                            "source": "upstream_capability",
+                        },
+                        {
+                            "artifact": "prd_validation_report",
+                            "source": "upstream_capability",
+                        },
+                    ],
+                    "metadata": {"disambiguation_policy": "branch_by_consumes"},
+                }
+            }
+        },
+    })
+
+    manifest = generate_agent_manifest(config)
+    entries = {e["capability_id"]: e for e in manifest["capability_manifest"]}
+
+    create = entries["agent.pm.prd_create"]
+    assert create["consumes"] == ["task_brief"]
+    assert create["provides"] == ["prd_document"]
+
+    edit = entries["agent.pm.prd_edit"]
+    assert edit["consumes"] == ["prd_document", "prd_validation_report"]
+    assert edit["input_contracts"][0]["artifact"] == "prd_document"
+    assert edit["caller_types"] == ["planner"]
+    assert edit["metadata"]["disambiguation_policy"] == "branch_by_consumes"
+
+
+def test_capability_suffix_consumes_map_projects_per_entry_contract() -> None:
+    config = AgentYamlConfig.model_validate({
+        "agent": {
+            "id": "task_splitter",
+            "name": "Task Splitter",
+            "version": "0.2.0",
+            "type": "artifact_agent",
+        },
+        "capabilities": [
+            "agent.task_splitter.from_brief",
+            "agent.task_splitter.from_requirements",
+        ],
+        "inputs": {
+            "consumes": {
+                "from_brief": ["task_brief"],
+                "from_requirements": ["requirements_analysis"],
+            }
+        },
+        "outputs": {
+            "provides": {
+                "from_brief": ["work_item_draft_graph"],
+                "from_requirements": ["work_item_draft_graph"],
+            }
+        },
+        "runtime": {"port": 8012},
+    })
+
+    manifest = generate_agent_manifest(config)
+    entries = {e["capability_id"]: e for e in manifest["capability_manifest"]}
+
+    from_brief = entries["agent.task_splitter.from_brief"]
+    assert from_brief["consumes"] == ["task_brief"]
+    assert from_brief["input_contracts"] == [
+        {
+            "artifact": "task_brief",
+            "source": "user_input",
+            "provider": "platform.user_input.task_brief",
+            "required": True,
+        }
+    ]
+
+    from_requirements = entries["agent.task_splitter.from_requirements"]
+    assert from_requirements["consumes"] == ["requirements_analysis"]
+    assert from_requirements["provides"] == ["work_item_draft_graph"]
+    assert from_requirements["input_contracts"] == [
+        {
+            "artifact": "requirements_analysis",
+            "source": "upstream_capability",
+            "required": True,
+        }
+    ]
 
 
 def test_capability_entry_humanizes_id_for_display_name() -> None:
