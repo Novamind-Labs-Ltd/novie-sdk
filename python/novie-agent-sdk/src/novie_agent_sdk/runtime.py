@@ -1825,6 +1825,14 @@ class SqliteTaskStore:
 
 # ── Registration client ───────────────────────────────────────────────────────
 
+
+def _truncate_registration_error(text: str, limit: int = 4000) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 class RegistrationClient:
     """向 Platform ManifestRegistry 注册/心跳/注销的客户端。"""
 
@@ -1867,7 +1875,17 @@ class RegistrationClient:
                         json=self._manifest.to_dict(),
                         headers=self._auth_headers(),
                     )
-                    resp.raise_for_status()
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError:
+                        _log.warning(
+                            "Platform registration rejected agent_id=%s "
+                            "status=%s response=%s",
+                            self._manifest.agent_id,
+                            resp.status_code,
+                            _truncate_registration_error(resp.text),
+                        )
+                        raise
                     _log.info(
                         "Registered with Platform agent_id=%s attempt=%s",
                         self._manifest.agent_id,
