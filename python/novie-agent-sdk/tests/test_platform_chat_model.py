@@ -33,6 +33,17 @@ class _LlmStub:
             "usage_metadata": {"total_tokens": 12},
         }
 
+    async def structured(
+        self,
+        messages: list[dict[str, Any]],
+        output_schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {"messages": messages, "output_schema": output_schema, **kwargs}
+        )
+        return {"structured": {"ok": True}, "usage_metadata": {"total_tokens": 8}}
+
 
 class _PlatformNamespaceStub:
     def __init__(self) -> None:
@@ -191,6 +202,39 @@ def test_astream_uses_platform_stream_chat_chunks() -> None:
 
     assert [chunk.content for chunk in chunks] == ["hel", "lo"]
     assert platform.llm.calls[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_platform_chat_model_forwards_max_output_tokens() -> None:
+    platform = _PlatformNamespaceStub()
+    model = PlatformChatModel(platform, max_output_tokens=32000)
+
+    _run(model.ainvoke([HumanMessage(content="hello")]))
+
+    assert platform.llm.calls[0]["max_output_tokens"] == 32000
+
+
+def test_platform_chat_model_stream_forwards_max_output_tokens() -> None:
+    platform = _StreamingPlatformNamespaceStub()
+    model = PlatformChatModel(platform, max_output_tokens=24000)
+
+    async def _collect() -> list[Any]:
+        return [chunk async for chunk in model.astream([HumanMessage(content="hello")])]
+
+    _run(_collect())
+
+    assert platform.llm.calls[0]["max_output_tokens"] == 24000
+
+
+def test_platform_structured_model_forwards_max_output_tokens() -> None:
+    platform = _PlatformNamespaceStub()
+    model = PlatformChatModel(platform, max_output_tokens=16000).with_structured_output(
+        {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    )
+
+    result = _run(model.ainvoke([HumanMessage(content="hello")]))
+
+    assert result == {"ok": True}
+    assert platform.llm.calls[0]["max_output_tokens"] == 16000
 
 
 def test_ai_message_raw_additional_tool_calls_are_canonicalised() -> None:

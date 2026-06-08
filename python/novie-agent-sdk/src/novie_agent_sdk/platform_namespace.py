@@ -1165,6 +1165,7 @@ class LlmNamespace:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
@@ -1191,6 +1192,8 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
+        if max_output_tokens is not None:
+            args["max_output_tokens"] = int(max_output_tokens)
         if tools:
             args["tools"] = tools
         if tool_choice is not None:
@@ -1206,6 +1209,7 @@ class LlmNamespace:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
@@ -1216,6 +1220,8 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
+        if max_output_tokens is not None:
+            args["max_output_tokens"] = int(max_output_tokens)
         if tools:
             args["tools"] = tools
         if tool_choice is not None:
@@ -1238,6 +1244,7 @@ class LlmNamespace:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         method: str | None = None,
         strict: bool | None = None,
     ) -> dict[str, Any]:
@@ -1269,6 +1276,8 @@ class LlmNamespace:
             args["model"] = model
         if temperature is not None:
             args["temperature"] = temperature
+        if max_output_tokens is not None:
+            args["max_output_tokens"] = int(max_output_tokens)
         if method is not None:
             args["method"] = method
         if strict is not None:

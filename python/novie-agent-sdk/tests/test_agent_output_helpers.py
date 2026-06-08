@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
     bounded_handoff_output,
+    bounded_subtask_evidence_text,
     bounded_workpad_text,
     capability_provides_artifacts,
     content_delta_event,
@@ -83,6 +84,22 @@ def test_workpad_entry_index_helpers() -> None:
     assert [entry["content"] for entry in workpad_entries_by_kind(workpad, "draft")] == ["b", "c"]
     assert latest_workpad_entry(workpad, kind="draft") == {"kind": "draft", "content": "c"}
     assert bounded_workpad_text("abcdef", limit=3).startswith("abc")
+
+
+def test_subtask_evidence_text_preserves_long_body_by_default() -> None:
+    evidence = "status: complete\n\n## Evidence\n" + ("A" * 9000)
+
+    content, truncated = bounded_subtask_evidence_text(evidence)
+
+    assert truncated is False
+    assert content == evidence
+
+
+def test_subtask_evidence_text_reports_explicit_truncation() -> None:
+    content, truncated = bounded_subtask_evidence_text("A" * 30, limit=20)
+
+    assert truncated is True
+    assert content == ("A" * 20) + "\n\n[truncated]"
 
 
 def test_upstream_context_reads_direct_or_nested_payload() -> None:

@@ -14,6 +14,7 @@ from .workpad import workpad_checkpoint_event
 DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 25.0
 KEEPALIVE_DONE = object()
 DEFAULT_MIN_SUBTASK_RESULT_CHARS = 900
+DEFAULT_SUBTASK_EVIDENCE_MAX_CHARS = 1_000_000
 
 _INCOMPLETE_MARKERS = (
     "budget exhausted",
@@ -274,6 +275,29 @@ def _bounded_label(text: str, *, limit: int = 120) -> str:
     return value[: limit - 1].rstrip() + "..."
 
 
+def subtask_evidence_max_chars(
+    *,
+    env_var: str = "NOVIE_AGENT_SUBTASK_EVIDENCE_MAX_CHARS",
+    default: int = DEFAULT_SUBTASK_EVIDENCE_MAX_CHARS,
+) -> int:
+    raw = os.getenv(env_var, "") or os.getenv("NOVIE_AGENT_SUBTASK_EVIDENCE_MAX_CHARS", "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(0, value)
+
+
+def bounded_subtask_evidence_text(text: str, *, limit: int | None = None) -> tuple[str, bool]:
+    value = str(text or "").strip()
+    max_chars = subtask_evidence_max_chars() if limit is None else max(0, int(limit))
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value, False
+    return value[:max_chars].rstrip() + "\n\n[truncated]", True
+
+
 class SubtaskEventMapper:
     """Map DeepAgents ``task`` tool calls into platform-visible events."""
 
@@ -461,9 +485,7 @@ class SubtaskEventMapper:
             return None
         metadata = dict(completed.metadata or {})
         subtask = metadata.get("subtask") if isinstance(metadata.get("subtask"), dict) else {}
-        content = result_text
-        if len(content) > 8000:
-            content = content[:7999].rstrip() + "..."
+        content, truncated = bounded_subtask_evidence_text(result_text)
         title = str(subtask.get("title") or metadata.get("subagent_type") or "Subtask")
         return workpad_checkpoint_event(
             kind="subtask_evidence_card",
@@ -481,6 +503,7 @@ class SubtaskEventMapper:
                 "subtask_status": metadata.get("subtask_status"),
                 "subtask_incomplete_reasons": list(metadata.get("subtask_incomplete_reasons") or []),
                 "tool_result_chars": metadata.get("tool_result_chars"),
+                "content_truncated": truncated,
             },
         )
 

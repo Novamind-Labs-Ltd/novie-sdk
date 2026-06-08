@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import json
-from typing import Any, Iterator, Optional, Sequence, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from .llm_contract import (
     normalise_tool_call_chunks,
@@ -48,7 +48,9 @@ except ImportError:  # pragma: no cover - exercised only without langchain-core
     ChatGeneration = None  # type: ignore[assignment]
     ChatResult = None  # type: ignore[assignment]
     ConfigDict = dict  # type: ignore[assignment]
-    Field = lambda default=None, **_kwargs: default  # type: ignore[assignment]
+
+    def Field(default=None, **_kwargs):  # type: ignore[no-untyped-def]
+        return default
 
 _log = logging.getLogger(__name__)
 
@@ -73,6 +75,7 @@ class PlatformChatModel(_BaseChatModel):
     platform_ns: Any = Field(exclude=True)
     model: str | None = None
     temperature: float | None = None
+    max_output_tokens: int | None = None
     tools: list[dict[str, Any]] = Field(default_factory=list)
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
@@ -85,6 +88,7 @@ class PlatformChatModel(_BaseChatModel):
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
@@ -94,6 +98,7 @@ class PlatformChatModel(_BaseChatModel):
             platform_ns=platform_ns,
             model=model,
             temperature=temperature,
+            max_output_tokens=max_output_tokens,
             tools=list(tools or []),
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
@@ -181,6 +186,7 @@ class PlatformChatModel(_BaseChatModel):
         arguments: dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,
+            "max_output_tokens": self.max_output_tokens,
             "tools": self.tools or None,
             "tool_choice": self.tool_choice,
             "parallel_tool_calls": self.parallel_tool_calls,
@@ -233,6 +239,7 @@ class PlatformChatModel(_BaseChatModel):
             self.platform_ns,
             model=self.model,
             temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
             tools=tool_schemas,
             tool_choice=kwargs.get("tool_choice"),
             parallel_tool_calls=kwargs.get("parallel_tool_calls", False),
@@ -259,6 +266,7 @@ class PlatformChatModel(_BaseChatModel):
             pydantic_class=schema if _is_pydantic_class(schema) else None,
             model=self.model,
             temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
         )
 
     def _normalise_input(self, input: Any) -> list[dict[str, str]]:
@@ -312,6 +320,7 @@ class PlatformChatModel(_BaseChatModel):
                 self._normalise_input(input),
                 model=self.model,
                 temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
                 tools=self.tools or None,
                 tool_choice=self.tool_choice,
                 parallel_tool_calls=self.parallel_tool_calls,
@@ -366,12 +375,14 @@ class PlatformStructuredChatModel:
         pydantic_class: Any | None,
         model: str | None,
         temperature: float | None,
+        max_output_tokens: int | None,
     ) -> None:
         self._platform_ns = platform_ns
         self._output_schema = output_schema
         self._pydantic_class = pydantic_class
         self._model = model
         self._temperature = temperature
+        self._max_output_tokens = max_output_tokens
 
     async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
         if isinstance(input, str):
@@ -393,6 +404,7 @@ class PlatformStructuredChatModel:
             self._output_schema,
             model=self._model,
             temperature=self._temperature,
+            max_output_tokens=self._max_output_tokens,
         )
         await notify_usage_callbacks(config, dict(result.get("usage_metadata") or {}))
         structured = result.get("structured") or result
