@@ -51,6 +51,11 @@ from typing import Any, Literal, Protocol
 
 import httpx
 
+from .artifact_text import (
+    ArtifactReadCache,
+    format_artifact_read_result,
+    normalize_artifact_id,
+)
 from .platform_callback import (
     build_platform_callback_headers,
     sign_platform_callback_headers,
@@ -854,6 +859,7 @@ class ArtifactsNamespace:
 
     def __init__(self, parent: "PlatformNamespace") -> None:
         self._parent = parent
+        self._text_cache = ArtifactReadCache()
 
     async def describe(self, artifact_id: str, *, purpose: str = "") -> dict[str, Any]:
         return await self.read(
@@ -944,6 +950,41 @@ class ArtifactsNamespace:
                 )
             )
         return dict(result)
+
+    async def read_text(
+        self,
+        artifact_id: str,
+        *,
+        mode: str = "summary",
+        purpose: str = "agent evidence retrieval",
+        query: str | None = None,
+        offset: int = 0,
+        max_bytes: int = 12000,
+    ) -> str:
+        """Read an artifact and render the response as prompt-safe text."""
+        normalized_artifact_id = normalize_artifact_id(artifact_id)
+        cache_key = (
+            normalized_artifact_id,
+            str(mode or "summary"),
+            str(query or ""),
+            int(offset or 0),
+            int(max_bytes or 12000),
+            str(purpose or ""),
+        )
+        cached = self._text_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        data = await self.read(
+            normalized_artifact_id,
+            mode=mode,
+            purpose=purpose,
+            query=query,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+        rendered = format_artifact_read_result(data)
+        self._text_cache.set(cache_key, rendered)
+        return rendered
 
     async def search_index(
         self,

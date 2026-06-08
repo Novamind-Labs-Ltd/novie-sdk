@@ -1177,6 +1177,36 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
 
 
+def test_stream_endpoint_emits_keepalive_while_handler_is_silent(monkeypatch):
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk import runtime as runtime_mod
+    from novie_agent_sdk.runtime import StreamContext
+
+    monkeypatch.setattr(runtime_mod, "_DEFAULT_STREAM_KEEPALIVE_SECONDS", 0.01)
+    agent = Agent(_stream_manifest("stream-keepalive"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        await asyncio.sleep(0.03)
+        yield {"kind": "content", "content": "body"}
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    keepalives = [
+        event
+        for event in events
+        if event.get("kind") == "status_changed"
+        and isinstance(event.get("payload"), dict)
+        and event["payload"].get("agent_event_kind") == "keepalive"
+    ]
+    assert keepalives
+    assert keepalives[0]["summary"] == "Agent is still working"
+    assert [event.get("kind") for event in events][-2:] == ["content", "done"]
+
+
 def test_stream_invocation_status_events_and_result_endpoints():
     from fastapi.testclient import TestClient
     from novie_agent_sdk.runtime import StreamContext

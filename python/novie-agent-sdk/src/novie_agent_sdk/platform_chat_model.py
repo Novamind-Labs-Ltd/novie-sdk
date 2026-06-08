@@ -34,6 +34,7 @@ from .llm_contract import (
     normalise_tool_calls,
     sanitize_additional_kwargs,
 )
+from .runtime_config import notify_usage_callbacks
 
 if TYPE_CHECKING:
     from .platform_namespace import PlatformNamespace
@@ -177,14 +178,31 @@ class PlatformChatModel(_BaseChatModel):
         from langchain_core.messages import AIMessage
 
         messages = self._normalise_input(input)
-        result = await self.platform_ns.llm.chat(
-            messages,
-            model=self.model,
-            temperature=self.temperature,
-            tools=self.tools or None,
-            tool_choice=self.tool_choice,
-            parallel_tool_calls=self.parallel_tool_calls,
-        )
+        arguments: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "tools": self.tools or None,
+            "tool_choice": self.tool_choice,
+            "parallel_tool_calls": self.parallel_tool_calls,
+        }
+        arguments = {key: value for key, value in arguments.items() if value is not None}
+        invoke_llm_capability = getattr(self.platform_ns, "invoke_llm_capability", None)
+        if callable(invoke_llm_capability) and (
+            self.tools or self.tool_choice or self.parallel_tool_calls is not None
+        ):
+            diagnostics = await invoke_llm_capability(
+                "platform.llm.chat",
+                {"messages": messages, **arguments},
+            )
+            unwrap = getattr(getattr(self.platform_ns, "llm", None), "_unwrap", None)
+            result = (
+                unwrap(diagnostics, "platform.llm.chat")
+                if callable(unwrap)
+                else diagnostics.result
+            )
+        else:
+            result = await self.platform_ns.llm.chat(messages, **arguments)
+        result = dict(result or {})
         content = result.get("content") or ""
         usage_metadata = result.get("usage_metadata") or {}
         msg = AIMessage(
@@ -194,6 +212,7 @@ class PlatformChatModel(_BaseChatModel):
             additional_kwargs=sanitize_additional_kwargs(result.get("additional_kwargs") or {}),
         )
         msg.usage_metadata = usage_metadata  # type: ignore[assignment]
+        await notify_usage_callbacks(config, dict(usage_metadata or {}))
         return msg
 
     def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
@@ -216,7 +235,7 @@ class PlatformChatModel(_BaseChatModel):
             temperature=self.temperature,
             tools=tool_schemas,
             tool_choice=kwargs.get("tool_choice"),
-            parallel_tool_calls=kwargs.get("parallel_tool_calls"),
+            parallel_tool_calls=kwargs.get("parallel_tool_calls", False),
         )
 
     def with_structured_output(
@@ -226,7 +245,7 @@ class PlatformChatModel(_BaseChatModel):
         method: str = "json_schema",
         include_raw: bool = False,
         **kwargs: Any,
-    ) -> "_StructuredPlatformModel":
+    ) -> "PlatformStructuredChatModel":
         """Return a model variant that enforces structured JSON-schema output.
 
         ``schema`` can be a ``dict`` (JSON Schema) or a Pydantic
@@ -234,7 +253,7 @@ class PlatformChatModel(_BaseChatModel):
         with ``model.model_json_schema()``.
         """
         json_schema = _resolve_schema(schema)
-        return _StructuredPlatformModel(
+        return PlatformStructuredChatModel(
             platform_ns=self.platform_ns,
             output_schema=json_schema,
             pydantic_class=schema if _is_pydantic_class(schema) else None,
@@ -246,7 +265,13 @@ class PlatformChatModel(_BaseChatModel):
         if isinstance(input, str):
             return [{"role": "user", "content": input}]
         if isinstance(input, list):
-            return [self._message_to_dict(m) for m in input]
+            messages: list[dict[str, Any]] = []
+            for item in input:
+                if isinstance(item, tuple) and len(item) == 2:
+                    messages.append({"role": str(item[0]), "content": str(item[1])})
+                else:
+                    messages.append(self._message_to_dict(item))
+            return messages
         return [self._message_to_dict(input)]
 
     # ── Streaming ─────────────────────────────────────────────────────────
@@ -331,7 +356,7 @@ class PlatformChatModel(_BaseChatModel):
         )
 
 
-class _StructuredPlatformModel:
+class PlatformStructuredChatModel:
     """Returned by ``PlatformChatModel.with_structured_output``."""
 
     def __init__(
@@ -353,7 +378,12 @@ class _StructuredPlatformModel:
             messages = [{"role": "user", "content": input}]
         elif isinstance(input, list):
             base = PlatformChatModel(self._platform_ns)
-            messages = [base._message_to_dict(m) for m in input]
+            messages = [
+                {"role": str(m[0]), "content": str(m[1])}
+                if isinstance(m, tuple) and len(m) == 2
+                else base._message_to_dict(m)
+                for m in input
+            ]
         else:
             base = PlatformChatModel(self._platform_ns)
             messages = [base._message_to_dict(input)]
@@ -364,6 +394,7 @@ class _StructuredPlatformModel:
             model=self._model,
             temperature=self._temperature,
         )
+        await notify_usage_callbacks(config, dict(result.get("usage_metadata") or {}))
         structured = result.get("structured") or result
         if self._pydantic_class is not None and isinstance(structured, dict):
             return self._pydantic_class.model_validate(structured)
@@ -398,4 +429,7 @@ def _is_pydantic_class(obj: Any) -> bool:
 
 __all__ = [
     "PlatformChatModel",
+    "PlatformStructuredChatModel",
 ]
+
+_StructuredPlatformModel = PlatformStructuredChatModel

@@ -20,6 +20,7 @@ without a real server.
 # ruff: noqa: I001
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable
 from typing import Any
@@ -323,7 +324,8 @@ async def test_artifacts_read_uses_budgeted_platform_capability() -> None:
                     "available": True,
                     "artifact_id": "artifact-1",
                     "mode": "search",
-                    "content": [{"offset": 12, "text": "bounded excerpt"}],
+                    "content": "1. offset=12\nbounded excerpt",
+                    "metadata": {"count": 1},
                 }
             ),
         )
@@ -336,7 +338,7 @@ async def test_artifacts_read_uses_budgeted_platform_capability() -> None:
         max_bytes=4096,
     )
 
-    assert out["content"] == [{"offset": 12, "text": "bounded excerpt"}]
+    assert out["content"] == "1. offset=12\nbounded excerpt"
     assert "/capabilities/platform.artifacts.read/invoke" in captured["url"]
     assert captured["body"]["arguments"] == {
         "artifact_id": "artifact-1",
@@ -376,6 +378,83 @@ async def test_artifacts_read_does_not_expose_full_read_allow_flag() -> None:
         d.capability_id == "platform.artifacts.read" and d.kind == "no_results"
         for d in ns.last_diagnostics()
     )
+
+
+@pytest.mark.asyncio
+async def test_artifacts_read_text_formats_platform_artifact_payload() -> None:
+    calls: list[dict[str, Any]] = []
+    encoded = base64.b64encode(
+        json.dumps(
+            {
+                "final_payload": {
+                    "final_markdown": "# Final Report\n\nReadable body."
+                }
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode()))
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "artifact_id": "artifact-1",
+                    "mode": "chunks",
+                    "metadata": {
+                        "encoding": "base64",
+                        "content_type": "application/json",
+                    },
+                    "content": {"data": encoded, "next_offset": 4096},
+                    "excerpts": [{"offset": 32, "excerpt": "bounded excerpt"}],
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    out = await ns.artifacts.read_text(
+        "artifact://artifact-1",
+        mode="chunks",
+        offset=128,
+        max_bytes=4096,
+    )
+
+    assert "# Final Report" in out
+    assert "Readable body." in out
+    assert "bounded excerpt" in out
+    assert "Next offset: 4096" in out
+    assert encoded not in out
+    assert calls[0]["arguments"]["artifact_id"] == "artifact-1"
+    assert calls[0]["arguments"]["purpose"] == "agent evidence retrieval"
+
+
+@pytest.mark.asyncio
+async def test_artifacts_read_text_caches_exact_repeated_reads() -> None:
+    call_count = 0
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "artifact_id": "artifact-1",
+                    "mode": "summary",
+                    "summary": "Cached artifact summary",
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+    first = await ns.artifacts.read_text("artifact-1", mode="summary")
+    second = await ns.artifacts.read_text("artifact://artifact-1", mode="summary")
+
+    assert first == second
+    assert "Cached artifact summary" in second
+    assert call_count == 1
 
 
 @pytest.mark.asyncio

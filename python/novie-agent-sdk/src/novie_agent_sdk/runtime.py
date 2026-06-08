@@ -662,6 +662,9 @@ _DEFAULT_INVOCATION_LEASE_SECONDS = _env_int(
 _DEFAULT_INVOCATION_HEARTBEAT_EVENTS = _env_int(
     "NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS", default=10,
 )
+_DEFAULT_STREAM_KEEPALIVE_SECONDS = _env_float(
+    "NOVIE_AGENT_STREAM_KEEPALIVE_SECONDS", default=25.0,
+)
 
 
 @dataclass
@@ -2289,6 +2292,7 @@ class Agent:
                     terminal_error_emitted = False
                     invocation_resolved = False
                     events_since_touch = 0
+                    last_event_at = time.monotonic()
 
                     async def _maybe_heartbeat() -> None:
                         # Tier B: renew the in_progress lease so a long-running
@@ -2310,6 +2314,30 @@ class Agent:
                             # just expire normally if downstream really did die.
                             _log.debug("invocation_store.touch raised", exc_info=True)
 
+                    async def _emit_stream_keepalive() -> bytes:
+                        nonlocal last_event_at
+                        idle_seconds = max(0, int(time.monotonic() - last_event_at))
+                        event = {
+                            "kind": "status_changed",
+                            "summary": "Agent is still working",
+                            "payload": {
+                                "agent_event_kind": "keepalive",
+                                "phase": "running",
+                                "idle_seconds": idle_seconds,
+                                "agent_id": m.agent_id,
+                            },
+                            "metadata": {
+                                "agent_event_kind": "keepalive",
+                                "phase": "running",
+                                "idle_seconds": idle_seconds,
+                                "agent_id": m.agent_id,
+                            },
+                        }
+                        emitted_events.append(event)
+                        last_event_at = time.monotonic()
+                        await _maybe_heartbeat()
+                        return (json.dumps(event) + "\n").encode()
+
                     async def _runner() -> None:
                         try:
                             async for event in self._stream_handler(ctx):
@@ -2322,7 +2350,14 @@ class Agent:
                     runner_task = asyncio.create_task(_runner())
                     try:
                         while True:
-                            kind, payload = await event_queue.get()
+                            try:
+                                kind, payload = await asyncio.wait_for(
+                                    event_queue.get(),
+                                    timeout=max(_DEFAULT_STREAM_KEEPALIVE_SECONDS, 0.001),
+                                )
+                            except asyncio.TimeoutError:
+                                yield await _emit_stream_keepalive()
+                                continue
                             if kind == "done":
                                 break
                             if kind == "error":
@@ -2355,6 +2390,7 @@ class Agent:
                                 # Already a fully-formed dict (UsageReport.
                                 # to_platform_task_event); forward verbatim.
                                 emitted_events.append(payload)
+                                last_event_at = time.monotonic()
                                 yield (json.dumps(payload) + "\n").encode()
                                 await _maybe_heartbeat()
                                 continue
@@ -2364,6 +2400,7 @@ class Agent:
                             else:
                                 event = {"kind": "content", "text": str(payload)}
                             emitted_events.append(event)
+                            last_event_at = time.monotonic()
                             yield (json.dumps(event) + "\n").encode()
                             await _maybe_heartbeat()
                         if not terminal_error_emitted:
