@@ -92,8 +92,12 @@ _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _WEB_SEARCH_CAP = "platform.web.search"
+_ARTIFACT_CREATE_CAP = "platform.artifacts.create"
 _ARTIFACT_READ_CAP = "platform.artifacts.read"
 _ARTIFACT_SEARCH_CAP = "platform.artifacts.search"
+_WORKPAD_SNAPSHOT_CAP = "platform.workpads.snapshot"
+_WORKPAD_RECORD_ENTRY_CAP = "platform.workpads.record_entry"
+_WORKPAD_SET_FINAL_DELIVERABLE_CAP = "platform.workpads.set_final_deliverable"
 _CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
 _CHECKPOINT_GET_CAP = "platform.external_agent_checkpoint.get"
 _CHECKPOINT_LIST_CAP = "platform.external_agent_checkpoint.list"
@@ -861,6 +865,45 @@ class ArtifactsNamespace:
         self._parent = parent
         self._text_cache = ArtifactReadCache()
 
+    async def create(
+        self,
+        *,
+        artifact_type: str,
+        content: Any,
+        content_type: str = "text/markdown",
+        summary: str = "",
+        workflow_id: str | None = None,
+        thread_id: str | None = None,
+        step_id: str | None = None,
+        agent_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "artifact_type": artifact_type,
+            "content": content,
+            "content_type": content_type,
+            "summary": summary,
+            "metadata": dict(metadata or {}),
+        }
+        for key, value in (
+            ("workflow_id", workflow_id),
+            ("thread_id", thread_id),
+            ("step_id", step_id),
+            ("agent_id", agent_id),
+        ):
+            if value:
+                payload[key] = value
+        diagnostics = await self._parent.invoke_capability(
+            _ARTIFACT_CREATE_CAP, payload,
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "error": diagnostics.error_code or diagnostics.kind or "artifact_create_failed",
+                "message": diagnostics.detail,
+            }
+        return dict(diagnostics.result or {})
+
     async def describe(self, artifact_id: str, *, purpose: str = "") -> dict[str, Any]:
         return await self.read(
             artifact_id,
@@ -1021,6 +1064,105 @@ class ArtifactsNamespace:
             )
             return []
         return [item for item in items if isinstance(item, dict)]
+
+
+class WorkpadsNamespace:
+    """Compact execution-workpad ledger access for connected agents."""
+
+    def __init__(self, parent: "PlatformNamespace") -> None:
+        self._parent = parent
+
+    async def snapshot(
+        self,
+        *,
+        workflow_id: str | None = None,
+        limit: int = 24,
+    ) -> dict[str, Any]:
+        payload = {
+            "workflow_id": workflow_id,
+            "limit": int(limit),
+        }
+        diagnostics = await self._parent.invoke_capability(
+            _WORKPAD_SNAPSHOT_CAP,
+            {key: value for key, value in payload.items() if value not in (None, "")},
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "error": diagnostics.error_code or diagnostics.kind or "workpad_snapshot_failed",
+                "message": diagnostics.detail,
+            }
+        return dict(diagnostics.result or {})
+
+    async def record_entry(
+        self,
+        *,
+        kind: str,
+        title: str = "",
+        workflow_id: str | None = None,
+        step_id: str | None = None,
+        agent_id: str | None = None,
+        capability_id: str | None = None,
+        content_ref: str = "",
+        content_preview: str = "",
+        artifact_refs: list[dict[str, Any]] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": kind,
+            "title": title,
+            "content_ref": content_ref,
+            "content_preview": content_preview,
+            "artifact_refs": list(artifact_refs or []),
+            "metadata": dict(metadata or {}),
+        }
+        for key, value in (
+            ("workflow_id", workflow_id),
+            ("step_id", step_id),
+            ("agent_id", agent_id),
+            ("capability_id", capability_id),
+        ):
+            if value:
+                payload[key] = value
+        diagnostics = await self._parent.invoke_capability(
+            _WORKPAD_RECORD_ENTRY_CAP,
+            payload,
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "error": diagnostics.error_code or diagnostics.kind or "workpad_record_failed",
+                "message": diagnostics.detail,
+            }
+        return dict(diagnostics.result or {})
+
+    async def set_final_deliverable(
+        self,
+        artifact_ref: str,
+        *,
+        workflow_id: str | None = None,
+        step_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "artifact_ref": artifact_ref,
+            "metadata": dict(metadata or {}),
+        }
+        if workflow_id:
+            payload["workflow_id"] = workflow_id
+        if step_id:
+            payload["step_id"] = step_id
+        diagnostics = await self._parent.invoke_capability(
+            _WORKPAD_SET_FINAL_DELIVERABLE_CAP,
+            payload,
+        )
+        if not diagnostics.ok:
+            return {
+                "available": False,
+                "error": diagnostics.error_code or diagnostics.kind or "workpad_final_failed",
+                "message": diagnostics.detail,
+            }
+        return dict(diagnostics.result or {})
 
 
 class CheckpointsNamespace:
@@ -1396,6 +1538,7 @@ class PlatformNamespace:
     knowledge: KnowledgeNamespace
     web: WebNamespace
     artifacts: ArtifactsNamespace
+    workpads: WorkpadsNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1419,6 +1562,7 @@ class PlatformNamespace:
         self.knowledge = KnowledgeNamespace(self)
         self.web = WebNamespace(self)
         self.artifacts = ArtifactsNamespace(self)
+        self.workpads = WorkpadsNamespace(self)
         self.checkpoints = CheckpointsNamespace(self)
         self.llm = LlmNamespace(self)
 
@@ -1505,6 +1649,7 @@ class _UnavailablePlatformNamespace:
     knowledge: KnowledgeNamespace
     web: WebNamespace
     artifacts: ArtifactsNamespace
+    workpads: WorkpadsNamespace
     checkpoints: CheckpointsNamespace
     llm: LlmNamespace
 
@@ -1515,6 +1660,7 @@ class _UnavailablePlatformNamespace:
         self.knowledge = KnowledgeNamespace(self)  # type: ignore[arg-type]
         self.web = WebNamespace(self)  # type: ignore[arg-type]
         self.artifacts = ArtifactsNamespace(self)  # type: ignore[arg-type]
+        self.workpads = WorkpadsNamespace(self)  # type: ignore[arg-type]
         self.checkpoints = CheckpointsNamespace(self)  # type: ignore[arg-type]
         self.llm = LlmNamespace(self)  # type: ignore[arg-type]
 
@@ -1634,4 +1780,5 @@ __all__ = [
     "QuotaExceededError",
     "build_platform_namespace",
     "classify_envelope_error",
+    "WorkpadsNamespace",
 ]

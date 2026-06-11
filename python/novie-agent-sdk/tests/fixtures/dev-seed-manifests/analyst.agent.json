@@ -2,24 +2,23 @@
   "$schema": "https://novie.dev/schemas/agent-manifest-v2.json",
   "agent_id": "analyst",
   "name": "Novie Analyst",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "kind": "expert_basic",
   "runtime": "external_a2a",
   "capabilities": [
-    "requirement_extraction",
-    "stakeholder_analysis",
-    "scope_clarification",
-    "competitor_identification",
-    "feature_comparison",
-    "market_positioning_analysis",
+    "brainstorming",
+    "product_brief",
+    "market_research",
+    "domain_research",
+    "technical_research",
     "report_synthesis"
   ],
   "capability_manifest": [
     {
-      "capability_id": "agent.analyst.requirement_extraction",
-      "version": "0.2.0",
-      "display_name": "Extract Requirements",
-      "description": "Extract structured requirements from user goals and project context.",
+      "capability_id": "agent.analyst.brainstorming",
+      "version": "0.4.0",
+      "display_name": "Brainstorming",
+      "description": "Generate and organise candidate directions before a product brief is locked.",
       "input_schema": {
         "type": "object"
       },
@@ -29,23 +28,49 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:analyst:requirement_extraction",
+      "runtime_ref": "agent:analyst:brainstorming",
       "tags": [
-        "requirements",
-        "analysis"
+        "brainstorming",
+        "ideation"
       ],
       "natural_language_aliases": [
-        "需求分析",
-        "提炼需求",
-        "extract requirements"
+        "头脑风暴",
+        "brainstorming",
+        "ideate"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
         "task_brief"
       ],
+      "metadata": {
+        "dependency_policy": "none",
+        "artifact_access": "none",
+        "routing_profile": {
+          "when_to_use": [
+            "Use for early ideation when the user asks to explore possible product directions before committing to a brief."
+          ],
+          "when_not_to_use": [
+            "Do not use for final PRD creation, backlog decomposition, repository edits, or management report synthesis."
+          ],
+          "terminal_artifacts": [
+            "brainstorm_notes"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Brainstorm feature directions from this product goal.",
+            "Explore solution options before writing the product brief."
+          ],
+          "negative_examples": [
+            "Create implementation tickets.",
+            "Edit the repository and open a pull request."
+          ],
+          "planner_notes": "Read-only artifact producer. It starts discovery and normally feeds product_brief as optional context."
+        }
+      },
       "provides": [
-        "requirements_analysis"
+        "brainstorm_notes"
       ],
       "execution_lane": "direct",
       "risk_class": "read_only",
@@ -69,10 +94,10 @@
       ]
     },
     {
-      "capability_id": "agent.analyst.stakeholder_analysis",
-      "version": "0.2.0",
-      "display_name": "Analyze Stakeholders",
-      "description": "Identify stakeholders, concerns, and decision points for a product request.",
+      "capability_id": "agent.analyst.product_brief",
+      "version": "0.4.0",
+      "display_name": "Product Brief",
+      "description": "Draft a structured product brief covering problem, users, scope, stakeholders, and open questions.",
       "input_schema": {
         "type": "object"
       },
@@ -82,74 +107,55 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:analyst:stakeholder_analysis",
+      "runtime_ref": "agent:analyst:product_brief",
       "tags": [
-        "stakeholders",
-        "analysis"
+        "product",
+        "brief",
+        "requirements"
       ],
       "natural_language_aliases": [
-        "干系人分析",
-        "stakeholder analysis"
+        "产品brief",
+        "需求分析",
+        "product brief"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
-        "requirements_analysis"
+        "task_brief"
       ],
-      "provides": [
-        "stakeholder_matrix"
-      ],
-      "execution_lane": "direct",
-      "risk_class": "read_only",
-      "governance": {
-        "requires_plan_review": false,
-        "requires_tracker_issue": false,
-        "requires_human_gate": false
-      },
-      "input_contracts": [
-        {
-          "artifact": "requirements_analysis",
-          "source": "upstream_capability",
-          "required": true
+      "metadata": {
+        "optional_consumes": [
+          "brainstorm_notes"
+        ],
+        "dependency_policy": "selected_context_only",
+        "artifact_access": "summary_then_fetch",
+        "routing_profile": {
+          "when_to_use": [
+            "Use when the goal is to turn an initial request into a structured product brief, requirements analysis, scope, stakeholders, and open questions."
+          ],
+          "when_not_to_use": [
+            "Do not use for market research, technical feasibility research, PRD validation, ticket splitting, or repository implementation."
+          ],
+          "terminal_artifacts": [
+            "requirements_analysis",
+            "product_brief"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Draft a product brief from this user goal.",
+            "Extract requirements and scope from this product idea."
+          ],
+          "negative_examples": [
+            "Produce a final management report from several analyses.",
+            "Break this PRD into implementation tickets."
+          ],
+          "planner_notes": "Prefer this capability for product-discovery starts. It may consume brainstorm_notes when the plan already produced them."
         }
-      ],
-      "caller_types": [
-        "planner",
-        "executor",
-        "agent"
-      ]
-    },
-    {
-      "capability_id": "agent.analyst.scope_clarification",
-      "version": "0.2.0",
-      "display_name": "Clarify Scope",
-      "description": "Clarify ambiguous scope, constraints, and acceptance boundaries.",
-      "input_schema": {
-        "type": "object"
       },
-      "output_schema": {
-        "type": "object"
-      },
-      "risk": "read",
-      "side_effect": "none",
-      "exec_kind": "async",
-      "runtime_ref": "agent:analyst:scope_clarification",
-      "tags": [
-        "scope",
-        "clarification"
-      ],
-      "natural_language_aliases": [
-        "澄清范围",
-        "scope clarification"
-      ],
-      "idempotent": true,
-      "expected_duration_class": "<1min",
-      "consumes": [
+      "provides": [
         "requirements_analysis",
-        "stakeholder_matrix"
-      ],
-      "provides": [
-        "scope_questions"
+        "product_brief"
       ],
       "execution_lane": "direct",
       "risk_class": "read_only",
@@ -160,14 +166,10 @@
       },
       "input_contracts": [
         {
-          "artifact": "requirements_analysis",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "stakeholder_matrix",
-          "source": "upstream_capability",
-          "required": true
+          "artifact": "task_brief",
+          "source": "user_input",
+          "required": true,
+          "provider": "platform.user_input.task_brief"
         }
       ],
       "caller_types": [
@@ -177,10 +179,10 @@
       ]
     },
     {
-      "capability_id": "agent.analyst.competitor_identification",
-      "version": "0.2.0",
-      "display_name": "Identify Competitors",
-      "description": "Identify direct, adjacent, and emerging competitors for a target product category.",
+      "capability_id": "agent.analyst.market_research",
+      "version": "0.4.0",
+      "display_name": "Market Research",
+      "description": "Research market structure, customer segments, buying behaviour, and competitive landscape.",
       "input_schema": {
         "type": "object"
       },
@@ -190,22 +192,142 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:analyst:competitor_identification",
+      "runtime_ref": "agent:analyst:market_research",
       "tags": [
         "research",
+        "market",
         "competitors"
       ],
       "natural_language_aliases": [
-        "竞品识别",
-        "identify competitors"
+        "市场调研",
+        "市场分析",
+        "竞品分析",
+        "market research"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
         "task_brief"
       ],
+      "metadata": {
+        "optional_consumes": [
+          "requirements_analysis"
+        ],
+        "dependency_policy": "selected_context_only",
+        "artifact_access": "summary_then_fetch",
+        "routing_profile": {
+          "when_to_use": [
+            "Use for customer segments, competitors, market sizing, buying behavior, pricing signals, and go-to-market evidence."
+          ],
+          "when_not_to_use": [
+            "Do not use for architecture design, code implementation, ticket splitting, or domain regulatory analysis unless market evidence is requested."
+          ],
+          "terminal_artifacts": [
+            "market_analysis"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Research competitors and customer segments for this product.",
+            "Assess the market opportunity and buying behavior."
+          ],
+          "negative_examples": [
+            "Evaluate implementation architecture.",
+            "Create GitHub issues from a spec."
+          ],
+          "planner_notes": "Use as an evidence-producing step before report_synthesis or PRD creation when market context matters."
+        }
+      },
       "provides": [
-        "competitor_set"
+        "market_analysis"
+      ],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "aliases": [
+        "agent.analyst.market_analysis"
+      ],
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      },
+      "input_contracts": [
+        {
+          "artifact": "task_brief",
+          "source": "user_input",
+          "required": true,
+          "provider": "platform.user_input.task_brief"
+        }
+      ],
+      "caller_types": [
+        "planner",
+        "executor",
+        "agent"
+      ]
+    },
+    {
+      "capability_id": "agent.analyst.domain_research",
+      "version": "0.4.0",
+      "display_name": "Domain Research",
+      "description": "Research industry structure, regulatory landscape, macro trends, and technology adoption in the domain.",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:analyst:domain_research",
+      "tags": [
+        "research",
+        "domain",
+        "industry",
+        "regulatory"
+      ],
+      "natural_language_aliases": [
+        "行业研究",
+        "领域分析",
+        "合规研究",
+        "domain research"
+      ],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": [
+        "task_brief"
+      ],
+      "metadata": {
+        "optional_consumes": [
+          "requirements_analysis"
+        ],
+        "dependency_policy": "selected_context_only",
+        "artifact_access": "summary_then_fetch",
+        "routing_profile": {
+          "when_to_use": [
+            "Use for industry structure, regulatory constraints, macro trends, operating model, and domain-specific adoption patterns."
+          ],
+          "when_not_to_use": [
+            "Do not use for competitor-only market analysis, technical architecture, code implementation, or backlog decomposition."
+          ],
+          "terminal_artifacts": [
+            "domain_analysis"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Research the industry and regulatory context for this product.",
+            "Summarize domain constraints and adoption trends."
+          ],
+          "negative_examples": [
+            "Compare framework options for implementation.",
+            "Open a pull request."
+          ],
+          "planner_notes": "Use as an evidence-producing step before report_synthesis or architecture when domain context changes decisions."
+        }
+      },
+      "provides": [
+        "domain_analysis"
       ],
       "execution_lane": "direct",
       "risk_class": "read_only",
@@ -229,10 +351,10 @@
       ]
     },
     {
-      "capability_id": "agent.analyst.feature_comparison",
-      "version": "0.2.0",
-      "display_name": "Compare Features",
-      "description": "Build a structured feature comparison matrix across the identified competitors.",
+      "capability_id": "agent.analyst.technical_research",
+      "version": "0.4.0",
+      "display_name": "Technical Research",
+      "description": "Research technology options, architecture patterns, integration approaches, and implementation feasibility.",
       "input_schema": {
         "type": "object"
       },
@@ -242,77 +364,61 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:analyst:feature_comparison",
+      "runtime_ref": "agent:analyst:technical_research",
       "tags": [
         "research",
-        "features"
+        "technical",
+        "feasibility",
+        "architecture"
       ],
       "natural_language_aliases": [
-        "功能对比",
-        "feature comparison"
+        "技术研究",
+        "技术分析",
+        "可行性分析",
+        "technical research"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
-        "competitor_set"
+        "task_brief"
       ],
-      "provides": [
-        "feature_matrix"
-      ],
-      "execution_lane": "direct",
-      "risk_class": "read_only",
-      "governance": {
-        "requires_plan_review": false,
-        "requires_tracker_issue": false,
-        "requires_human_gate": false
-      },
-      "input_contracts": [
-        {
-          "artifact": "competitor_set",
-          "source": "upstream_capability",
-          "required": true
+      "metadata": {
+        "optional_consumes": [
+          "requirements_analysis"
+        ],
+        "dependency_policy": "selected_context_only",
+        "artifact_access": "summary_then_fetch",
+        "routing_profile": {
+          "when_to_use": [
+            "Use for technology options, architecture patterns, integration approaches, feasibility, engineering risks, and implementation trade-offs."
+          ],
+          "when_not_to_use": [
+            "Do not use for market research, PRD editing, ticket drafting, or direct repository mutation."
+          ],
+          "terminal_artifacts": [
+            "technical_analysis"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Evaluate technical options and feasibility for this product.",
+            "Research architecture patterns and integration trade-offs."
+          ],
+          "negative_examples": [
+            "Create epics and stories.",
+            "Implement the feature in the repository."
+          ],
+          "planner_notes": "Use as a read-only evidence step before architecture or report_synthesis when feasibility or stack choice matters."
         }
-      ],
-      "caller_types": [
-        "planner",
-        "executor",
-        "agent"
-      ]
-    },
-    {
-      "capability_id": "agent.analyst.market_positioning_analysis",
-      "version": "0.2.0",
-      "display_name": "Analyze Market Positioning",
-      "description": "Analyze competitor positioning, target customer segments, and value propositions.",
-      "input_schema": {
-        "type": "object"
       },
-      "output_schema": {
-        "type": "object"
-      },
-      "risk": "read",
-      "side_effect": "none",
-      "exec_kind": "async",
-      "runtime_ref": "agent:analyst:market_positioning_analysis",
-      "tags": [
-        "research",
-        "positioning"
-      ],
-      "natural_language_aliases": [
-        "市场定位分析",
-        "market positioning analysis"
-      ],
-      "idempotent": true,
-      "expected_duration_class": "<1min",
-      "consumes": [
-        "competitor_set",
-        "feature_matrix"
-      ],
       "provides": [
-        "positioning_map"
+        "technical_analysis"
       ],
       "execution_lane": "direct",
       "risk_class": "read_only",
+      "aliases": [
+        "agent.analyst.technical_analysis"
+      ],
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": false,
@@ -320,14 +426,10 @@
       },
       "input_contracts": [
         {
-          "artifact": "competitor_set",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "feature_matrix",
-          "source": "upstream_capability",
-          "required": true
+          "artifact": "task_brief",
+          "source": "user_input",
+          "required": true,
+          "provider": "platform.user_input.task_brief"
         }
       ],
       "caller_types": [
@@ -338,9 +440,9 @@
     },
     {
       "capability_id": "agent.analyst.report_synthesis",
-      "version": "0.2.0",
-      "display_name": "Synthesize Management Report",
-      "description": "Synthesize a management-facing report from upstream analysis artifacts.",
+      "version": "0.4.0",
+      "display_name": "Report Synthesis",
+      "description": "Synthesize upstream analyses into a single decision-ready management report.",
       "input_schema": {
         "type": "object"
       },
@@ -353,20 +455,78 @@
       "runtime_ref": "agent:analyst:report_synthesis",
       "tags": [
         "research",
-        "report"
+        "report",
+        "synthesis"
       ],
       "natural_language_aliases": [
         "报告综合",
+        "汇总报告",
         "report synthesis"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
-        "requirements_analysis",
-        "competitor_set",
-        "feature_matrix",
-        "positioning_map"
+        "task_brief"
       ],
+      "metadata": {
+        "requires_upstream_handoff": true,
+        "upstream_handoff_policy": "direct",
+        "minimum_upstream_artifacts": 1,
+        "optional_consumes": [
+          "requirements_analysis",
+          "product_brief",
+          "brainstorm_notes",
+          "market_analysis",
+          "domain_analysis",
+          "technical_analysis"
+        ],
+        "evidence_policy": {
+          "slot": "research_evidence",
+          "accepts": [
+            "requirements_analysis",
+            "product_brief",
+            "brainstorm_notes",
+            "market_analysis",
+            "domain_analysis",
+            "technical_analysis"
+          ],
+          "default_min": 1,
+          "default_max": 1,
+          "complex_max": 3,
+          "selection": "planner_selected_only"
+        },
+        "dependency_policy": "selected_evidence_only",
+        "artifact_access": "summary_then_fetch",
+        "routing_profile": {
+          "when_to_use": [
+            "Use when the requested terminal output is a decision-ready management report synthesized from one or more upstream analysis artifacts."
+          ],
+          "when_not_to_use": [
+            "Do not use as the first/root step. Do not use for first-pass product brief drafting, individual market/domain/technical research, ticket splitting, or repository implementation."
+          ],
+          "terminal_artifacts": [
+            "management_report"
+          ],
+          "intermediate_artifacts": [
+            "brainstorm_notes",
+            "requirements_analysis",
+            "product_brief",
+            "market_analysis",
+            "domain_analysis",
+            "technical_analysis"
+          ],
+          "execution_boundary": "direct_read_only",
+          "positive_examples": [
+            "Write a management report from the available market and technical analyses.",
+            "Synthesize the research into an executive-ready recommendation."
+          ],
+          "negative_examples": [
+            "Split this report into Jira tickets.",
+            "Make code changes based on this report."
+          ],
+          "planner_notes": "Terminal report-writing capability. It requires planner-selected upstream evidence and a platform-provided upstream handoff; planner/resolver must include at least one evidence-producing step before this capability."
+        }
+      },
       "provides": [
         "management_report"
       ],
@@ -379,22 +539,13 @@
       },
       "input_contracts": [
         {
+          "artifact": "task_brief",
+          "source": "user_input",
+          "required": true,
+          "provider": "platform.user_input.task_brief"
+        },
+        {
           "artifact": "requirements_analysis",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "competitor_set",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "feature_matrix",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "positioning_map",
           "source": "upstream_capability",
           "required": true
         }
@@ -416,7 +567,7 @@
   "endpoint": "http://analyst:8010",
   "execution": {
     "expected_duration_seconds": 180,
-    "max_duration_seconds": 600,
+    "max_duration_seconds": 3600,
     "idempotent": false,
     "supports_cancel": false,
     "supports_resume": false,
@@ -430,33 +581,49 @@
     "owner_team": "novie-core",
     "durability": "none",
     "protocol_mode": "stream",
-    "role_description": "Turns user goals, project context, and research prompts into structured analysis artifacts.",
+    "role_description": "Produces brainstorming notes, product briefs, market research, domain research, technical research, and synthesised management reports.",
     "when_to_use": [
-      "Requirements extraction, product scoping, stakeholder analysis, research framing, feasibility analysis, or report synthesis.",
-      "Early planning stages where the platform needs a clear artifact before implementation."
+      "Brainstorming candidate directions before a product brief is locked.",
+      "Drafting a product brief from a user goal and project context.",
+      "Market research: customer segments, competitive landscape, market sizing.",
+      "Domain research: industry structure, regulations, technology trends.",
+      "Technical research: tech stack evaluation, architecture patterns, feasibility.",
+      "Synthesising upstream analyses into a decision-ready management report."
     ],
     "when_not_to_use": [
-      "Direct repository edits, GitHub operations, pull request creation, or task-bundle execution.",
+      "Direct repository edits, GitHub operations, pull request creation, or backlog ticket drafting.",
       "Inspecting an already running plan or agent execution status."
     ],
-    "handoff_contract": "Produces analysis artifacts for Planner, Task Splitter, or downstream review; does not execute repository changes.",
+    "handoff_contract": "Produces analysis artifacts for downstream review or for the Task Splitter to turn into backlog tickets; does not execute repository changes.",
     "user_facing_aliases": [
-      "requirements agent",
       "analyst agent",
-      "research agent",
-      "report agent"
+      "brainstorming agent",
+      "product brief agent",
+      "market research agent",
+      "domain research agent",
+      "technical research agent",
+      "report synthesis agent"
     ],
-    "artifact_output_type": "requirements_analysis",
+    "capability_profiles": [
+      "brainstorming",
+      "product_brief",
+      "market_research",
+      "domain_research",
+      "technical_research",
+      "report_synthesis"
+    ],
     "analysis_modes": [
-      "requirements",
-      "research_report",
-      "feasibility"
+      "brainstorming",
+      "product_brief",
+      "research"
     ],
     "analysis_phases": [
+      "default",
       "discovery",
-      "scoping",
-      "validation",
-      "reporting"
+      "market_map",
+      "competitive_landscape",
+      "technical",
+      "synthesis"
     ],
     "runtime_phases": [
       {
@@ -496,7 +663,8 @@
     "external_research_providers": [
       "gemini"
     ],
-    "external_research_note": "Routing controlled by ANALYST_GEMINI_DEEP_RESEARCH_ENABLED on the analyst host. Gemini credentials live with the analyst service; platform never calls Gemini directly. See docs/ANALYST_GEMINI_DEPLOYMENT.md.",
-    "skill_hint_note": "skills[] is a planner routing hint only; does not imply a physical skill server is available"
+    "external_research_note": "Routing controlled by ANALYST_GEMINI_DEEP_RESEARCH_ENABLED on the analyst host. Gemini credentials live with the analyst service; platform never calls Gemini directly.",
+    "skill_driven": true,
+    "skill_hint_note": "Six capabilities are each backed by Deep Agents SKILL.md files under skills/analyst/. SkillsMiddleware provides progressive disclosure."
   }
 }

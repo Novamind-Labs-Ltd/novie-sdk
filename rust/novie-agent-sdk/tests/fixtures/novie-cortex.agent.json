@@ -18,7 +18,7 @@
       "capability_id": "agent.novie-cortex.execute_task_bundle",
       "version": "0.2.2",
       "display_name": "Execute Task Bundle",
-      "description": "Execute a validated task bundle against a project repository.",
+      "description": "Execute a PMS-ticket-controlled implementation task against a project repository.",
       "input_schema": {
         "type": "object"
       },
@@ -40,7 +40,7 @@
         "execute task bundle"
       ],
       "expected_duration_class": ">1h",
-      "streamable": false,
+      "streamable": true,
       "cancellation_supported": true,
       "progress_events": true,
       "requires_confirmation": true,
@@ -54,6 +54,43 @@
       ],
       "execution_lane": "board_controlled",
       "risk_class": "repo_mutation",
+      "metadata": {
+        "repo_execution": true,
+        "requires_existing_pms_ticket": true,
+        "planner_excluded": true,
+        "execution_entrypoint": "pms_ticket_execution_only",
+        "user_facing": {
+          "name": "Execute approved development work",
+          "description": "Implement, test, and organize code changes only for a concrete PMS issue that a human moved into execution."
+        },
+        "approval_hints": {
+          "summary": "This is not started from chat. It runs only after a PMS issue is explicitly moved into execution and may produce code changes, commits, or a pull request."
+        },
+        "routing_profile": {
+          "when_to_use": [
+            "Use only from the PMS ticket execution service after a human moves an existing PMS issue into execution.",
+            "Use only when the runtime context contains a concrete PMS issue id, issue snapshot, approved work item, and repository binding."
+          ],
+          "when_not_to_use": [
+            "Do not use for research reports, product brief or PRD drafting, architecture-only analysis, or ticket decomposition.",
+            "Do not use from Reception/chat planning, even when the user asks to implement, code, commit, open a PR, or run tests.",
+            "Do not use when the only available input is task_brief or work_item_draft_graph without a PMS issue execution context."
+          ],
+          "terminal_artifacts": [
+            "implementation_result",
+            "code_changes"
+          ],
+          "intermediate_artifacts": [],
+          "execution_boundary": "board_controlled_after_pms",
+          "positive_examples": [
+            "A PMS Todo issue with an acquired execution lease invokes Cortex to implement the issue in a linked repository."
+          ],
+          "negative_examples": [
+            "A chat request asks to implement a feature before PMS tickets exist, or asks to start coding from a work_item_draft_graph."
+          ],
+          "planner_notes": "High-risk repo-mutating executor. Reception planning must not select this capability. Chat development requests must first create PMS backlog issues; PMS ticket execution invokes Cortex later with a concrete issue context."
+        }
+      },
       "governance": {
         "requires_plan_review": false,
         "requires_tracker_issue": true,
@@ -100,27 +137,23 @@
   "task_bundles_path": "/task-bundles",
   "metadata": {
     "owner_team": "novie-core",
-    "durability": "task_store",
-    "protocol_mode": "tasks",
     "runtime_mode": "platform_bundle",
     "role_description": "Executes approved build work against a repository, including code edits, git operations, and pull request creation.",
     "when_to_use": [
-      "Approved build tasks that require repository edits, GitHub operations, code generation, tests, commits, or pull requests.",
-      "Task bundles produced by Planner or Task Splitter for implementation."
+      "Existing PMS issues that a human has moved into the execution lane and that require repository edits, GitHub operations, code generation, tests, commits, or pull requests.",
+      "PMS ticket execution requests that include a concrete issue id, issue snapshot, approved work item, and repository binding."
     ],
     "when_not_to_use": [
       "Initial requirements clarification, research reports, product design, or task decomposition.",
-      "Answering casual questions or inspecting unrelated platform status without an active run."
+      "Chat-originated development requests before PMS issues exist.",
+      "Answering casual questions or inspecting unrelated platform status without an active PMS ticket execution."
     ],
-    "handoff_contract": "Consumes validated task bundles and repository context; returns implementation results, code changes, and pull request metadata.",
+    "handoff_contract": "Consumes an existing PMS issue snapshot, approved work item details, and repository context; returns implementation results, code changes, and pull request metadata.",
     "user_facing_aliases": [
       "coding agent",
       "implementation agent",
       "GitHub PR agent",
       "repo editing agent"
-    ],
-    "artifact_input_types": [
-      "task_bundle"
     ],
     "managed_skills_summary": [
       "context7",

@@ -39,6 +39,6 @@ def test_dev_seed_preserves_core_agent_capability_ids() -> None:
     task_splitter = _load_manifest("task_splitter.agent.json")
     cortex = _load_manifest("novie-cortex.agent.json")
 
-    assert "agent.analyst.requirement_extraction" in _capability_ids(analyst)
-    assert "agent.task_splitter.ticket_drafting" in _capability_ids(task_splitter)
+    assert "agent.analyst.report_synthesis" in _capability_ids(analyst)
+    assert "agent.task_splitter.from_requirements" in _capability_ids(task_splitter)
     assert "agent.novie-cortex.execute_task_bundle" in _capability_ids(cortex)

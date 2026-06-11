@@ -2,20 +2,20 @@
   "$schema": "https://novie.dev/schemas/agent-manifest-v2.json",
   "agent_id": "task_splitter",
   "name": "Task Splitter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "expert_basic",
   "runtime": "external_a2a",
   "capabilities": [
-    "task_decomposition",
-    "issue_planning",
-    "ticket_drafting"
+    "from_brief",
+    "from_requirements",
+    "from_management_report"
   ],
   "capability_manifest": [
     {
-      "capability_id": "agent.task_splitter.task_decomposition",
-      "version": "0.1.0",
-      "display_name": "Decompose Tasks",
-      "description": "Break requirements analysis into implementation tasks.",
+      "capability_id": "agent.task_splitter.from_brief",
+      "version": "0.2.0",
+      "display_name": "Backlog From Brief",
+      "description": "Convert a single task brief directly into a platform WorkItemDraftGraph.",
       "input_schema": {
         "type": "object"
       },
@@ -25,22 +25,150 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:task_splitter:task_decomposition",
+      "runtime_ref": "agent:task_splitter:from_brief",
       "tags": [
-        "planning",
-        "tasks"
+        "work_item_draft_graph",
+        "backlog",
+        "brief",
+        "pms-first"
       ],
       "natural_language_aliases": [
         "拆任务",
-        "task decomposition"
+        "拆 backlog",
+        "拆 ticket",
+        "生成 backlog",
+        "生成 ticket",
+        "backlog decomposition",
+        "task splitting",
+        "ticket drafting",
+        "split this task"
+      ],
+      "idempotent": true,
+      "expected_duration_class": "<1min",
+      "consumes": [
+        "task_brief"
+      ],
+      "metadata": {
+        "dependency_policy": "none",
+        "artifact_access": "none",
+        "disambiguation_policy": "branch_by_consumes",
+        "user_facing": {
+          "name": "Create PMS backlog issues from a task brief",
+          "description": "Turn an approved task brief into schedulable and testable PMS backlog issues."
+        },
+        "approval_hints": {
+          "summary": "Approval creates a backlog draft graph that the platform stores as PMS backlog issues. It does not change code."
+        },
+        "routing_profile": {
+          "when_to_use": [
+            "Use when the user explicitly asks to split a single task brief into backlog items, tickets, implementation slices, or a WorkItemDraftGraph."
+          ],
+          "when_not_to_use": [
+            "Do not use for PRD/report writing, research, architecture design, status lookup, or direct repository implementation."
+          ],
+          "terminal_artifacts": [
+            "work_item_draft_graph"
+          ],
+          "execution_boundary": "backlog_only",
+          "positive_examples": [
+            "Split this approved brief into implementation tickets."
+          ],
+          "negative_examples": [
+            "Write a PRD or start coding immediately."
+          ],
+          "planner_notes": "Best root splitter when only task_brief exists and the user explicitly asks for backlog/tickets. This is phase one of development work; repository execution happens later only from a human-moved PMS issue."
+        }
+      },
+      "provides": [
+        "work_item_draft_graph"
+      ],
+      "execution_lane": "direct",
+      "risk_class": "read_only",
+      "governance": {
+        "requires_plan_review": false,
+        "requires_tracker_issue": false,
+        "requires_human_gate": false
+      },
+      "input_contracts": [
+        {
+          "artifact": "task_brief",
+          "source": "user_input",
+          "required": true,
+          "provider": "platform.user_input.task_brief"
+        }
+      ],
+      "caller_types": [
+        "planner",
+        "executor",
+        "agent"
+      ]
+    },
+    {
+      "capability_id": "agent.task_splitter.from_requirements",
+      "version": "0.2.0",
+      "display_name": "Backlog From Requirements",
+      "description": "Convert a requirements analysis artifact into a platform WorkItemDraftGraph.",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "risk": "read",
+      "side_effect": "none",
+      "exec_kind": "async",
+      "runtime_ref": "agent:task_splitter:from_requirements",
+      "tags": [
+        "work_item_draft_graph",
+        "backlog",
+        "requirements",
+        "pms-first"
+      ],
+      "natural_language_aliases": [
+        "从需求拆任务",
+        "从 product brief 生成 backlog",
+        "requirements backlog",
+        "requirements decomposition",
+        "ticket drafting"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
         "requirements_analysis"
       ],
+      "metadata": {
+        "dependency_policy": "strict_single_artifact",
+        "artifact_access": "exact_required",
+        "disambiguation_policy": "branch_by_consumes",
+        "user_facing": {
+          "name": "Create PMS backlog issues from requirements",
+          "description": "Turn requirements analysis into schedulable and testable PMS backlog issues."
+        },
+        "approval_hints": {
+          "summary": "Approval creates a backlog draft graph that the platform stores as PMS backlog issues. It does not change code."
+        },
+        "routing_profile": {
+          "when_to_use": [
+            "Use when requirements_analysis already exists and the user asks for backlog items, tickets, or implementation slices."
+          ],
+          "when_not_to_use": [
+            "Do not use before requirements are available, for final reports, or for repository mutation."
+          ],
+          "terminal_artifacts": [
+            "work_item_draft_graph"
+          ],
+          "execution_boundary": "backlog_only",
+          "positive_examples": [
+            "Turn these requirements into a WorkItemDraftGraph."
+          ],
+          "negative_examples": [
+            "Create a management report or execute the tickets."
+          ],
+          "planner_notes": "Prefer this over from_brief when an upstream requirements_analysis step is planned or available. This is phase one of development work; repository execution happens later only from a human-moved PMS issue."
+        }
+      },
       "provides": [
-        "task_plan"
+        "work_item_draft_graph"
       ],
       "execution_lane": "direct",
       "risk_class": "read_only",
@@ -63,51 +191,10 @@
       ]
     },
     {
-      "capability_id": "agent.task_splitter.issue_planning",
-      "version": "0.1.0",
-      "display_name": "Plan Issues",
-      "description": "Convert scoped work into reviewable issue-sized implementation units.",
-      "input_schema": {
-        "type": "object"
-      },
-      "output_schema": {
-        "type": "object"
-      },
-      "risk": "read",
-      "side_effect": "none",
-      "exec_kind": "async",
-      "runtime_ref": "agent:task_splitter:issue_planning",
-      "tags": [
-        "planning",
-        "issues"
-      ],
-      "natural_language_aliases": [
-        "规划 issue",
-        "issue planning"
-      ],
-      "idempotent": true,
-      "expected_duration_class": "<1min",
-      "provides": [
-        "issue_plan"
-      ],
-      "execution_lane": "direct",
-      "risk_class": "read_only",
-      "governance": {
-        "requires_plan_review": false,
-        "requires_tracker_issue": false,
-        "requires_human_gate": false
-      },
-      "caller_types": [
-        "planner",
-        "executor",
-        "agent"
-      ]
-    },
-    {
-      "capability_id": "agent.task_splitter.ticket_drafting",
+      "capability_id": "agent.task_splitter.from_management_report",
       "version": "0.2.0",
-      "display_name": "Draft PMS Tickets",
-      "description": "Convert a scoped requirements-analysis-backed task plan into a WorkItemDraftGraph to be written into the PMS Backlog.",
+      "display_name": "Backlog From Management Report",
+      "description": "Convert a synthesized analyst management report into a platform WorkItemDraftGraph.",
       "input_schema": {
         "type": "object"
       },
@@ -117,22 +204,56 @@
       "risk": "read",
       "side_effect": "none",
       "exec_kind": "async",
-      "runtime_ref": "agent:task_splitter:ticket_drafting",
+      "runtime_ref": "agent:task_splitter:from_management_report",
       "tags": [
         "work_item_draft_graph",
+        "backlog",
+        "management_report",
         "pms-first"
       ],
       "natural_language_aliases": [
-        "拆 ticket",
-        "生成 ticket",
+        "从报告拆任务",
+        "从汇总报告生成 backlog",
+        "management report backlog",
+        "report decomposition",
         "ticket drafting"
       ],
       "idempotent": true,
       "expected_duration_class": "<1min",
       "consumes": [
-        "task_plan",
-        "requirements_analysis"
+        "management_report"
       ],
+      "metadata": {
+        "dependency_policy": "strict_single_artifact",
+        "artifact_access": "exact_required",
+        "disambiguation_policy": "branch_by_consumes",
+        "user_facing": {
+          "name": "Create PMS backlog issues from a report",
+          "description": "Turn recommendations from an analysis report into follow-up PMS backlog issues."
+        },
+        "approval_hints": {
+          "summary": "Approval creates a backlog draft graph that the platform stores as PMS backlog issues. It does not change code."
+        },
+        "routing_profile": {
+          "when_to_use": [
+            "Use when a management_report already exists and the user wants to convert report recommendations into backlog items or implementation tickets."
+          ],
+          "when_not_to_use": [
+            "Do not use for raw research, report synthesis, or repository implementation."
+          ],
+          "terminal_artifacts": [
+            "work_item_draft_graph"
+          ],
+          "execution_boundary": "backlog_only",
+          "positive_examples": [
+            "Turn this analysis report into a backlog for delivery."
+          ],
+          "negative_examples": [
+            "Analyze the market or code the recommendations directly."
+          ],
+          "planner_notes": "Use only after report_synthesis or when a management_report artifact is available. This is phase one of development work; repository execution happens later only from a human-moved PMS issue."
+        }
+      },
       "provides": [
         "work_item_draft_graph"
       ],
@@ -145,12 +266,7 @@
       },
       "input_contracts": [
         {
-          "artifact": "task_plan",
-          "source": "upstream_capability",
-          "required": true
-        },
-        {
-          "artifact": "requirements_analysis",
+          "artifact": "management_report",
           "source": "upstream_capability",
           "required": true
         }
@@ -167,7 +283,7 @@
   "endpoint": "http://task-splitter:8012",
   "execution": {
     "expected_duration_seconds": 60,
-    "max_duration_seconds": 180,
+    "max_duration_seconds": 3600,
     "idempotent": true,
     "supports_cancel": false,
     "supports_resume": false,
@@ -181,28 +297,26 @@
     "owner_team": "novie-core",
     "durability": "none",
     "protocol_mode": "stream",
-    "role_description": "Converts scoped requirements, designs, or analysis artifacts into WorkItemDraftGraphs to be written into the PMS Backlog.",
+    "role_description": "Splits a task brief, requirements analysis, or management report into a platform WorkItemDraftGraph to be written into the PMS Backlog.",
     "when_to_use": [
-      "Build or sprint-planning tasks that need decomposition before tickets can be created.",
+      "Converting a task brief, requirements analysis, or management report into a platform WorkItemDraftGraph.",
       "Producing a WorkItemDraftGraph for the platform to ingest into PMS Backlog."
     ],
     "when_not_to_use": [
       "Producing final code changes, editing repositories, creating pull requests, or answering status questions.",
       "Raw research or requirements clarification before a scoped artifact exists."
     ],
-    "handoff_contract": "Consumes scoped artifacts and produces WorkItemDraftGraph; platform TicketDraftIngestionService writes the drafts into PMS Backlog. Each ticket then enters the standard Backlog -> Todo -> execution flow per ExecutionPolicy.",
+    "handoff_contract": "Consumes one scoped input profile and produces WorkItemDraftGraph; platform WorkItemGraphIngestionService writes the graph into PMS Backlog. Each ticket then enters the standard Backlog -> Todo -> execution flow per ExecutionPolicy.",
     "user_facing_aliases": [
       "task splitting agent",
-      "decomposition agent",
+      "backlog decomposition agent",
       "ticket drafting agent"
     ],
-    "artifact_input_types": [
-      "prd",
-      "design",
-      "analysis",
-      "requirements_analysis"
+    "capability_profiles": [
+      "from_brief",
+      "from_requirements",
+      "from_management_report"
     ],
-    "artifact_output_type": "work_item_draft_graph",
     "input_schema": "schemas/input.schema.json",
     "output_schema": "schemas/output.schema.json"
   }
