@@ -5,9 +5,12 @@ from types import SimpleNamespace
 from novie_agent_sdk import (
     RequestHeaders,
     context_block_from_sdk_request,
+    execution_context_from_block,
+    execution_context_from_runtime_block,
     execution_context_from_sdk_request,
     legacy_request_from_sdk_context,
     resolve_capability_id,
+    resolve_runtime_capability_id,
 )
 
 
@@ -68,6 +71,29 @@ def test_execution_context_from_sdk_request_preserves_project_id() -> None:
     assert exec_ctx.tenant.tenant_id == "tenant-1"
     assert exec_ctx.tenant.workspace_id == "workspace-1"
     assert exec_ctx.tenant.project_id == "project-1"
+
+
+def test_top_level_execution_context_from_block_keeps_document_signature() -> None:
+    exec_ctx = execution_context_from_block({})
+
+    assert exec_ctx.request_id == "req-agent-local"
+    assert exec_ctx.session_id == "sess-agent-local"
+
+
+def test_runtime_bridge_block_converter_has_explicit_name() -> None:
+    exec_ctx = execution_context_from_runtime_block({}, agent_id="demo")
+
+    assert exec_ctx.request_id == "req-demo-local"
+    assert exec_ctx.session_id == "sess-demo-local"
+
+
+def test_runtime_capability_resolver_has_explicit_name() -> None:
+    assert (
+        resolve_runtime_capability_id(
+            {"capability_grants": [{"capability_id": "runtime-grant"}]}
+        )
+        == "runtime-grant"
+    )
 
 
 def test_legacy_request_from_sdk_context_shapes_runtime_inputs() -> None:

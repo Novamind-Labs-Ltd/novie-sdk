@@ -185,6 +185,7 @@ class ArtifactLedger:
         capability_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         workpad_metadata: Mapping[str, Any] | None = None,
+        strict: bool = False,
     ) -> dict[str, Any]:
         artifact = await self.create_artifact(
             artifact_type=artifact_type,
@@ -198,6 +199,11 @@ class ArtifactLedger:
             metadata=metadata,
         )
         if artifact.get("available", True) is False:
+            if strict:
+                raise RuntimeError(
+                    "artifact_create_failed:"
+                    f"{artifact.get('error') or 'artifact_create_unavailable'}"
+                )
             return {"artifact": artifact, "workpad": None}
         preview = summary or _preview(content)
         workpad = await self.record_entry(
@@ -211,6 +217,11 @@ class ArtifactLedger:
             content_preview=preview,
             metadata=workpad_metadata,
         )
+        if strict and isinstance(workpad, Mapping) and workpad.get("available", True) is False:
+            raise RuntimeError(
+                "workpad_record_failed:"
+                f"{workpad.get('error') or 'workpad_record_unavailable'}"
+            )
         return {"artifact": artifact, "workpad": workpad}
 
     async def set_final_deliverable(

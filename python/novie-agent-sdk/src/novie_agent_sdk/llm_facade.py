@@ -56,6 +56,12 @@ class LlmFacade:
         self._byok = byok
 
     @property
+    def platform_ns(self) -> "PlatformNamespace | _UnavailablePlatformNamespace":
+        """Wrapped PlatformNamespace, for consumers that need the non-LLM
+        namespaces (artifacts/knowledge/workpad) alongside the facade."""
+        return self._platform_ns
+
+    @property
     def platform_available(self) -> bool:
         return getattr(self._platform_ns, "is_available", False)
 

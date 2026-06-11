@@ -108,6 +108,12 @@ class _Workpads:
         return {"available": True, "artifact_ref": artifact_ref}
 
 
+class _FailingWorkpads(_Workpads):
+    async def record_entry(self, **kwargs: Any) -> dict[str, Any]:
+        self.entries.append(kwargs)
+        return {"available": False, "error": "workpad_down"}
+
+
 class _Platform:
     def __init__(self) -> None:
         self.artifacts = _Artifacts()
@@ -146,6 +152,27 @@ async def test_artifact_ledger_creates_artifact_and_records_workpad_ref() -> Non
             "kind": "section_draft",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_artifact_ledger_strict_create_and_record_raises_on_workpad_failure() -> None:
+    platform = _Platform()
+    platform.workpads = _FailingWorkpads()
+    ledger = ArtifactLedger(platform)
+
+    with pytest.raises(RuntimeError, match="workpad_record_failed:workpad_down"):
+        await ledger.create_and_record(
+            artifact_type="management_report.section",
+            content="section body",
+            kind="section_draft",
+            title="Market",
+            workflow_id="wf-1",
+            step_id="s2",
+            strict=True,
+        )
+
+    assert platform.artifacts.created[0]["artifact_type"] == "management_report.section"
+    assert platform.workpads.entries[0]["kind"] == "section_draft"
 
 
 @pytest.mark.asyncio

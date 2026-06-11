@@ -236,3 +236,14 @@ class TestBuildLlmFacade:
             facade = build_llm_facade(unavail, agent_id="test-agent")
         # mode may be "unavailable" or "byok" depending on ambient env
         assert facade.mode in ("unavailable", "byok")
+
+
+def test_llm_facade_exposes_platform_ns_publicly() -> None:
+    """Consumers extract the wrapped namespace for artifacts/knowledge —
+    keep platform_ns public so they never reach into _platform_ns."""
+    from types import SimpleNamespace
+
+    from novie_agent_sdk.llm_facade import LlmFacade
+
+    namespace = SimpleNamespace(is_available=True)
+    assert LlmFacade(namespace).platform_ns is namespace

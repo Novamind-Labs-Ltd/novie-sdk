@@ -71,14 +71,13 @@ behaviour, put structured policy in `contract.yaml` next to the skill:
 version: 1
 name: report-synthesis
 runtime:
-  strategy: sectioned_document
-  context_policy: artifact_ref_context_pack
-  finalization: bounded_polish
+  strategy: sectioned_longform
+  context_policy: evidence_pack_v1
+  finalization: section_ledger_polish
 task_profile:
-  selected_by: llm_structured
-  schema:
-    length_profile:
-      enum: [short, medium, long]
+  selected_by: llm
+  defaults:
+    length_profile: adaptive
 document:
   outline:
     min_sections: 2
@@ -111,13 +110,54 @@ contract = resolver.resolve(
     required=True,
 )
 
-if contract.strategy == "sectioned_document":
+if contract.strategy == "sectioned_longform":
     artifact_type = contract.artifacts.final_type
 ```
 
 `contract.yaml` is preferred because it keeps runtime policy separate from
 LLM-facing prose. As a fallback, `SkillContractResolver` also reads
 `runtime_contract` or `contract` from `SKILL.md` frontmatter.
+
+## Sectioned longform authoring
+
+Document-style agents can use `SectionedLongformAuthor` to write long outputs
+through the same durable flow:
+
+1. Ask the LLM for an outline from the original task and upstream/workpad refs.
+2. Rebuild a bounded evidence pack for each section.
+3. Draft, quality-check, and record each section as an artifact/workpad ref.
+4. Polish the joined sections and record the final deliverable ref.
+
+```python
+from novie_agent_sdk import (
+    SectionedLongformAuthor,
+    sectioned_authoring_contract_from_skill,
+)
+
+author = SectionedLongformAuthor(
+    llm_facade=llm_facade,
+    platform=platform_ns,
+    artifact_type="management_report",
+    step_id=step_id,
+    capability_id=capability_id,
+    context_budget=context_budget,
+    authoring_contract=sectioned_authoring_contract_from_skill(
+        contract,
+        artifact_type="management_report",
+    ),
+)
+result = await author.author(
+    brief=brief,
+    upstream=upstream,
+    workflow_id=ctx.workflow_id,
+    thread_id=ctx.thread_id,
+    agent_id="analyst",
+)
+```
+
+The feature is on by default. Set `NOVIE_SECTIONED_AUTHORING_DISABLED=1`, or an
+agent-specific disabled variable passed to `sectioned_authoring_enabled()`, to
+fail closed before authoring starts.
 
 ## Legacy agent bridge
 
@@ -160,6 +200,12 @@ The bridge only projects protocol data: headers, context, capability id,
 stream-event formatting, and platform callback services. It does not classify
 business intent or infer artifact/task semantics.
 
+Use `execution_context_from_sdk_request()` for SDK request objects. If a
+legacy runtime already has a raw context block, use
+`execution_context_from_runtime_block(ctx_data, agent_id="...")`. The older
+top-level `execution_context_from_block(ctx_data)` name remains the
+document-agent helper and does not require `agent_id`.
+
 For final outputs, use manifest projection when an agent needs to surface
 explicitly declared artifact refs without inlining every artifact:
 
@@ -195,6 +241,7 @@ result = await ledger.create_and_record(
     title="Architecture",
     workflow_id=ctx.workflow_id,
     step_id="s2",
+    strict=True,
 )
 
 context_pack = await ContextPackBuilder(
@@ -207,6 +254,10 @@ context_pack = await ContextPackBuilder(
     purpose="draft section",
 )
 ```
+
+Use `strict=True` when the artifact and workpad entry are part of the same
+durable authoring ledger. In strict mode, `create_and_record` raises if artifact
+creation or workpad ref recording fails, instead of returning a partial result.
 
 `EvidencePackBuilder` remains available as a backwards-compatible alias for
 research/analyst agents. New generic agents should prefer `ContextPackBuilder`.
