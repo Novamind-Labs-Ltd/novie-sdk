@@ -66,7 +66,7 @@
 ///
 /// See module-level docs for the mirror policy. Bump this in lockstep with
 /// `novie-protocol` releases.
-pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.2";
+pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.4";
 
 // ── A2A Runtime (v2 primary path) ────────────────────────────────────────────
 #[cfg(feature = "http")]
@@ -97,8 +97,8 @@ pub use error::{Error, Result};
 pub use long_task::{LongTaskCompletion, LongTaskStatus, notify_long_task_complete};
 pub use payload::{AgentInvokePayload, AgentStatusCallbackConfig, PlatformCallbackConfig};
 pub use platform_llm::{
-    ChatMessage, ChatOptions, EmbedOptions, LlmBudgetGuard, PlatformLlmClient,
-    PlatformLlmIdentity, StructuredOptions, TokenUsage, UsageReport,
+    ChatMessage, ChatOptions, EmbedOptions, LlmBudgetGuard, PlatformLlmClient, PlatformLlmIdentity,
+    StructuredOptions, TokenUsage, UsageReport,
 };
 pub use platform_services::PlatformServicesClient;
 pub use token::{

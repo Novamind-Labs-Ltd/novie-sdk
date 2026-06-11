@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 /// Wire format version tag written into every manifest.
 pub const MANIFEST_SCHEMA: &str = "https://novie.dev/schemas/agent-manifest-v2.json";
+const DESCRIPTION_MIN_LENGTH: usize = 30;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol mode
@@ -348,6 +349,9 @@ impl AgentManifestV2 {
         {
             errors.push("`durability = task_store` requires `protocol_mode = tasks`".to_owned());
         }
+        for capability in &self.capability_manifest {
+            errors.extend(validate_capability_manifest_entry(capability));
+        }
         errors
     }
 
@@ -360,6 +364,44 @@ impl AgentManifestV2 {
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+}
+
+fn validate_capability_manifest_entry(entry: &Value) -> Vec<String> {
+    let Some(obj) = entry.as_object() else {
+        return vec!["capability_manifest entries must be JSON objects".to_owned()];
+    };
+    let capability_id = obj
+        .get("capability_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if capability_id.is_empty() {
+        return vec!["capability_manifest entries must have non-empty capability_id".to_owned()];
+    }
+
+    let description = obj
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let display_name = obj
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    if description.len() < DESCRIPTION_MIN_LENGTH {
+        return vec![format!(
+            "capability {capability_id:?}: description too short ({} chars; minimum {DESCRIPTION_MIN_LENGTH}). Describe what the capability does, its inputs, and its side effects.",
+            description.len()
+        )];
+    }
+    if !display_name.is_empty() && description.eq_ignore_ascii_case(display_name) {
+        return vec![format!(
+            "capability {capability_id:?}: description duplicates display_name; write a real explanation of what the capability does."
+        )];
+    }
+    Vec::new()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,10 +495,9 @@ mod tests {
 
     #[test]
     fn parses_current_cortex_manifest_shape() {
-        let m = AgentManifestV2::from_json(include_str!(
-            "../tests/fixtures/novie-cortex.agent.json"
-        ))
-        .unwrap();
+        let m =
+            AgentManifestV2::from_json(include_str!("../tests/fixtures/novie-cortex.agent.json"))
+                .unwrap();
 
         assert_eq!(m.agent_id, "novie-cortex");
         assert_eq!(m.protocol_mode, ProtocolMode::Tasks);
@@ -469,6 +510,58 @@ mod tests {
         assert!(!m.capability_manifest.is_empty());
         assert!(m.metadata.contains_key("owner_team"));
         assert!(!m.metadata.contains_key("protocol_mode"));
+    }
+
+    #[test]
+    fn validates_capability_manifest_description_quality() {
+        let mut m = tasks_manifest();
+        m.capability_manifest = vec![serde_json::json!({
+            "capability_id": "agent.test.short_description",
+            "version": "0.1.0",
+            "display_name": "Short",
+            "description": "too short",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "risk": "read",
+            "side_effect": "none",
+            "exec_kind": "async",
+            "runtime_ref": "agent:test:short_description"
+        })];
+
+        let errors = m.validate();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("description too short")),
+            "expected description quality error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validates_capability_manifest_requires_capability_id() {
+        let mut m = tasks_manifest();
+        m.capability_manifest = vec![serde_json::json!({
+            "capability_id": "",
+            "version": "0.1.0",
+            "display_name": "Missing Id",
+            "description": "This description is long enough to pass the quality floor.",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "risk": "read",
+            "side_effect": "none",
+            "exec_kind": "async",
+            "runtime_ref": "agent:test:missing_id"
+        })];
+
+        let errors = m.validate();
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("non-empty capability_id")),
+            "expected capability_id error, got {errors:?}"
+        );
     }
 
     #[test]

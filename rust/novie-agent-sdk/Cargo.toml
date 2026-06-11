@@ -1,6 +1,6 @@
 [package]
 name = "novie-agent-sdk"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Rust A2A Agent Runtime SDK for Novie Platform. Contracts are hand-mirrored from novie-protocol; see MIRRORED_PROTOCOL_VERSION in src/lib.rs."
 license = "Apache-2.0"
