@@ -5,6 +5,12 @@ The goal is to let new agents depend on platform-owned runtime capabilities
 instead of re-implementing transport, artifact, workpad, LLM, and output
 contracts.
 
+The SDK owns platform integration mechanics: A2A runtime wiring, lifecycle and
+progress reporting, artifact/workpad/checkpoint state, context propagation, and
+access to platform-owned capabilities such as LLM, search, knowledge, artifacts,
+and future tool namespaces. Agent packages own domain workflows, prompts, skill
+content, artifact taxonomy, and business-specific fallback policy.
+
 ## API Categories For Agent Authors
 
 Use the SDK in these layers. New agents should start from the first two
@@ -22,6 +28,7 @@ categories and only drop lower when they need tighter control.
 | LLM integration | `PlatformChatModel`, `build_llm_facade`, `langchain_runnable_config`, LLM normalization helpers | You need LangChain or direct platform LLM calls with usage/callback propagation. |
 | Context budget | `default_context_budget`, `context_budget_from_inputs`, `budget_status`, `adaptive_phase_timeout_seconds`, `budget_summary` | You need shared token/wall-clock budget behavior for long document runs. |
 | Artifacts and deliverables | `ArtifactReader`, `format_artifact_read_result`, `markdown_deliverable_output`, `bounded_handoff_output` | You need agent-friendly artifact reads or standardized final/internal outputs. |
+| Sectioned document authoring | `SectionedLongformAuthor`, `sectioned_authoring_contract_from_skill`, `sectioned_authoring_enabled` | You need a skill-driven outline -> section artifacts -> final polish path with workpad refs. |
 | Step role and output contracts | `step_run_policy`, `resolve_step_role`, `handoff_max_bytes` | You need to branch behavior for upstream handoffs vs final deliverables. |
 | Streaming and workpad events | `progress_event`, `content_delta_event`, `tool_call_event`, `tool_result_event`, `workpad_entry_event`, `execution_workpad_entries`, `with_keepalive`, `SubtaskEventMapper` | You need platform-readable progress, tool, content, workpad traces, keepalives, subtask summaries, or workpad recovery reads. |
 | Checkpoints and degradation | `checkpoint_step_id`, `checkpoint_input_digest`, `checkpoint_matches_invocation`, `external_agent_checkpoint_service`, `put_external_agent_checkpoint`, `get_matching_document_checkpoint`, `skipped_phase_events`, `DegradationTracker` | You need resumable external-agent checkpoints, cross-version checkpoint writes/reads, skipped-phase traces, or symbolic degradation flags. |
@@ -41,6 +48,11 @@ Current API overlap to watch:
 - `PlatformChatModel`, `build_llm_facade`, and `LlmNamespace` are three access levels over platform LLM. Prefer `PlatformChatModel` for LangChain, `build_llm_facade` for agent runtime abstraction, and `LlmNamespace` for direct platform calls.
 - `ArtifactReader` and `ArtifactsNamespace` are not duplicates: `ArtifactReader` is the agent-friendly text/cache layer over lower-level artifact capability calls.
 - `workpad_entry_event` and `workpad_checkpoint_event` are aliases by design; `workpad_checkpoint_event` exists for long-running agent readability.
+- `DocumentAgentTemplate` and `SectionedLongformAuthor` are separate layers:
+  `DocumentAgentTemplate` centralizes runtime mechanics for custom document
+  loops, while `SectionedLongformAuthor` is an optional generic section ledger
+  implementation. Domain-specific document shape still belongs in the agent or
+  skill runtime contract.
 
 ## Runtime
 
@@ -419,7 +431,7 @@ Use:
 reader = ArtifactReader(
     platform,
     max_uncached_reads=8,
-    purpose="analyst evidence retrieval",
+    purpose="document evidence retrieval",
 )
 
 text = await reader.read_text(
@@ -534,6 +546,72 @@ Purpose:
 - Reads platform `upstream_context.v1`.
 - Gives agents direct handoffs, dependency metadata, transitive refs, and read policy.
 
+## Sectioned Document Authoring
+
+### `SectionedLongformAuthor`
+
+Import:
+
+```python
+from novie_agent_sdk import (
+    SectionedLongformAuthor,
+    sectioned_authoring_contract_from_skill,
+)
+```
+
+Use:
+
+```python
+author = SectionedLongformAuthor(
+    llm_facade=llm_facade,
+    platform=platform_ns,
+    artifact_type="document",
+    step_id="s2",
+    capability_id="agent.example.write_document",
+    context_budget=context_budget,
+    authoring_contract=sectioned_authoring_contract_from_skill(
+        skill_runtime_contract,
+        artifact_type="document",
+    ),
+)
+
+result = await author.author(
+    brief=brief,
+    upstream=upstream,
+    workflow_id=workflow_id,
+    thread_id=thread_id,
+    agent_id="example",
+)
+```
+
+Purpose:
+
+- Provides the shared outline -> section drafts -> final polish path for document agents.
+- Writes the outline, each section draft, and the final deliverable as artifacts.
+- Records artifact refs into Execution Workpad and marks the final deliverable ref when supported.
+- Builds bounded evidence packs from upstream/workpad refs for each section.
+- Applies a generic section quality gate before recording drafts, including exact planned-heading presence, minimum information units, process-language rejection, and evidence-ref checks.
+- Repairs missing planned Markdown headings before the quality gate so an otherwise valid section is not failed because the model used a different heading.
+- Sends bounded `max_output_tokens` for section and final-polish LLM calls so document agents do not leave a single section generation unbounded.
+
+### `sectioned_authoring_enabled`
+
+Purpose:
+
+- Defaults sectioned authoring on.
+- Supports SDK-level env vars `NOVIE_SECTIONED_AUTHORING_DISABLED` and `NOVIE_SECTIONED_AUTHORING_V2`.
+- Supports agent-specific env vars through `agent_enabled_env_var` and `agent_disabled_env_var` so agents can keep backward-compatible flags while using the SDK implementation.
+
+## LLM Facade
+
+### `build_llm_facade`
+
+Purpose:
+
+- Creates the SDK `LlmFacade` around a `PlatformNamespace`, with BYOK fallback only when the platform namespace is unavailable.
+- `LlmFacade.chat(...)` supports `max_output_tokens` and forwards it to platform or BYOK clients.
+- Platform LLM chat may first attempt the streaming capability endpoint for long calls; if the platform returns `stream_endpoint_not_found`, the namespace falls back to normal invoke and skips later stream attempts for the same namespace instance.
+
 ## Document A2A Runtime Adapters
 
 These helpers are for document-style agents that keep a custom runtime loop but
@@ -572,9 +650,9 @@ Use:
 ```python
 ctx_block = context_block_from_request(
     ctx,
-    default_request_id="req-analyst-local",
-    default_session_id="sess-analyst-local",
-    default_thread_id="thread-analyst-local",
+    default_request_id="req-example-local",
+    default_session_id="sess-example-local",
+    default_thread_id="thread-example-local",
 )
 ```
 
@@ -668,8 +746,8 @@ Use:
 
 ```python
 defaults = default_context_budget(
-    env_prefix="NOVIE_ANALYST",
-    source="analyst_default",
+    env_prefix="NOVIE_AGENT",
+    source="agent_default",
     max_revision_rounds=2,
     overrides={"phase_timeouts": {"research": 300}},
 )
@@ -741,7 +819,7 @@ Use:
 ```python
 services = build_http_platform_services(
     incoming_headers,
-    agent_id="analyst",
+    agent_id="example",
     tracker=degradation_tracker,
 )
 ```
@@ -934,6 +1012,12 @@ Purpose:
 
 - Works like `with_keepalive(...)`.
 - Emits active-subtask keepalive traces when a subtask is running.
+- Raises `SubtaskIdleTimeoutError` after an active DeepAgents subtask stays idle
+  past the configured timeout; before raising it emits a summary-visible
+  `subtask.idle_timeout` trace.
+- Reads `NOVIE_AGENT_SUBTASK_IDLE_TIMEOUT_S` by default. The default is
+  `DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS`; set the env value to `0` to disable
+  the timeout while keeping subtask keepalives.
 
 ### `assess_subtask_result`
 
@@ -955,6 +1039,7 @@ Purpose:
 
 - `DEFAULT_KEEPALIVE_INTERVAL_SECONDS` is the SDK default idle interval.
 - `DEFAULT_MIN_SUBTASK_RESULT_CHARS` is the default evidence/result size threshold.
+- `DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS` is the default active-subtask idle timeout.
 - `KEEPALIVE_DONE` is an advanced sentinel used internally by keepalive wrappers.
 
 ## Degradation Tracking
@@ -1085,11 +1170,11 @@ Use:
 
 ```python
 config = langchain_runnable_config(
-    agent_id="analyst",
+    agent_id="example",
     ctx=ctx,
     callbacks=callbacks,
     runtime_phase="draft",
-    capability_id="agent.analyst.report_synthesis",
+    capability_id="agent.example.write_document",
     stage="section_1",
 )
 ```
@@ -1200,9 +1285,9 @@ Use:
 
 ```python
 output = markdown_deliverable_output(
-    title="Final Report",
-    markdown="# Final Report",
-    artifact_type="management_report",
+    title="Final Document",
+    markdown="# Final Document",
+    artifact_type="document",
     artifact_family="document",
     metadata={"phase": "final"},
 )

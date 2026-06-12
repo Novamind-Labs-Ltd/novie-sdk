@@ -868,7 +868,31 @@ async def test_llm_stream_chat_normalises_tool_chunks_for_non_langchain_agents()
 
 
 @pytest.mark.asyncio
-async def test_llm_chat_falls_back_to_legacy_invoke_when_stream_endpoint_missing() -> None:
+async def test_llm_stream_chat_raises_on_stream_error_event() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        return httpx.Response(
+            200,
+            content=(
+                b'{"type":"error","error_code":"internal_error",'
+                b'"explanation":"provider failed"}\n'
+            ),
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    with pytest.raises(PlatformLlmCallError) as excinfo:
+        async for _event in ns.llm.stream_chat([{"role": "user", "content": "hi"}]):
+            pass
+
+    assert excinfo.value.capability_id == "platform.llm.chat"
+    assert excinfo.value.error_code == "internal_error"
+    assert excinfo.value.detail == "provider failed"
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_raises_when_stream_endpoint_missing() -> None:
     captured_paths: list[str] = []
 
     def responder(request: httpx.Request) -> httpx.Response:
@@ -879,13 +903,12 @@ async def test_llm_chat_falls_back_to_legacy_invoke_when_stream_endpoint_missing
 
     ns = _build_with_responder(responder)
 
-    result = await ns.llm.chat([{"role": "user", "content": "hi"}])
+    with pytest.raises(PlatformLlmCallError) as excinfo:
+        await ns.llm.chat([{"role": "user", "content": "hi"}])
 
-    assert result["content"] == "legacy"
-    assert captured_paths == [
-        "/capabilities/platform.llm.chat/invoke-stream",
-        "/capabilities/platform.llm.chat/invoke",
-    ]
+    assert excinfo.value.capability_id == "platform.llm.chat"
+    assert excinfo.value.error_code == "stream_endpoint_not_found"
+    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
 
 
 @pytest.mark.asyncio
@@ -998,3 +1021,46 @@ async def test_invoke_llm_capability_routes_through_llm_caller() -> None:
     await ns.invoke_llm_capability("platform.llm.structured", {"messages": []})
 
     assert counts == {"default": 1, "llm": 1}
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_stream_404_raises_without_legacy_invoke() -> None:
+    counts = {"stream": 0, "invoke": 0}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ok_envelope({"content": "ok"}))
+
+    transport = httpx.MockTransport(responder)
+    client = httpx.AsyncClient(transport=transport, base_url="http://platform.test")
+    ns = build_platform_namespace(
+        _incoming_headers(),
+        agent_id="demo",
+        base_url="http://platform.test",
+        client=client,
+    )
+    assert isinstance(ns, PlatformNamespace)
+
+    async def stream_404(*args, **kwargs):  # type: ignore[no-untyped-def]
+        counts["stream"] += 1
+        return CapabilityCallDiagnostics(
+            ok=False,
+            capability_id="platform.llm.chat",
+            kind="platform_unavailable",
+            error_code="stream_endpoint_not_found",
+        )
+
+    original_invoke = ns._llm_caller.invoke_with_diagnostics  # noqa: SLF001
+
+    async def invoke_wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        counts["invoke"] += 1
+        return await original_invoke(*args, **kwargs)
+
+    ns._llm_caller.invoke_stream_with_diagnostics = stream_404  # type: ignore[method-assign]  # noqa: SLF001
+    ns._llm_caller.invoke_with_diagnostics = invoke_wrapper  # type: ignore[method-assign]  # noqa: SLF001
+
+    with pytest.raises(PlatformLlmCallError) as excinfo:
+        await ns.llm.chat([{"role": "user", "content": "one"}])
+
+    assert excinfo.value.capability_id == "platform.llm.chat"
+    assert excinfo.value.error_code == "stream_endpoint_not_found"
+    assert counts == {"stream": 1, "invoke": 0}

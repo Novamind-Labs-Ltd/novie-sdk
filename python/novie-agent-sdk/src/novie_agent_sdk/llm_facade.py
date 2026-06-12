@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ class LlmFacade:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
@@ -100,6 +102,7 @@ class LlmFacade:
                 messages,
                 model=model,
                 temperature=temperature,
+                max_output_tokens=max_output_tokens,
                 tools=tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
@@ -112,7 +115,12 @@ class LlmFacade:
                     "LlmFacade BYOK chat does not support tool-calling through "
                     "the facade. Use a LangChain ChatModel for tool workflows."
                 )
-            result = await self._byok.chat(messages, model=model, temperature=temperature)
+            result = await self._byok.chat(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
             return {**result, "llm_mode": "byok"}
 
         raise RuntimeError(
@@ -120,6 +128,53 @@ class LlmFacade:
             "Either connect to the Novie platform (set NOVIE_PLATFORM_BASE_URL) "
             f"or configure a BYOK key ({_byok_key_hint()})."
         )
+
+    async def stream_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream a chat response as platform-shaped text events.
+
+        Platform mode delegates to ``llm.stream_chat`` when available. BYOK and
+        legacy/non-streaming platform callers fall back to ``chat`` and emit the
+        final text once as a chunk, followed by a completed event. Consumers can
+        therefore build one visibility path without branching on backend mode.
+        """
+        if self.platform_available:
+            stream_chat = getattr(getattr(self._platform_ns, "llm", None), "stream_chat", None)
+            if callable(stream_chat):
+                async for event in stream_chat(
+                    messages,
+                    model=model,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                ):
+                    yield event
+                return
+
+        result = await self.chat(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+        content = str(result.get("content") or "")
+        if content:
+            yield {"type": "chunk", "delta": {"content": content}}
+        yield {"type": "completed", "result": result}
 
     async def structured(
         self,

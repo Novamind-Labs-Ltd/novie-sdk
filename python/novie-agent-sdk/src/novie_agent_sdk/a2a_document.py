@@ -103,6 +103,7 @@ def execution_context_from_block(ctx_data: dict[str, Any]) -> ExecutionContext:
         tenant=TenantScope(
             tenant_id=tenant_raw.get("tenant_id", "t"),
             workspace_id=tenant_raw.get("workspace_id", "w"),
+            project_id=tenant_raw.get("project_id"),
         ),
         identity=IdentityContext(
             principal_id=identity_raw.get("principal_id", "u"),

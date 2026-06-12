@@ -12,6 +12,7 @@ from novie_protocol.agents import AgentStreamEvent
 from .workpad import workpad_checkpoint_event
 
 DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 25.0
+DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS = 120.0
 KEEPALIVE_DONE = object()
 DEFAULT_MIN_SUBTASK_RESULT_CHARS = 900
 DEFAULT_SUBTASK_EVIDENCE_MAX_CHARS = 1_000_000
@@ -48,6 +49,27 @@ class SubtaskResultAssessment:
     @property
     def complete(self) -> bool:
         return self.status == "complete"
+
+
+class SubtaskIdleTimeoutError(TimeoutError):
+    """Raised when a DeepAgents subtask stays active without stream progress."""
+
+    def __init__(
+        self,
+        *,
+        idle_seconds: float,
+        timeout_seconds: float,
+        subtask: dict[str, Any] | None = None,
+    ) -> None:
+        self.idle_seconds = float(idle_seconds)
+        self.timeout_seconds = float(timeout_seconds)
+        self.subtask = dict(subtask or {})
+        subtask_id = str(self.subtask.get("subtask_id") or "unknown")
+        super().__init__(
+            "subtask idle timeout: "
+            f"subtask_id={subtask_id} idle_seconds={int(self.idle_seconds)} "
+            f"timeout_seconds={int(self.timeout_seconds)}"
+        )
 
 
 def _result_text(value: Any) -> str:
@@ -100,6 +122,32 @@ def keepalive_interval_seconds(
         return float(raw)
     except ValueError:
         return default
+
+
+def _resolve_subtask_idle_timeout_seconds(
+    *,
+    env_var: str = "NOVIE_AGENT_SUBTASK_IDLE_TIMEOUT_S",
+    default: float = DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS,
+) -> float:
+    raw = os.getenv(env_var, "") or os.getenv("NOVIE_AGENT_SUBTASK_IDLE_TIMEOUT_S", "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def subtask_idle_timeout_seconds(
+    *,
+    env_var: str = "NOVIE_AGENT_SUBTASK_IDLE_TIMEOUT_S",
+    default: float = DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS,
+) -> float:
+    """Return the active-subtask idle timeout.
+
+    A value <= 0 disables the timeout while preserving keepalive emission.
+    """
+    return _resolve_subtask_idle_timeout_seconds(env_var=env_var, default=default)
 
 
 def content_stream_closed_event(
@@ -432,6 +480,44 @@ class SubtaskEventMapper:
             },
         )
 
+    def active_timeout_event(
+        self,
+        *,
+        idle_seconds: float,
+        timeout_seconds: float,
+    ) -> AgentStreamEvent | None:
+        record = self._active_record()
+        if record is None:
+            return None
+        key = str(record.get("subtask_id") or "")
+        subagent_type = str(record.get("subagent_type") or "subtask")
+        title = str(record.get("title") or "subtask")
+        return AgentStreamEvent(
+            kind="trace",
+            metadata={
+                **self._base_metadata,
+                "event": "subtask.idle_timeout",
+                "runtime_phase": "subtask",
+                "semantic_phase": "subtask_timeout",
+                "progress_label": (
+                    f"{subagent_type}: {title} idle timeout "
+                    f"({int(idle_seconds)}s)"
+                ),
+                "status": "timeout",
+                "subtask": {
+                    **dict(record),
+                    "status": "timeout",
+                    "idle_seconds": int(idle_seconds),
+                    "timeout_seconds": int(timeout_seconds),
+                },
+                "subtask_id": key,
+                "subagent_type": subagent_type,
+                "idle_seconds": int(idle_seconds),
+                "timeout_seconds": int(timeout_seconds),
+                "visibility": "summary",
+            },
+        )
+
     def _active_record(self) -> dict[str, Any] | None:
         if not self._active:
             return None
@@ -563,12 +649,21 @@ async def with_subtask_keepalive(
     phase: str,
     capability_id: str | None,
     interval_seconds: float | None = None,
+    subtask_idle_timeout_seconds: float | None = None,
     env_var: str = "NOVIE_AGENT_KEEPALIVE_INTERVAL_S",
+    subtask_idle_timeout_env_var: str = "NOVIE_AGENT_SUBTASK_IDLE_TIMEOUT_S",
 ) -> AsyncIterator[Any]:
     interval = (
         keepalive_interval_seconds(env_var=env_var)
         if interval_seconds is None
         else interval_seconds
+    )
+    idle_timeout = (
+        _resolve_subtask_idle_timeout_seconds(
+            env_var=subtask_idle_timeout_env_var,
+        )
+        if subtask_idle_timeout_seconds is None
+        else float(subtask_idle_timeout_seconds)
     )
     if interval <= 0:
         async for item in source:
@@ -600,6 +695,23 @@ async def with_subtask_keepalive(
                     idle_seconds=idle_seconds
                 )
                 if subtask_keepalive is not None:
+                    if idle_timeout > 0 and idle_seconds >= idle_timeout:
+                        timeout_event = subtask_events.active_timeout_event(
+                            idle_seconds=idle_seconds,
+                            timeout_seconds=idle_timeout,
+                        )
+                        if timeout_event is not None:
+                            yield timeout_event
+                            timeout_subtask = dict(
+                                timeout_event.metadata.get("subtask") or {}
+                            )
+                        else:
+                            timeout_subtask = {}
+                        raise SubtaskIdleTimeoutError(
+                            idle_seconds=idle_seconds,
+                            timeout_seconds=idle_timeout,
+                            subtask=timeout_subtask,
+                        )
                     yield subtask_keepalive
                 else:
                     yield keepalive_event(
@@ -626,6 +738,8 @@ __all__ = [
     "DEFAULT_KEEPALIVE_INTERVAL_SECONDS",
     "DEFAULT_MIN_SUBTASK_RESULT_CHARS",
     "KEEPALIVE_DONE",
+    "DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS",
+    "SubtaskIdleTimeoutError",
     "SubtaskEventMapper",
     "SubtaskResultAssessment",
     "assess_subtask_result",
@@ -635,6 +749,7 @@ __all__ = [
     "keepalive_event",
     "keepalive_interval_seconds",
     "normalize_langgraph_stream_item",
+    "subtask_idle_timeout_seconds",
     "text_blob",
     "with_keepalive",
     "with_subtask_keepalive",

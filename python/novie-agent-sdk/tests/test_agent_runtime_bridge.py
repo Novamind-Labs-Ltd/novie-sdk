@@ -74,10 +74,21 @@ def test_execution_context_from_sdk_request_preserves_project_id() -> None:
 
 
 def test_top_level_execution_context_from_block_keeps_document_signature() -> None:
-    exec_ctx = execution_context_from_block({})
+    exec_ctx = execution_context_from_block(
+        {
+            "tenant": {
+                "tenant_id": "tenant-1",
+                "workspace_id": "workspace-1",
+                "project_id": "project-1",
+            }
+        }
+    )
 
     assert exec_ctx.request_id == "req-agent-local"
     assert exec_ctx.session_id == "sess-agent-local"
+    assert exec_ctx.tenant.tenant_id == "tenant-1"
+    assert exec_ctx.tenant.workspace_id == "workspace-1"
+    assert exec_ctx.tenant.project_id == "project-1"
 
 
 def test_runtime_bridge_block_converter_has_explicit_name() -> None:

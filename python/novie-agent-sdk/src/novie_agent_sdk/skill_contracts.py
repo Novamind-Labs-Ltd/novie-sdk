@@ -61,12 +61,31 @@ class DocumentFinalContract:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentLengthProfileContract:
+    """Length-profile override for document-style runtimes."""
+
+    name: str
+    strategy: str = ""
+    finalization: str = ""
+    evidence_depth: str = ""
+    min_sections: int = 0
+    max_sections: int = 0
+    min_units: int = 0
+    default_units: int = 0
+    max_units: int = 0
+    max_revision_rounds: int = 0
+    final_retention_ratio: float = 0.0
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class DocumentRuntimeContract:
     """Document-oriented runtime settings with no business-domain semantics."""
 
     outline: DocumentOutlineContract = field(default_factory=DocumentOutlineContract)
     section: DocumentSectionContract = field(default_factory=DocumentSectionContract)
     final: DocumentFinalContract = field(default_factory=DocumentFinalContract)
+    length_profiles: Mapping[str, DocumentLengthProfileContract] = field(default_factory=dict)
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -102,6 +121,8 @@ class SubagentContract:
     role: str = ""
     description: str = ""
     system_prompt: str = ""
+    tools: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def to_deepagents_spec(self) -> dict[str, Any]:
@@ -112,7 +133,23 @@ class SubagentContract:
             spec["description"] = self.description
         if self.system_prompt:
             spec["system_prompt"] = self.system_prompt
+        if self.tools:
+            spec["tools"] = list(self.tools)
+        if self.skills:
+            spec["skills"] = list(self.skills)
         return spec
+
+
+@dataclass(frozen=True, slots=True)
+class QualityGatePolicy:
+    """Machine-readable quality gate thresholds declared by a skill."""
+
+    require_evidence_refs: bool = False
+    require_confidence_layer: bool = False
+    forbid_step_artifact_only_citations: bool = False
+    min_unique_sources_per_core_section: int = 0
+    max_reuse_per_evidence_ref: int = 0
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +163,10 @@ class SkillRuntimeContract:
     document: DocumentRuntimeContract = field(default_factory=DocumentRuntimeContract)
     artifacts: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     workpad: WorkpadPolicy = field(default_factory=WorkpadPolicy)
+    quality_gates: QualityGatePolicy = field(default_factory=QualityGatePolicy)
     subagents: tuple[SubagentContract, ...] = ()
+    required_tools: tuple[str, ...] = ()
+    strict_runtime: bool = False
     raw: Mapping[str, Any] = field(default_factory=dict)
     sources: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -145,6 +185,7 @@ class SkillRuntimeContract:
             "version": self.version,
             "strategy": self.runtime.strategy,
             "context_policy": self.runtime.context_policy,
+            "length_profiles": sorted(self.document.length_profiles),
             "sources": list(self.sources),
         }
 
@@ -165,10 +206,8 @@ class SkillContractResolver:
         self,
         *,
         root_dir: str | Path | None = None,
-        contract_filename: str = "contract.yaml",
     ) -> None:
         self._root_dir = Path(root_dir).resolve() if root_dir is not None else None
-        self._contract_filename = contract_filename
 
     def resolve(
         self,
@@ -211,25 +250,28 @@ class SkillContractResolver:
         else:
             path = raw
 
-        if path.name in {self._contract_filename, "SKILL.md"}:
+        if path.name == "contract.yaml":
+            raise SkillContractError(
+                "contract.yaml is no longer supported; declare "
+                "metadata.novie.runtime_contract in SKILL.md"
+            )
+        if path.name == "SKILL.md":
             return path.parent
         return path
 
     def _load_contract(self, skill_dir: Path) -> tuple[Mapping[str, Any], Path] | None:
-        contract_path = skill_dir / self._contract_filename
-        if contract_path.exists():
-            return _load_yaml_mapping(contract_path), contract_path
-
         skill_path = skill_dir / "SKILL.md"
-        if not skill_path.exists():
-            return None
-        frontmatter = _load_skill_frontmatter(skill_path)
-        raw = frontmatter.get("runtime_contract")
-        if isinstance(raw, Mapping):
-            return raw, skill_path
-        raw = frontmatter.get("contract")
-        if isinstance(raw, Mapping):
-            return raw, skill_path
+        contract_path = skill_dir / "contract.yaml"
+        if contract_path.exists():
+            raise SkillContractError(
+                "contract.yaml is no longer supported; declare "
+                f"metadata.novie.runtime_contract in {skill_path}"
+            )
+        if skill_path.exists():
+            frontmatter = _load_skill_frontmatter(skill_path)
+            skill_raw = _frontmatter_runtime_contract(frontmatter)
+            if skill_raw is not None:
+                return skill_raw, skill_path
         return None
 
 
@@ -245,8 +287,10 @@ def _contract_from_mapping(
     outline = _mapping(document.get("outline"))
     section = _mapping(document.get("section"))
     final = _mapping(document.get("final"))
+    length_profiles = _length_profiles_from_raw(document.get("length_profiles"))
     artifacts = _mapping(raw.get("artifacts"))
     workpad = _mapping(raw.get("workpad"))
+    quality_gates = _mapping(raw.get("quality_gates"))
 
     return SkillRuntimeContract(
         version=_positive_int(raw.get("version"), 1),
@@ -277,6 +321,7 @@ def _contract_from_mapping(
             final=DocumentFinalContract(
                 min_retention_ratio=_ratio(final.get("min_retention_ratio"), 0.0),
             ),
+            length_profiles=length_profiles,
             raw=document,
         ),
         artifacts=ArtifactPolicy(
@@ -294,7 +339,32 @@ def _contract_from_mapping(
             ),
             raw=workpad,
         ),
+        quality_gates=QualityGatePolicy(
+            require_evidence_refs=_bool(
+                quality_gates.get("require_evidence_refs"),
+                False,
+            ),
+            require_confidence_layer=_bool(
+                quality_gates.get("require_confidence_layer"),
+                False,
+            ),
+            forbid_step_artifact_only_citations=_bool(
+                quality_gates.get("forbid_step_artifact_only_citations"),
+                False,
+            ),
+            min_unique_sources_per_core_section=_non_negative_int(
+                quality_gates.get("min_unique_sources_per_core_section"),
+                0,
+            ),
+            max_reuse_per_evidence_ref=_non_negative_int(
+                quality_gates.get("max_reuse_per_evidence_ref"),
+                0,
+            ),
+            raw=quality_gates,
+        ),
         subagents=tuple(_subagents_from_raw(raw.get("subagents"))),
+        required_tools=tuple(_strings(raw.get("required_tools"))),
+        strict_runtime=_bool(raw.get("strict_runtime"), False),
         raw=dict(raw),
         sources=sources,
         warnings=warnings,
@@ -318,17 +388,38 @@ def _subagents_from_raw(value: Any) -> list[SubagentContract]:
                 role=str(raw.get("role") or ""),
                 description=str(raw.get("description") or ""),
                 system_prompt=str(raw.get("system_prompt") or ""),
+                tools=tuple(_strings(raw.get("tools"))),
+                skills=tuple(_strings(raw.get("skills"))),
                 raw=raw,
             )
         )
     return out
 
 
-def _load_yaml_mapping(path: Path) -> Mapping[str, Any]:
-    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(loaded, Mapping):
-        raise SkillContractError(f"Skill contract must be a mapping: {path}")
-    return loaded
+def _length_profiles_from_raw(value: Any) -> dict[str, DocumentLengthProfileContract]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, DocumentLengthProfileContract] = {}
+    for key, raw_value in value.items():
+        name = str(key or "").strip().lower()
+        if not name or not isinstance(raw_value, Mapping):
+            continue
+        raw = dict(raw_value)
+        out[name] = DocumentLengthProfileContract(
+            name=name,
+            strategy=str(raw.get("strategy") or ""),
+            finalization=str(raw.get("finalization") or ""),
+            evidence_depth=str(raw.get("evidence_depth") or ""),
+            min_sections=_non_negative_int(raw.get("min_sections"), 0),
+            max_sections=_non_negative_int(raw.get("max_sections"), 0),
+            min_units=_non_negative_int(raw.get("min_units"), 0),
+            default_units=_non_negative_int(raw.get("default_units"), 0),
+            max_units=_non_negative_int(raw.get("max_units"), 0),
+            max_revision_rounds=_non_negative_int(raw.get("max_revision_rounds"), 0),
+            final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.0),
+            raw=raw,
+        )
+    return out
 
 
 def _load_skill_frontmatter(path: Path) -> Mapping[str, Any]:
@@ -340,6 +431,15 @@ def _load_skill_frontmatter(path: Path) -> Mapping[str, Any]:
         return {}
     loaded = yaml.safe_load(text[4:end]) or {}
     return loaded if isinstance(loaded, Mapping) else {}
+
+
+def _frontmatter_runtime_contract(frontmatter: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    metadata = _mapping(frontmatter.get("metadata"))
+    novie = _mapping(metadata.get("novie"))
+    raw = novie.get("runtime_contract")
+    if isinstance(raw, Mapping):
+        return raw
+    return None
 
 
 def _deep_merge(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
@@ -386,6 +486,14 @@ def _merge_subagents(left: Any, right: Any) -> list[Any]:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace(",", " ").split() if item.strip()]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
 
 
 def _positive_int(value: Any, default: int) -> int:

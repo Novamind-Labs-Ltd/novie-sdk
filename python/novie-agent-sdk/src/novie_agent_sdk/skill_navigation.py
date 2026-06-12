@@ -172,7 +172,7 @@ def load_skill_metadata(
     allowed_tools_raw = str(frontmatter.get("allowed-tools") or "").strip()
     allowed_tools = tuple(
         item.strip()
-        for item in allowed_tools_raw.split(",")
+        for item in allowed_tools_raw.replace(",", " ").split()
         if item.strip()
     )
     if not name:
@@ -221,8 +221,9 @@ def compile_skill_scope(
     source_resolver: Callable[[list[str], dict[str, Any]], list[str] | tuple[str, ...]] | None = None,
     section_names: Sequence[str] = DEFAULT_DOCUMENT_SKILL_SECTIONS,
     max_digest_chars: int = 2200,
-    synthesis_allowed_tools: tuple[str, ...] = ("fetch_artifact",),
+    synthesis_allowed_tools: tuple[str, ...] = (),
     no_file_tool_warning: bool = True,
+    include_instruction_digest: bool = True,
 ) -> SkillScope:
     """Compile the deterministic boundary within which DeepAgents may choose."""
     if spec is None:
@@ -272,24 +273,25 @@ def compile_skill_scope(
             hint_parts.append(
                 "Allowed tools in scope: " + ", ".join(effective_allowed_tools)
             )
-        instruction_blocks = [
-            f"### {skill.name}\n{skill.instruction_digest}"
-            for skill in skills
-            if skill.instruction_digest
-        ]
-        if instruction_blocks:
-            warning = (
-                "These bounded skill instructions are already loaded into this "
-                "prompt. Do not call read_file to inspect /skills or write_todos "
-                "to restate the skill plan; use these instructions directly.\n\n"
-                if no_file_tool_warning
-                else ""
-            )
-            hint_parts.append(
-                "Loaded skill instructions:\n"
-                + warning
-                + "\n\n".join(instruction_blocks)
-            )
+        if include_instruction_digest:
+            instruction_blocks = [
+                f"### {skill.name}\n{skill.instruction_digest}"
+                for skill in skills
+                if skill.instruction_digest
+            ]
+            if instruction_blocks:
+                warning = (
+                    "These bounded skill instructions are already loaded into this "
+                    "prompt. Do not call read_file to inspect /skills or write_todos "
+                    "to restate the skill plan; use these instructions directly.\n\n"
+                    if no_file_tool_warning
+                    else ""
+                )
+                hint_parts.append(
+                    "Loaded skill instructions:\n"
+                    + warning
+                    + "\n\n".join(instruction_blocks)
+                )
         finalization_blocks = [
             f"- {skill.name}:\n{skill.finalization_requirements}"
             for skill in skills

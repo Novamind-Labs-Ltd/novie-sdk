@@ -126,6 +126,7 @@ class ByokLlmClient:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> Any:
         from langchain_openai import ChatOpenAI
 
@@ -138,6 +139,8 @@ class ByokLlmClient:
             kwargs["base_url"] = self._base_url
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if max_output_tokens is not None:
+            kwargs["max_tokens"] = int(max_output_tokens)
 
         llm = ChatOpenAI(**kwargs)
         if self._usage_sink is not None:
@@ -156,6 +159,7 @@ class ByokLlmClient:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Send a chat request using the agent's own key.
 
@@ -174,7 +178,11 @@ class ByokLlmClient:
                 return AIMessage(content=content)
             return HumanMessage(content=content)
 
-        llm = self._build_chat_model(model=model, temperature=temperature)
+        llm = self._build_chat_model(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         response = await llm.ainvoke([_to_msg(m) for m in messages])
         content = getattr(response, "content", str(response))
         usage_metadata = dict(getattr(response, "usage_metadata", None) or {})

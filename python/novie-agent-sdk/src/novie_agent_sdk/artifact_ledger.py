@@ -266,13 +266,19 @@ class EvidencePackBuilder:
         query: str = "",
         purpose: str = "",
         artifact_type_prefixes: set[str] | None = None,
+        exclude_workpad_step_ids: set[str] | None = None,
     ) -> EvidencePack:
         refs: list[dict[str, Any]] = []
         warnings: list[str] = []
         snapshot = await self._snapshot(workflow_id=workflow_id)
         entries = snapshot.get("entries") if isinstance(snapshot, Mapping) else None
         if isinstance(entries, list):
-            refs.extend(_refs_from_workpad_entries(entries))
+            refs.extend(
+                _refs_from_workpad_entries(
+                    entries,
+                    exclude_step_ids=exclude_workpad_step_ids or set(),
+                )
+            )
         elif snapshot and snapshot.get("available") is False:
             warnings.append(str(snapshot.get("error") or "workpad_snapshot_unavailable"))
         refs.extend(_refs_from_upstream(upstream or {}))
@@ -399,10 +405,17 @@ def _artifact_ref_from_result(result: Mapping[str, Any], *, kind: str) -> dict[s
     }
 
 
-def _refs_from_workpad_entries(entries: Sequence[Any]) -> list[dict[str, Any]]:
+def _refs_from_workpad_entries(
+    entries: Sequence[Any],
+    *,
+    exclude_step_ids: set[str],
+) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
+            continue
+        entry_step_id = str(entry.get("step_id") or "").strip()
+        if entry_step_id and entry_step_id in exclude_step_ids:
             continue
         artifact_refs = entry.get("artifact_refs")
         if not isinstance(artifact_refs, Sequence) or isinstance(artifact_refs, (str, bytes)):
@@ -413,6 +426,8 @@ def _refs_from_workpad_entries(entries: Sequence[Any]) -> list[dict[str, Any]]:
             item = dict(ref)
             item.setdefault("source", "workpad")
             item.setdefault("title", entry.get("title") or "")
+            if entry_step_id:
+                item.setdefault("source_step_id", entry_step_id)
             refs.append(item)
     return refs
 

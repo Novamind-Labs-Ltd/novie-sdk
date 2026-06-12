@@ -492,6 +492,8 @@ class _CapabilityCaller:
                 if response.status_code >= 400:
                     await response.aread()
                     envelope_code = _extract_envelope_code(response)
+                    if response.status_code == 404 and not envelope_code:
+                        envelope_code = "stream_endpoint_not_found"
                     yield {
                         "type": "error",
                         "error_code": envelope_code or "",
@@ -1377,6 +1379,19 @@ class LlmNamespace:
             yield {"type": "completed", "result": self._unwrap(diagnostics, _LLM_CHAT_CAP)}
             return
         async for event in stream(_LLM_CHAT_CAP, args):
+            event_type = str(event.get("type") or "")
+            if event_type in {"error", "cancelled"}:
+                error_code = str(event.get("error_code") or "")
+                raise PlatformLlmCallError(
+                    capability_id=_LLM_CHAT_CAP,
+                    kind=classify_envelope_error(error_code or None, http_status=None),
+                    error_code=error_code,
+                    detail=str(
+                        event.get("explanation")
+                        or event.get("reason")
+                        or "platform LLM stream failed"
+                    ),
+                )
             yield event
 
     async def structured(
@@ -1608,15 +1623,15 @@ class PlatformNamespace:
         like knowledge / checkpoints.
         """
         invoke_stream = getattr(self._llm_caller, "invoke_stream_with_diagnostics", None)
-        if self._stream_llm_chat and capability_id == _LLM_CHAT_CAP and callable(invoke_stream):
+        if (
+            self._stream_llm_chat
+            and capability_id == _LLM_CHAT_CAP
+            and callable(invoke_stream)
+        ):
             diagnostics = await invoke_stream(capability_id, arguments)
-            if not (
-                not diagnostics.ok
-                and diagnostics.error_code == "stream_endpoint_not_found"
-            ):
-                if not diagnostics.ok:
-                    self._diagnostics.append(diagnostics)
-                return diagnostics
+            if not diagnostics.ok:
+                self._diagnostics.append(diagnostics)
+            return diagnostics
 
         diagnostics = await self._llm_caller.invoke_with_diagnostics(
             capability_id, arguments,

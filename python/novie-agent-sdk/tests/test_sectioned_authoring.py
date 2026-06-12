@@ -4,10 +4,24 @@ from typing import Any
 
 import pytest
 
-from novie_agent_sdk import SectionedLongformAuthor
+from novie_agent_sdk import (
+    PlatformLlmCallError,
+    SectionedLongformAuthor,
+    SkillContractResolver,
+    sectioned_authoring_contract_from_skill,
+)
+from novie_agent_sdk.sectioned_authoring import (
+    _llm_stream_event_delta,
+    _llm_stream_event_result,
+)
 
 
 class _FakeLlm:
+    def __init__(self) -> None:
+        self.force_wrong_heading = False
+        self.chat_kwargs: list[dict[str, Any]] = []
+        self.chat_prompts: list[str] = []
+
     async def structured(
         self,
         *,
@@ -42,18 +56,222 @@ class _FakeLlm:
         *,
         messages: list[dict[str, str]],
         temperature: float,
+        **kwargs: Any,
     ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
         prompt = messages[0]["content"]
+        self.chat_prompts.append(prompt)
         if "Polish the concatenated sections" in prompt:
             return {"content": "too short"}
+        if "upstream-s1-evidence" in prompt:
+            heading = (
+                "Recommendation"
+                if '"section_id": "recommendation"' in prompt
+                else "Context"
+            )
+            return {
+                "content": (
+                    f"## {heading}\n\n"
+                    "alpha beta gamma delta epsilon zeta "
+                    "[artifact://upstream-s1-evidence]"
+                )
+            }
         if '"section_id": "recommendation"' in prompt:
             return {"content": "## Recommendation\n\neta theta iota kappa lambda mu"}
+        if self.force_wrong_heading:
+            return {"content": "## Wrong Heading\n\nalpha beta gamma delta epsilon zeta"}
         return {"content": "## Context\n\nalpha beta gamma delta epsilon zeta"}
+
+
+class _FlakyStreamLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_output_tokens: int,
+    ):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"type": "chunk", "delta": {"content": "partial"}}
+            raise PlatformLlmCallError(
+                capability_id="platform.llm.chat",
+                kind="platform_unavailable",
+                error_code="internal_error",
+                detail=(
+                    "peer closed connection without sending complete message body "
+                    "(incomplete chunked read)"
+                ),
+            )
+        yield {"type": "chunk", "delta": {"content": "complete"}}
+        yield {
+            "type": "completed",
+            "result": {
+                "content": "complete",
+                "usage_metadata": {"total_tokens": 7},
+            },
+        }
+
+
+class _LongFakeLlm(_FakeLlm):
+    async def structured(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        output_schema: dict[str, Any],
+        temperature: float,
+    ) -> dict[str, Any]:
+        return {
+            "structured": {
+                "length_profile": "long",
+                "sections": [
+                    {
+                        "section_id": f"section-{index}",
+                        "title": f"Section {index}",
+                        "objective": f"Explain section {index}.",
+                        "evidence_query": f"section {index}",
+                        "min_words": 5,
+                    }
+                    for index in range(1, 6)
+                ],
+            }
+        }
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        prompt = messages[0]["content"]
+        self.chat_prompts.append(prompt)
+        if "Merge this cluster" in prompt or "Polish the concatenated sections" in prompt:
+            return {"content": "too short"}
+        for index in range(1, 6):
+            if f'"section_id": "section-{index}"' in prompt:
+                return {
+                    "content": (
+                        f"## Section {index}\n\n"
+                        "alpha beta gamma delta epsilon zeta"
+                    )
+                }
+        return {"content": "## Section 1\n\nalpha beta gamma delta epsilon zeta"}
+
+
+def test_llm_stream_event_delta_extracts_content_blocks() -> None:
+    assert (
+        _llm_stream_event_delta(
+            {
+                "type": "chunk",
+                "delta": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "text", "text": "world"},
+                    ]
+                },
+            }
+        )
+        == "hello world"
+    )
+
+
+def test_llm_stream_event_result_extracts_provider_text_shapes() -> None:
+    result = _llm_stream_event_result(
+        {
+            "type": "completed",
+            "result": {
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "section draft"},
+                    ]
+                },
+                "usage_metadata": {"total_tokens": 12},
+            },
+        }
+    )
+
+    assert result is not None
+    assert result["content"] == "section draft"
+    assert result["usage_metadata"]["total_tokens"] == 12
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_text_retries_transient_stream_failure_same_path() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _FlakyStreamLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        context_budget={
+            "llm_stream_max_attempts": 2,
+            "llm_stream_retry_backoff_seconds": 0,
+        },
+        phase_event_sink=phase_events.append,
+    )
+
+    content = await author._stream_llm_text(
+        purpose="revise_section",
+        messages=[{"role": "user", "content": "rewrite"}],
+        temperature=0.25,
+        max_output_tokens=1200,
+    )
+
+    assert content == "complete"
+    assert llm.calls == 2
+    assert [event["event"] for event in phase_events] == [
+        "agent.llm_call.started",
+        "agent.llm_call.delta",
+        "agent.llm_call.retrying",
+        "agent.llm_call.delta",
+        "agent.llm_call.completed",
+    ]
+    retry_event = phase_events[2]
+    assert retry_event["attempt"] == 1
+    assert retry_event["next_attempt"] == 2
+    assert retry_event["chars_total"] == len("partial")
+    completed_event = phase_events[-1]
+    assert completed_event["attempt"] == 2
+    assert completed_event["chars_total"] == len("complete")
+
+
+class _EmptyDraftLlm(_FakeLlm):
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        self.chat_prompts.append(messages[0]["content"])
+        return {"content": ""}
+
+
+class _PlaceholderDraftLlm(_FakeLlm):
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        self.chat_prompts.append(messages[0]["content"])
+        return {"content": "## Context\n\nNo section draft was returned."}
 
 
 class _FakeArtifacts:
     def __init__(self) -> None:
         self.created: list[dict[str, Any]] = []
+        self.read_artifact_ids: list[str] = []
 
     async def create(self, **kwargs: Any) -> dict[str, Any]:
         artifact_id = f"artifact-{len(self.created) + 1}"
@@ -66,14 +284,30 @@ class _FakeArtifacts:
         self.created.append({**kwargs, **result})
         return result
 
+    async def read_chunks(
+        self,
+        artifact_id: str,
+        *,
+        purpose: str,
+        offset: int,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        self.read_artifact_ids.append(artifact_id)
+        return {
+            "available": True,
+            "content": f"evidence from {artifact_id}",
+            "metadata": {"bytes": len(artifact_id)},
+        }
+
 
 class _FakeWorkpads:
     def __init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
+        self.snapshot_entries: list[dict[str, Any]] = []
         self.final_refs: list[str] = []
 
     async def snapshot(self, *, workflow_id: str | None, limit: int) -> dict[str, Any]:
-        return {"entries": []}
+        return {"entries": self.snapshot_entries[:limit]}
 
     async def record_entry(self, **kwargs: Any) -> dict[str, Any]:
         self.entries.append(dict(kwargs))
@@ -100,32 +334,34 @@ class _FakePlatform:
 @pytest.mark.asyncio
 async def test_sectioned_author_records_outline_sections_and_final_ref() -> None:
     platform = _FakePlatform()
+    phase_events: list[dict[str, Any]] = []
     author = SectionedLongformAuthor(
         llm_facade=_FakeLlm(),
         platform=platform,
-        artifact_type="prd_document",
+        artifact_type="example_document",
         step_id="s2",
-        capability_id="agent.pm.prd_create",
+        capability_id="agent.example.write_document",
         authoring_contract={
-            "coverage_model": "prd_document",
+            "coverage_model": "example_document",
             "min_outline_sections": 2,
             "max_outline_sections": 2,
             "min_section_words": 5,
             "default_section_words": 5,
             "max_section_words": 20,
             "final_retention_ratio": 0.8,
-            "outline_artifact_type": "prd_document.outline",
-            "section_artifact_type": "prd_document.section",
-            "final_artifact_type": "prd_document",
+            "outline_artifact_type": "example_document.outline",
+            "section_artifact_type": "example_document.section",
+            "final_artifact_type": "example_document",
         },
+        phase_event_sink=phase_events.append,
     )
 
     result = await author.author(
-        brief={"title": "Payments PRD"},
+        brief={"title": "Example document"},
         upstream={},
         workflow_id="workflow-1",
         thread_id="thread-1",
-        agent_id="pm",
+        agent_id="writer",
     )
 
     assert "## Context" in result.markdown
@@ -138,12 +374,185 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         "final_deliverable",
     ]
     assert [item["artifact_type"] for item in platform.artifacts.created] == [
-        "prd_document.outline",
-        "prd_document.section",
-        "prd_document.section",
-        "prd_document",
+        "example_document.outline",
+        "example_document.section",
+        "example_document.section",
+        "example_document",
     ]
     assert platform.workpads.final_refs == ["artifact://artifact-4"]
+    event_names = [event["event"] for event in phase_events]
+    assert [name for name in event_names if name.startswith("document.")] == [
+        "document.profile.selected",
+        "document.outline.started",
+        "document.outline.completed",
+        "document.section.started",
+        "document.section.evidence_pack_built",
+        "document.section.gap_detected",
+        "document.section.quality_checked",
+        "document.section.completed",
+        "document.section.started",
+        "document.section.evidence_pack_built",
+        "document.section.gap_detected",
+        "document.section.quality_checked",
+        "document.section.completed",
+        "document.final.polish_started",
+        "document.final.created",
+    ]
+    assert "agent.llm_call.started" in event_names
+    assert "agent.llm_call.delta" in event_names
+    assert "agent.llm_call.completed" in event_names
+    assert any(
+        event["event"] == "agent.tool_call" and event.get("tool_name") == "evidence.build"
+        for event in phase_events
+    )
+    assert any(
+        event["event"] == "agent.tool_result" and event.get("tool_name") == "artifact.write"
+        for event in phase_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_passes_bounded_chat_output_tokens() -> None:
+    platform = _FakePlatform()
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
+        1200,
+        1200,
+        2400,
+    ]
+
+
+def test_sectioned_contract_applies_active_length_profile(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    skill = tmp_path / "skills" / "report"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: report
+metadata:
+  novie:
+    runtime_contract:
+      version: 1
+      name: report
+      runtime:
+        strategy: sectioned_longform
+        context_policy: evidence_pack_v1
+      document:
+        outline:
+          min_sections: 2
+          max_sections: 9
+        section:
+          min_units: 90
+          default_units: 180
+          max_units: 280
+          max_revision_rounds: 1
+        final:
+          min_retention_ratio: 0.8
+        length_profiles:
+          long:
+            min_sections: 8
+            max_sections: 16
+            min_units: 260
+            default_units: 520
+            max_units: 900
+            max_revision_rounds: 2
+            finalization: progressive_section_merge
+            evidence_depth: deep
+---
+
+# Report
+""",
+        encoding="utf-8",
+    )
+
+    contract = SkillContractResolver(root_dir=tmp_path).resolve(["skills/report"], required=True)
+    authoring = sectioned_authoring_contract_from_skill(
+        contract,
+        artifact_type="management_report",
+        length_profile="long",
+        profile_source="user_input",
+        profile_confidence="confirmed",
+    )
+
+    assert authoring["length_profile"] == "long"
+    assert authoring["profile_source"] == "user_input"
+    assert authoring["min_outline_sections"] == 8
+    assert authoring["max_outline_sections"] == 16
+    assert authoring["default_section_words"] == 520
+    assert authoring["max_section_revision_rounds"] == 2
+    assert authoring["finalization"] == "progressive_section_merge"
+    assert authoring["evidence_depth"] == "deep"
+
+
+@pytest.mark.asyncio
+async def test_long_profile_uses_progressive_section_merge() -> None:
+    platform = _FakePlatform()
+    phase_events: list[dict[str, Any]] = []
+    llm = _LongFakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "length_profile": "long",
+            "profile_source": "user_input",
+            "profile_confidence": "confirmed",
+            "min_outline_sections": 5,
+            "max_outline_sections": 5,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "finalization": "progressive_section_merge",
+            "final_retention_ratio": 0.8,
+        },
+        phase_event_sink=phase_events.append,
+    )
+
+    result = await author.author(
+        brief={"title": "Example long document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert len(result.drafts) == 5
+    assert result.ledger["length_profile"] == "long"
+    assert result.ledger["finalization"] == "progressive_section_merge"
+    assert any("Merge this cluster" in prompt for prompt in llm.chat_prompts)
+    assert [event["event"] for event in phase_events].count(
+        "document.final.merge_cluster_started"
+    ) == 2
+    assert [event["event"] for event in phase_events].count(
+        "document.final.merge_cluster_completed"
+    ) == 2
 
 
 def test_outline_schema_carries_function_title() -> None:
@@ -157,3 +566,312 @@ def test_outline_schema_carries_function_title() -> None:
 
     schema = _outline_schema(SectionedAuthoringContract())
     assert schema.get("title"), "outline schema lost its top-level title"
+    assert "maxItems" not in schema["properties"]["sections"]
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_repairs_missing_planned_heading_before_quality_gate() -> None:
+    platform = _FakePlatform()
+    llm = _FakeLlm()
+    llm.force_wrong_heading = True
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+            "outline_artifact_type": "example_document.outline",
+            "section_artifact_type": "example_document.section",
+            "final_artifact_type": "example_document",
+        },
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert result.drafts[0].markdown.startswith("## Context\n\n## Wrong Heading")
+    assert result.drafts[0].quality["passed"] is True
+    assert result.drafts[0].quality["failures"] == []
+
+
+def test_unique_sources_gate_caps_requirement_by_available_evidence() -> None:
+    """A thin evidence pack must not make the gate unsatisfiable: the required
+    unique-source count is capped by what the pack actually offers, and grades
+    sources *cited in the section* rather than merely present in the pack."""
+    from novie_agent_sdk.sectioned_authoring import (
+        SectionedAuthoringContract,
+        SectionPlan,
+        _evaluate_section_quality,
+    )
+
+    contract = SectionedAuthoringContract(
+        min_section_words=3,
+        require_evidence_refs=True,
+        min_unique_sources_per_core_section=2,
+    )
+    plan = SectionPlan(section_id="context", title="Context", min_words=3)
+
+    # Only one source available, and it is cited → no insufficient_unique_sources
+    single = _evaluate_section_quality(
+        plan=plan,
+        markdown="## Context\n\nalpha beta gamma delta https://a.example",
+        evidence_pack={"items": [{"url": "https://a.example", "title": "A"}]},
+        contract=contract,
+        revision_rounds=0,
+    )
+    assert "insufficient_unique_sources" not in single.failures
+    assert single.unique_sources_available == 1
+    assert single.unique_sources_cited == 1
+
+
+def test_unique_sources_gate_fails_when_fewer_sources_cited_than_available() -> None:
+    from novie_agent_sdk.sectioned_authoring import (
+        SectionedAuthoringContract,
+        SectionPlan,
+        _evaluate_section_quality,
+    )
+
+    contract = SectionedAuthoringContract(
+        min_section_words=3,
+        require_evidence_refs=True,
+        min_unique_sources_per_core_section=2,
+    )
+    plan = SectionPlan(section_id="context", title="Context", min_words=3)
+
+    # Two sources available but only one cited → gate fails.
+    result = _evaluate_section_quality(
+        plan=plan,
+        markdown="## Context\n\nalpha beta gamma delta https://a.example",
+        evidence_pack={
+            "items": [
+                {"url": "https://a.example", "title": "A"},
+                {"url": "https://b.example", "title": "B"},
+            ]
+        },
+        contract=contract,
+        revision_rounds=0,
+    )
+    assert "insufficient_unique_sources" in result.failures
+    assert result.unique_sources_available == 2
+    assert result.unique_sources_cited == 1
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_degrades_soft_gate_failure_instead_of_raising() -> None:
+    """Default ``degrade`` enforcement records a best-effort section with a gap
+    marker for soft failures rather than dead-ending the plan."""
+    platform = _FakePlatform()
+    phase_events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+            # Soft gate the FakeLlm output never satisfies.
+            "require_confidence_layer": True,
+        },
+        phase_event_sink=phase_events.append,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert result.ledger["degraded"] is True
+    assert result.ledger["degraded_sections"]
+    assert all(draft.quality["degraded"] is True for draft in result.drafts)
+    assert "Evidence gap (auto-flagged)" in result.drafts[0].markdown
+    assert "document.section.quality_degraded" in [e["event"] for e in phase_events]
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_strict_mode_raises_on_soft_gate_failure() -> None:
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+            "require_confidence_layer": True,
+            "gate_enforcement": "strict",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="section_quality_gate_failed"):
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_rejects_empty_section_drafts() -> None:
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_EmptyDraftLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="section_quality_gate_failed:context"):
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
+
+    assert [item["artifact_type"] for item in platform.artifacts.created] == [
+        "example_document.outline",
+    ]
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_rejects_placeholder_section_drafts() -> None:
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_PlaceholderDraftLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 3,
+            "default_section_words": 3,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="placeholder_section"):
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
+
+    assert [item["artifact_type"] for item in platform.artifacts.created] == [
+        "example_document.outline",
+    ]
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_excludes_current_step_workpad_refs_from_evidence() -> None:
+    platform = _FakePlatform()
+    platform.workpads.snapshot_entries = [
+        {
+            "step_id": "s2",
+            "title": "stale current-step section",
+            "artifact_refs": [
+                {
+                    "artifact_id": "stale-s2-section",
+                    "artifact_type": "example_document.section",
+                    "ref": "artifact://stale-s2-section",
+                }
+            ],
+        },
+        {
+            "step_id": "s1",
+            "title": "upstream research",
+            "artifact_refs": [
+                {
+                    "artifact_id": "upstream-s1-evidence",
+                    "artifact_type": "market_analysis",
+                    "ref": "artifact://upstream-s1-evidence",
+                }
+            ],
+        },
+    ]
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert "upstream-s1-evidence" in platform.artifacts.read_artifact_ids
+    assert "stale-s2-section" not in platform.artifacts.read_artifact_ids
+    draft_prompts = [
+        prompt
+        for prompt in llm.chat_prompts
+        if "Write exactly this document section" in prompt
+    ]
+    assert draft_prompts
+    assert "evidence from upstream-s1-evidence" in draft_prompts[0]
+    assert "stale-s2-section" not in draft_prompts[0]

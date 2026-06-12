@@ -1,18 +1,22 @@
 """Section-by-section longform authoring for document deliverables."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import inspect
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
 from .skill_contracts import SkillRuntimeContract
 
 _SECTIONED_AUTHORING_ENV = "NOVIE_SECTIONED_AUTHORING_V2"
 _SECTIONED_AUTHORING_DISABLED_ENV = "NOVIE_SECTIONED_AUTHORING_DISABLED"
+_LLM_STREAM_MAX_ATTEMPTS_ENV = "NOVIE_LLM_STREAM_MAX_ATTEMPTS"
+_LLM_STREAM_RETRY_BACKOFF_ENV = "NOVIE_LLM_STREAM_RETRY_BACKOFF_S"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on", "enabled"}
 _FALSY_ENV_VALUES = {"0", "false", "no", "off", "disabled"}
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
@@ -25,6 +29,33 @@ _INTERNAL_PROCESS_RE = re.compile(
     r"上游证据包|紧凑交接|现在撰写)",
     re.IGNORECASE,
 )
+_PLACEHOLDER_SECTION_RE = re.compile(
+    r"\bno\s+section\s+draft\s+was\s+returned\b",
+    re.IGNORECASE,
+)
+
+# Quality-gate failures that indicate the section is structurally unusable.
+# These always block (even under ``degrade`` enforcement) because a downstream
+# merge/polish step cannot recover an empty or un-headed section.
+_STRUCTURAL_GATE_FAILURES = frozenset({
+    "empty_section",
+    "missing_section_heading",
+    "placeholder_section",
+})
+
+# Gate enforcement modes. ``strict`` keeps the legacy behaviour of hard-failing
+# the step on any unmet gate; ``degrade`` records a best-effort section with an
+# explicit gap marker for soft, evidence-bound failures so the plan completes
+# instead of dead-ending on an unsatisfiable quality bar.
+_GATE_ENFORCEMENT_STRICT = "strict"
+_GATE_ENFORCEMENT_DEGRADE = "degrade"
+_GATE_ENFORCEMENT_MODES = frozenset({_GATE_ENFORCEMENT_STRICT, _GATE_ENFORCEMENT_DEGRADE})
+_TRANSIENT_LLM_ERROR_CODES = frozenset({
+    "internal_error",
+    "platform_unavailable",
+    "stream_heartbeat_timeout",
+    "transport_error",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +71,14 @@ class SectionPlan:
 class SectionedAuthoringContract:
     """Shape and quality contract for sectioned longform authoring."""
 
-    coverage_model: str = "management_report"
+    coverage_model: str = "document"
     length_profile: str = "adaptive"
+    profile_source: str = ""
+    profile_confidence: str = ""
     context_policy: str = "evidence_pack_v1"
-    quality_contract_ref: str = "research_report.deep_synthesis"
+    quality_contract_ref: str = "document.generic_quality"
+    finalization: str = "single_polish"
+    evidence_depth: str = "standard"
     min_outline_sections: int = 2
     max_outline_sections: int = 9
     min_section_words: int = 90
@@ -52,6 +87,10 @@ class SectionedAuthoringContract:
     max_section_revision_rounds: int = 1
     final_retention_ratio: float = 0.8
     require_evidence_refs: bool = True
+    require_confidence_layer: bool = False
+    forbid_step_artifact_only_citations: bool = False
+    min_unique_sources_per_core_section: int = 0
+    gate_enforcement: str = _GATE_ENFORCEMENT_DEGRADE
     outline_artifact_type: str = ""
     section_artifact_type: str = ""
     final_artifact_type: str = ""
@@ -66,12 +105,16 @@ class SectionedAuthoringContract:
     ) -> "SectionedAuthoringContract":
         raw = dict(value or {})
         return cls(
-            coverage_model=str(raw.get("coverage_model") or "management_report"),
+            coverage_model=str(raw.get("coverage_model") or "document"),
             length_profile=str(raw.get("length_profile") or "adaptive"),
+            profile_source=str(raw.get("profile_source") or ""),
+            profile_confidence=str(raw.get("profile_confidence") or ""),
             context_policy=str(raw.get("context_policy") or "evidence_pack_v1"),
             quality_contract_ref=str(
-                raw.get("quality_contract_ref") or "research_report.deep_synthesis"
+                raw.get("quality_contract_ref") or "document.generic_quality"
             ),
+            finalization=str(raw.get("finalization") or "single_polish"),
+            evidence_depth=str(raw.get("evidence_depth") or "standard"),
             min_outline_sections=_positive_int(raw.get("min_outline_sections"), 2),
             max_outline_sections=_positive_int(raw.get("max_outline_sections"), 9),
             min_section_words=_positive_int(raw.get("min_section_words"), 90),
@@ -83,6 +126,19 @@ class SectionedAuthoringContract:
             ),
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.8),
             require_evidence_refs=_bool(raw.get("require_evidence_refs"), True),
+            require_confidence_layer=_bool(
+                raw.get("require_confidence_layer"),
+                False,
+            ),
+            forbid_step_artifact_only_citations=_bool(
+                raw.get("forbid_step_artifact_only_citations"),
+                False,
+            ),
+            min_unique_sources_per_core_section=_positive_int(
+                raw.get("min_unique_sources_per_core_section"),
+                0,
+            ),
+            gate_enforcement=_gate_enforcement(raw.get("gate_enforcement")),
             outline_artifact_type=str(raw.get("outline_artifact_type") or ""),
             section_artifact_type=str(raw.get("section_artifact_type") or ""),
             final_artifact_type=str(raw.get("final_artifact_type") or ""),
@@ -110,19 +166,37 @@ class SectionQualityGateResult:
     citation_count: int
     evidence_item_count: int
     revision_rounds: int = 0
+    unique_sources_available: int = 0
+    unique_sources_cited: int = 0
+    degraded: bool = False
 
     @property
     def passed(self) -> bool:
         return not self.failures
 
+    @property
+    def hard_failures(self) -> tuple[str, ...]:
+        """Structural failures that always block the deliverable."""
+        return tuple(f for f in self.failures if f in _STRUCTURAL_GATE_FAILURES)
+
+    @property
+    def soft_failures(self) -> tuple[str, ...]:
+        """Evidence/quality-bound failures eligible for graceful degradation."""
+        return tuple(f for f in self.failures if f not in _STRUCTURAL_GATE_FAILURES)
+
     def to_metadata(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "failures": list(self.failures),
+            "hard_failures": list(self.hard_failures),
+            "soft_failures": list(self.soft_failures),
             "information_units": self.information_units,
             "citation_count": self.citation_count,
             "evidence_item_count": self.evidence_item_count,
             "revision_rounds": self.revision_rounds,
+            "unique_sources_available": self.unique_sources_available,
+            "unique_sources_cited": self.unique_sources_cited,
+            "degraded": self.degraded,
         }
 
 
@@ -166,28 +240,83 @@ def sectioned_authoring_contract_from_skill(
     contract: SkillRuntimeContract,
     *,
     artifact_type: str,
+    length_profile: str | None = None,
+    profile_source: str = "",
+    profile_confidence: str = "",
 ) -> dict[str, Any]:
     """Map a generic skill runtime contract to sectioned authoring settings."""
     document = contract.document
     raw_document = dict(document.raw or {})
     defaults = dict(contract.task_profile.defaults or {})
+    base_length_profile = (
+        str(length_profile or "").strip().lower()
+        or str(defaults.get("length_profile") or "").strip().lower()
+        or str(raw_document.get("length_profile") or "").strip().lower()
+        or "adaptive"
+    )
+    profile = document.length_profiles.get(base_length_profile)
+    if profile is not None:
+        finalization = profile.finalization or contract.runtime.finalization or "single_polish"
+        evidence_depth = profile.evidence_depth or "standard"
+        min_outline_sections = profile.min_sections or document.outline.min_sections or 2
+        max_outline_sections = profile.max_sections or document.outline.max_sections or 9
+        min_section_words = profile.min_units or document.section.min_units or 90
+        default_section_words = (
+            profile.default_units or document.section.default_units or 180
+        )
+        max_section_words = profile.max_units or document.section.max_units or 280
+        max_section_revision_rounds = (
+            profile.max_revision_rounds
+            or document.section.max_revision_rounds
+            or 1
+        )
+        final_retention_ratio = (
+            profile.final_retention_ratio
+            or document.final.min_retention_ratio
+            or 0.8
+        )
+    else:
+        finalization = contract.runtime.finalization or "single_polish"
+        evidence_depth = str(raw_document.get("evidence_depth") or "standard")
+        min_outline_sections = document.outline.min_sections or 2
+        max_outline_sections = document.outline.max_sections or 9
+        min_section_words = document.section.min_units or 90
+        default_section_words = document.section.default_units or 180
+        max_section_words = document.section.max_units or 280
+        max_section_revision_rounds = document.section.max_revision_rounds or 1
+        final_retention_ratio = document.final.min_retention_ratio or 0.8
+
     return {
         "coverage_model": raw_document.get("coverage_model") or artifact_type,
-        "length_profile": defaults.get("length_profile")
-        or raw_document.get("length_profile")
-        or "adaptive",
+        "length_profile": base_length_profile,
+        "profile_source": profile_source,
+        "profile_confidence": profile_confidence,
         "context_policy": contract.runtime.context_policy or "evidence_pack_v1",
         "quality_contract_ref": raw_document.get("quality_contract_ref")
         or contract.name
         or artifact_type,
-        "min_outline_sections": document.outline.min_sections or 2,
-        "max_outline_sections": document.outline.max_sections or 9,
-        "min_section_words": document.section.min_units or 90,
-        "default_section_words": document.section.default_units or 180,
-        "max_section_words": document.section.max_units or 280,
-        "max_section_revision_rounds": document.section.max_revision_rounds or 1,
-        "final_retention_ratio": document.final.min_retention_ratio or 0.8,
-        "require_evidence_refs": True,
+        "finalization": finalization,
+        "evidence_depth": evidence_depth,
+        "min_outline_sections": min_outline_sections,
+        "max_outline_sections": max_outline_sections,
+        "min_section_words": min_section_words,
+        "default_section_words": default_section_words,
+        "max_section_words": max_section_words,
+        "max_section_revision_rounds": max_section_revision_rounds,
+        "final_retention_ratio": final_retention_ratio,
+        "require_evidence_refs": (
+            contract.quality_gates.require_evidence_refs
+            if contract.quality_gates.raw
+            else True
+        ),
+        "require_confidence_layer": contract.quality_gates.require_confidence_layer,
+        "forbid_step_artifact_only_citations": (
+            contract.quality_gates.forbid_step_artifact_only_citations
+        ),
+        "min_unique_sources_per_core_section": (
+            contract.quality_gates.min_unique_sources_per_core_section
+        ),
+        "gate_enforcement": _gate_enforcement(raw_document.get("gate_enforcement")),
         "outline_artifact_type": contract.artifacts.outline_type
         or f"{artifact_type}.outline",
         "section_artifact_type": contract.artifacts.section_type
@@ -200,7 +329,7 @@ def sectioned_authoring_contract_from_skill(
 
 
 class SectionedLongformAuthor:
-    """Outline, draft, record, and polish a longform report section by section."""
+    """Outline, draft, record, and polish a longform document section by section."""
 
     def __init__(
         self,
@@ -212,6 +341,8 @@ class SectionedLongformAuthor:
         capability_id: str,
         context_budget: Mapping[str, Any] | None = None,
         authoring_contract: Mapping[str, Any] | SectionedAuthoringContract | None = None,
+        phase_event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
     ) -> None:
         self._llm = llm_facade
         self._platform = platform
@@ -230,6 +361,20 @@ class SectionedLongformAuthor:
             self._context_budget.get("max_section_revision_rounds"),
             self._contract.max_section_revision_rounds,
         )
+        self._max_llm_stream_attempts = _positive_int(
+            self._context_budget.get("llm_stream_max_attempts")
+            or os.getenv(_LLM_STREAM_MAX_ATTEMPTS_ENV),
+            2,
+        )
+        self._llm_stream_retry_backoff_seconds = _non_negative_float(
+            self._context_budget.get("llm_stream_retry_backoff_seconds")
+            or os.getenv(_LLM_STREAM_RETRY_BACKOFF_ENV),
+            1.0,
+        )
+        self._phase_event_sink = phase_event_sink
+        self._phase_checkpoint_sink = phase_checkpoint_sink
+        self._llm_call_seq = 0
+        self._tool_call_seq = 0
 
     async def author(
         self,
@@ -239,27 +384,142 @@ class SectionedLongformAuthor:
         workflow_id: str | None = None,
         thread_id: str | None = None,
         agent_id: str | None = None,
+        resume_state: Mapping[str, Any] | None = None,
     ) -> SectionedAuthoringResult:
-        length_profile, outline = await self._build_outline(brief=brief, upstream=upstream)
-        outline_ref = await self._record_outline(
-            outline,
-            length_profile=length_profile,
-            workflow_id=workflow_id,
-            thread_id=thread_id,
-            agent_id=agent_id,
+        state = dict(resume_state or {})
+        await self._emit(
+            "document.profile.selected",
+            status="complete",
+            length_profile=self._contract.length_profile,
+            profile_source=self._contract.profile_source,
+            profile_confidence=self._contract.profile_confidence,
+            finalization=self._contract.finalization,
+            evidence_depth=self._contract.evidence_depth,
+            min_outline_sections=self._contract.min_outline_sections,
+            max_outline_sections=self._contract.max_outline_sections,
+            min_section_words=self._contract.min_section_words,
+            default_section_words=self._contract.default_section_words,
+            max_section_words=self._contract.max_section_words,
         )
+        resume_outline = _section_plans_from_resume_state(state)
         drafts: list[SectionDraft] = []
-        for index, plan in enumerate(outline, start=1):
+        if resume_outline:
+            outline = resume_outline
+            length_profile = str(state.get("length_profile") or self._contract.length_profile)
+            outline_ref = _mapping(state.get("outline_ref"))
+            drafts = await self._resume_drafts_from_state(state, outline=outline)
+            await self._emit(
+                "document.sectioned_authoring.resumed",
+                status="running",
+                artifact_type=self._artifact_type,
+                length_profile=length_profile,
+                profile_source=self._contract.profile_source,
+                section_count=len(outline),
+                resumed_section_count=len(drafts),
+            )
+        else:
+            await self._emit(
+                "document.outline.started",
+                status="running",
+                artifact_type=self._artifact_type,
+                length_profile=self._contract.length_profile,
+                profile_source=self._contract.profile_source,
+            )
+            length_profile, outline = await self._build_outline(brief=brief, upstream=upstream)
+            outline_ref = await self._record_outline(
+                outline,
+                length_profile=length_profile,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+            )
+            await self._emit(
+                "document.outline.completed",
+                status="complete",
+                artifact_type=self._artifact_type,
+                length_profile=length_profile,
+                profile_source=self._contract.profile_source,
+                section_count=len(outline),
+                artifact_ref=outline_ref,
+            )
+            await self._checkpoint(
+                current_phase="draft_sections",
+                length_profile=length_profile,
+                outline=[asdict(plan) for plan in outline],
+                outline_ref=outline_ref,
+                drafts=[],
+            )
+        degraded_sections: list[dict[str, Any]] = list(
+            state.get("degraded_sections") if isinstance(state.get("degraded_sections"), list) else []
+        )
+        for index, plan in enumerate(outline[len(drafts) :], start=len(drafts) + 1):
+            await self._emit(
+                "document.section.started",
+                status="running",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                length_profile=self._contract.length_profile,
+            )
+            evidence_call_id = self._next_tool_call_id("evidence-build")
+            await self._emit(
+                "agent.tool_call",
+                tool_name="evidence.build",
+                tool_call_id=evidence_call_id,
+                status="running",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                query=plan.evidence_query or plan.title,
+            )
             evidence_pack = await self._evidence.build(
                 workflow_id=workflow_id,
                 upstream=upstream,
                 query=plan.evidence_query or plan.title,
                 purpose=f"draft section {index}: {plan.title}",
+                exclude_workpad_step_ids={self._step_id} if self._step_id else set(),
             )
             evidence_pack_input = evidence_pack.to_prompt_input()
+            await self._emit(
+                "agent.tool_result",
+                tool_name="evidence.build",
+                tool_call_id=evidence_call_id,
+                status="complete",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                result_preview=(
+                    f"{len(evidence_pack.items)} evidence items, "
+                    f"{evidence_pack.total_chars} chars"
+                ),
+                evidence_item_count=len(evidence_pack.items),
+                evidence_total_chars=evidence_pack.total_chars,
+                warnings=list(evidence_pack.warnings),
+            )
+            await self._emit(
+                "document.section.evidence_pack_built",
+                status="complete",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                evidence_item_count=len(evidence_pack.items),
+                evidence_total_chars=evidence_pack.total_chars,
+                warnings=list(evidence_pack.warnings),
+            )
+            if evidence_pack.warnings or not evidence_pack.items:
+                await self._emit(
+                    "document.section.gap_detected",
+                    status="incomplete",
+                    section_id=plan.section_id,
+                    section_title=plan.title,
+                    section_index=index,
+                    reasons=list(evidence_pack.warnings)
+                    or ["empty_evidence_pack"],
+                )
             markdown = await self._draft_section(
                 brief=brief,
                 plan=plan,
+                section_index=index,
                 previous=drafts,
                 evidence_pack=evidence_pack_input,
             )
@@ -270,6 +530,14 @@ class SectionedLongformAuthor:
                 contract=self._contract,
                 revision_rounds=0,
             )
+            await self._emit(
+                "document.section.quality_checked",
+                status="passed" if quality.passed else "failed",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                quality=quality.to_metadata(),
+            )
             revision_rounds = 0
             while (
                 not quality.passed
@@ -279,6 +547,7 @@ class SectionedLongformAuthor:
                 markdown = await self._draft_section(
                     brief=brief,
                     plan=plan,
+                    section_index=index,
                     previous=drafts,
                     evidence_pack=evidence_pack_input,
                     revision_feedback=quality,
@@ -290,11 +559,53 @@ class SectionedLongformAuthor:
                     contract=self._contract,
                     revision_rounds=revision_rounds,
                 )
+                await self._emit(
+                    "document.section.quality_checked",
+                    status="passed" if quality.passed else "failed",
+                    section_id=plan.section_id,
+                    section_title=plan.title,
+                    section_index=index,
+                    quality=quality.to_metadata(),
+                )
             if not quality.passed:
-                raise RuntimeError(
-                    "section_quality_gate_failed:"
-                    f"{plan.section_id}:"
-                    + ",".join(quality.failures)
+                hard_failures = quality.hard_failures
+                if (
+                    hard_failures
+                    or self._contract.gate_enforcement == _GATE_ENFORCEMENT_STRICT
+                ):
+                    raise RuntimeError(
+                        "section_quality_gate_failed:"
+                        f"{plan.section_id}:"
+                        + ",".join(quality.failures)
+                    )
+                # Graceful degradation: soft, evidence-bound gate failures must
+                # not dead-end the plan. Record the best-effort section with an
+                # explicit gap marker and continue so the deliverable completes.
+                markdown = _append_quality_gap_note(markdown, quality.soft_failures)
+                quality = SectionQualityGateResult(
+                    failures=quality.failures,
+                    information_units=quality.information_units,
+                    citation_count=quality.citation_count,
+                    evidence_item_count=quality.evidence_item_count,
+                    revision_rounds=quality.revision_rounds,
+                    unique_sources_available=quality.unique_sources_available,
+                    unique_sources_cited=quality.unique_sources_cited,
+                    degraded=True,
+                )
+                degraded_sections.append(
+                    {
+                        "section_id": plan.section_id,
+                        "section_title": plan.title,
+                        "failures": list(quality.soft_failures),
+                    }
+                )
+                await self._emit(
+                    "document.section.quality_degraded",
+                    status="degraded",
+                    section_id=plan.section_id,
+                    section_title=plan.title,
+                    section_index=index,
+                    quality=quality.to_metadata(),
                 )
             artifact_ref = await self._record_section(
                 plan,
@@ -305,6 +616,15 @@ class SectionedLongformAuthor:
                 agent_id=agent_id,
                 quality=quality,
             )
+            await self._emit(
+                "document.section.completed",
+                status="complete",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                section_index=index,
+                artifact_ref=artifact_ref,
+                quality=quality.to_metadata(),
+            )
             drafts.append(
                 SectionDraft(
                     plan=plan,
@@ -313,13 +633,46 @@ class SectionedLongformAuthor:
                     quality=quality.to_metadata(),
                 )
             )
+            await self._checkpoint(
+                current_phase="draft_sections",
+                length_profile=length_profile,
+                outline=[asdict(item) for item in outline],
+                outline_ref=outline_ref,
+                drafts=[_draft_resume_record(draft) for draft in drafts],
+                degraded_sections=degraded_sections,
+            )
 
+        await self._emit(
+            "document.final.polish_started",
+            status="running",
+            section_count=len(drafts),
+            length_profile=self._contract.length_profile,
+            finalization=self._contract.finalization,
+        )
         final_markdown = await self._polish_final(brief=brief, drafts=drafts)
         final_ref = await self._record_final(
             final_markdown,
             workflow_id=workflow_id,
             thread_id=thread_id,
             agent_id=agent_id,
+        )
+        await self._checkpoint(
+            current_phase="finalize",
+            length_profile=length_profile,
+            outline=[asdict(item) for item in outline],
+            outline_ref=outline_ref,
+            drafts=[_draft_resume_record(draft) for draft in drafts],
+            final_ref=final_ref,
+            narrative=final_markdown,
+            degraded_sections=degraded_sections,
+        )
+        await self._emit(
+            "document.final.created",
+            status="complete",
+            artifact_ref=final_ref,
+            section_count=len(drafts),
+            length_profile=self._contract.length_profile,
+            finalization=self._contract.finalization,
         )
         artifact_refs = [{"role": "outline", **dict(outline_ref)}] if outline_ref else []
         artifact_refs.extend(
@@ -344,11 +697,248 @@ class SectionedLongformAuthor:
                 "outline_ref": outline_ref,
                 "final_ref": final_ref,
                 "length_profile": length_profile,
+                "profile_source": self._contract.profile_source,
+                "profile_confidence": self._contract.profile_confidence,
+                "finalization": self._contract.finalization,
                 "section_count": len(outline),
                 "created_count": len(artifact_refs),
                 "artifact_refs": artifact_refs,
+                "degraded": bool(degraded_sections),
+                "degraded_sections": degraded_sections,
             },
         )
+
+    async def _emit(self, event: str, **metadata: Any) -> None:
+        sink = self._phase_event_sink
+        if sink is None:
+            return
+        payload = {
+            "event": event,
+            "runtime_phase": "sectioned_authoring",
+            "authoring_strategy": "sectioned_longform",
+            "artifact_type": self._artifact_type,
+            "capability_id": self._capability_id,
+            **metadata,
+        }
+        result = sink(payload)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _checkpoint(self, **payload: Any) -> None:
+        sink = self._phase_checkpoint_sink
+        if sink is None:
+            return
+        result = sink(
+            {
+                "authoring_strategy": "sectioned_longform",
+                "artifact_type": self._artifact_type,
+                "capability_id": self._capability_id,
+                **payload,
+            }
+        )
+        if inspect.isawaitable(result):
+            await result
+
+    async def _resume_drafts_from_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        outline: tuple[SectionPlan, ...],
+    ) -> list[SectionDraft]:
+        raw_drafts = state.get("drafts")
+        if not isinstance(raw_drafts, list):
+            return []
+        drafts: list[SectionDraft] = []
+        for index, raw in enumerate(raw_drafts, start=1):
+            if not isinstance(raw, Mapping):
+                continue
+            plan = (
+                _section_plan_from_mapping(raw.get("plan"))
+                or (outline[index - 1] if index - 1 < len(outline) else None)
+            )
+            if plan is None:
+                continue
+            markdown = str(raw.get("markdown") or "")
+            artifact_ref = _mapping(raw.get("artifact_ref"))
+            if not markdown:
+                markdown = await self._read_resume_artifact_text(artifact_ref)
+            if not markdown.strip():
+                raise RuntimeError(
+                    "sectioned_resume_artifact_unavailable:"
+                    f"{plan.section_id or index}"
+                )
+            drafts.append(
+                SectionDraft(
+                    plan=plan,
+                    markdown=markdown,
+                    artifact_ref=artifact_ref,
+                    quality=_mapping(raw.get("quality")),
+                )
+            )
+        return drafts
+
+    async def _read_resume_artifact_text(self, artifact_ref: Mapping[str, Any]) -> str:
+        artifacts = getattr(self._platform, "artifacts", None)
+        read_text = getattr(artifacts, "read_text", None)
+        if not callable(read_text):
+            return ""
+        artifact_id = _artifact_id_from_ref(artifact_ref)
+        if not artifact_id:
+            return ""
+        return str(
+            await read_text(
+                artifact_id,
+                mode="chunks",
+                purpose="resume sectioned authoring draft",
+                max_bytes=64000,
+            )
+            or ""
+        )
+
+    def _next_llm_call_id(self, purpose: str) -> str:
+        self._llm_call_seq += 1
+        return f"llm-{_slug(purpose, fallback='call')}-{self._llm_call_seq:04d}"
+
+    def _next_tool_call_id(self, tool_name: str) -> str:
+        self._tool_call_seq += 1
+        return f"tool-{_slug(tool_name, fallback='call')}-{self._tool_call_seq:04d}"
+
+    async def _stream_llm_text(
+        self,
+        *,
+        purpose: str,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_output_tokens: int,
+        section: SectionPlan | None = None,
+        section_index: int | None = None,
+        extra_metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        call_id = self._next_llm_call_id(purpose)
+        base_metadata = {
+            "call_id": call_id,
+            "llm_purpose": purpose,
+            "max_output_tokens": max_output_tokens,
+            **(dict(extra_metadata or {})),
+        }
+        if section is not None:
+            base_metadata.update(
+                {
+                    "section_id": section.section_id,
+                    "section_title": section.title,
+                    "section_index": section_index,
+                }
+            )
+        await self._emit("agent.llm_call.started", **base_metadata, status="running")
+        max_attempts = max(1, self._max_llm_stream_attempts)
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            chunks: list[str] = []
+            completed_result: Mapping[str, Any] | None = None
+            saw_delta = False
+            attempt_metadata = {
+                **base_metadata,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
+            try:
+                stream_text = getattr(self._llm, "stream_text", None)
+                if not callable(stream_text):
+                    result = await self._llm.chat(
+                        messages=messages,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    )
+                    content = str(result.get("content") or "")
+                    if content:
+                        saw_delta = True
+                        chunks.append(content)
+                        await self._emit(
+                            "agent.llm_call.delta",
+                            **attempt_metadata,
+                            text_delta=content,
+                            preview=_preview(content, limit=240),
+                            chars_in_chunk=len(content),
+                            chars_total=len(content),
+                        )
+                    completed_result = result if isinstance(result, Mapping) else {}
+                else:
+                    async for event in stream_text(
+                        messages,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    ):
+                        delta = _llm_stream_event_delta(event)
+                        if delta:
+                            saw_delta = True
+                            chunks.append(delta)
+                            await self._emit(
+                                "agent.llm_call.delta",
+                                **attempt_metadata,
+                                text_delta=delta,
+                                preview=_preview(delta, limit=240),
+                                chars_in_chunk=len(delta),
+                                chars_total=sum(len(chunk) for chunk in chunks),
+                            )
+                        result = _llm_stream_event_result(event)
+                        if result is not None:
+                            completed_result = result
+            except Exception as exc:
+                last_exc = exc
+                chars_total = sum(len(chunk) for chunk in chunks)
+                if attempt < max_attempts and _is_transient_llm_stream_error(exc):
+                    await self._emit(
+                        "agent.llm_call.retrying",
+                        **attempt_metadata,
+                        status="retrying",
+                        error=type(exc).__name__,
+                        message=str(exc),
+                        chars_total=chars_total,
+                        next_attempt=attempt + 1,
+                    )
+                    delay = self._llm_stream_retry_backoff_seconds * (2 ** (attempt - 1))
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                await self._emit(
+                    "agent.llm_call.failed",
+                    **attempt_metadata,
+                    status="failed",
+                    error=type(exc).__name__,
+                    message=str(exc),
+                    chars_total=chars_total,
+                )
+                raise
+
+            content = "".join(chunks)
+            if not content and completed_result is not None:
+                final_content = str(completed_result.get("content") or "")
+                if final_content:
+                    content = final_content
+                    if not saw_delta:
+                        await self._emit(
+                            "agent.llm_call.delta",
+                            **attempt_metadata,
+                            text_delta=final_content,
+                            preview=_preview(final_content, limit=240),
+                            chars_in_chunk=len(final_content),
+                            chars_total=len(final_content),
+                        )
+            await self._emit(
+                "agent.llm_call.completed",
+                **attempt_metadata,
+                status="complete",
+                chars_total=len(content),
+                usage_metadata=(
+                    dict(completed_result.get("usage_metadata") or {})
+                    if isinstance(completed_result, Mapping)
+                    else {}
+                ),
+            )
+            return content
+        if last_exc is not None:
+            raise last_exc
+        return ""
 
     async def _build_outline(
         self,
@@ -357,13 +947,12 @@ class SectionedLongformAuthor:
         upstream: Mapping[str, Any],
     ) -> tuple[str, tuple[SectionPlan, ...]]:
         prompt = (
-            "Design a concise longform document outline.\n"
+            "Design a longform document outline for the selected length profile.\n"
             f"Coverage model: {self._contract.coverage_model}.\n"
-            f"Length profile hint: {self._contract.length_profile}.\n"
-            "Choose the length_profile from the original task and evidence. "
-            "If the hint is adaptive, infer the appropriate profile from the "
-            "task semantics. If the user asks for a complete document and does "
-            "not constrain length, prefer enough sections for full coverage. "
+            f"Selected length profile: {self._contract.length_profile}.\n"
+            f"Evidence depth: {self._contract.evidence_depth}.\n"
+            "The length profile is already selected by the runtime. Do not "
+            "change it. Plan within the declared section and unit bounds. "
             f"Return {self._contract.min_outline_sections}-"
             f"{self._contract.max_outline_sections} sections. "
             "Each section must have a focused evidence query and an appropriate "
@@ -371,18 +960,34 @@ class SectionedLongformAuthor:
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Available upstream/workpad refs:\n{_json_block(upstream, limit=12000)}"
         )
-        result = await self._llm.structured(
-            messages=[{"role": "user", "content": prompt}],
-            output_schema=_outline_schema(self._contract),
-            temperature=0.2,
+        call_id = self._next_llm_call_id("build_outline")
+        await self._emit(
+            "agent.llm_call.started",
+            call_id=call_id,
+            llm_purpose="build_outline",
+            status="running",
+            max_outline_sections=self._contract.max_outline_sections,
+            length_profile=self._contract.length_profile,
         )
+        try:
+            result = await self._llm.structured(
+                messages=[{"role": "user", "content": prompt}],
+                output_schema=_outline_schema(self._contract),
+                temperature=0.2,
+            )
+        except Exception as exc:
+            await self._emit(
+                "agent.llm_call.failed",
+                call_id=call_id,
+                llm_purpose="build_outline",
+                status="failed",
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
         structured = result.get("structured") if isinstance(result, Mapping) else None
         raw_sections = structured.get("sections") if isinstance(structured, Mapping) else None
-        length_profile = (
-            str(structured.get("length_profile") or self._contract.length_profile).strip()
-            if isinstance(structured, Mapping)
-            else self._contract.length_profile
-        )
+        length_profile = self._contract.length_profile
         plans: list[SectionPlan] = []
         if isinstance(raw_sections, list):
             for index, raw in enumerate(raw_sections, start=1):
@@ -407,30 +1012,55 @@ class SectionedLongformAuthor:
                         ),
                     )
                 )
-        if plans:
-            return length_profile or "adaptive", tuple(plans[: self._contract.max_outline_sections])
-        return length_profile or "adaptive", (
+        await self._emit(
+            "agent.llm_call.completed",
+            call_id=call_id,
+            llm_purpose="build_outline",
+            status="complete",
+            section_count=len(plans),
+        )
+        if len(plans) >= self._contract.min_outline_sections:
+            return (
+                length_profile or "medium",
+                tuple(plans[: self._contract.max_outline_sections]),
+            )
+        fallback = [
             SectionPlan(
-                section_id="executive-summary",
-                title="Executive Summary",
-                objective="Summarize the decision-relevant findings.",
-                evidence_query=str(brief.get("title") or brief.get("goal") or "executive summary"),
+                section_id="overview",
+                title="Overview",
+                objective="Summarize the requested document scope and key points.",
+                evidence_query=str(brief.get("title") or brief.get("goal") or "overview"),
                 min_words=self._contract.default_section_words,
             ),
             SectionPlan(
-                section_id="evidence-analysis",
-                title="Evidence Analysis",
-                objective="Synthesize the strongest upstream evidence.",
-                evidence_query="evidence analysis",
+                section_id="details",
+                title="Details",
+                objective="Develop the main body from the available context and evidence.",
+                evidence_query="document details",
                 min_words=self._contract.default_section_words,
             ),
             SectionPlan(
-                section_id="recommendations",
-                title="Recommendations",
-                objective="Translate findings into practical recommendations.",
-                evidence_query="recommendations implications",
+                section_id="next-steps",
+                title="Next Steps",
+                objective="Capture follow-up actions, decisions, or open questions.",
+                evidence_query="next steps open questions",
                 min_words=self._contract.default_section_words,
             ),
+        ]
+        while len(fallback) < self._contract.min_outline_sections:
+            index = len(fallback) + 1
+            fallback.append(
+                SectionPlan(
+                    section_id=f"section-{index}",
+                    title=f"Section {index}",
+                    objective="Develop an additional required section from the available context.",
+                    evidence_query=f"section {index} supporting evidence",
+                    min_words=self._contract.default_section_words,
+                )
+            )
+        return (
+            length_profile or "medium",
+            tuple(fallback[: max(self._contract.min_outline_sections, 1)]),
         )
 
     async def _draft_section(
@@ -438,6 +1068,7 @@ class SectionedLongformAuthor:
         *,
         brief: Mapping[str, Any],
         plan: SectionPlan,
+        section_index: int | None,
         previous: list[SectionDraft],
         evidence_pack: Mapping[str, Any],
         revision_feedback: SectionQualityGateResult | None = None,
@@ -466,16 +1097,23 @@ class SectionedLongformAuthor:
                 "fixing these deterministic failures without dropping evidence:\n"
                 f"{_json_block(revision_feedback.to_metadata(), limit=4000)}"
             )
-        result = await self._llm.chat(
+        content = await self._stream_llm_text(
+            purpose="revise_section" if revision_feedback is not None else "draft_section",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.25,
+            max_output_tokens=_section_output_token_budget(plan, self._contract),
+            section=plan,
+            section_index=section_index,
+            extra_metadata={
+                "revision_round": revision_feedback.revision_rounds + 1
+                if revision_feedback is not None
+                else 0,
+            },
         )
-        content = str(result.get("content") or "").strip()
+        content = content.strip()
         if not content:
-            content = f"## {plan.title}\n\nNo section draft was returned."
-        if not content.lstrip().startswith("#"):
-            content = f"## {plan.title}\n\n{content}"
-        return content
+            return ""
+        return _ensure_section_heading(content, plan.title)
 
     async def _polish_final(
         self,
@@ -483,7 +1121,26 @@ class SectionedLongformAuthor:
         brief: Mapping[str, Any],
         drafts: list[SectionDraft],
     ) -> str:
-        combined = "\n\n".join(draft.markdown.strip() for draft in drafts if draft.markdown.strip())
+        combined = _join_markdown(draft.markdown for draft in drafts)
+        if self._contract.finalization == "progressive_section_merge":
+            return await self._progressive_merge_final(
+                brief=brief,
+                drafts=drafts,
+                combined=combined,
+            )
+        return await self._single_polish_final(
+            brief=brief,
+            drafts=drafts,
+            combined=combined,
+        )
+
+    async def _single_polish_final(
+        self,
+        *,
+        brief: Mapping[str, Any],
+        drafts: list[SectionDraft],
+        combined: str,
+    ) -> str:
         refs = [
             {
                 "section_id": draft.plan.section_id,
@@ -500,11 +1157,14 @@ class SectionedLongformAuthor:
             f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
             f"Draft sections:\n{combined[:48000]}"
         )
-        result = await self._llm.chat(
+        polished = await self._stream_llm_text(
+            purpose="final_polish",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            max_output_tokens=_final_output_token_budget(combined),
+            extra_metadata={"section_count": len(drafts)},
         )
-        polished = str(result.get("content") or "").strip()
+        polished = polished.strip()
         if not polished:
             return combined
         combined_units = _information_units(combined)
@@ -515,6 +1175,91 @@ class SectionedLongformAuthor:
         ):
             return combined
         return polished
+
+    async def _progressive_merge_final(
+        self,
+        *,
+        brief: Mapping[str, Any],
+        drafts: list[SectionDraft],
+        combined: str,
+    ) -> str:
+        if len(drafts) <= 3:
+            return await self._single_polish_final(
+                brief=brief,
+                drafts=drafts,
+                combined=combined,
+            )
+
+        merged_clusters: list[str] = []
+        cluster_size = 4
+        for cluster_index, start in enumerate(range(0, len(drafts), cluster_size), start=1):
+            cluster = drafts[start : start + cluster_size]
+            cluster_markdown = _join_markdown(draft.markdown for draft in cluster)
+            cluster_refs = [
+                {
+                    "section_id": draft.plan.section_id,
+                    "title": draft.plan.title,
+                    "artifact_ref": draft.artifact_ref.get("artifact_ref"),
+                }
+                for draft in cluster
+            ]
+            await self._emit(
+                "document.final.merge_cluster_started",
+                status="running",
+                cluster_index=cluster_index,
+                section_count=len(cluster),
+                length_profile=self._contract.length_profile,
+            )
+            prompt = (
+                "Merge this cluster of adjacent report sections into one "
+                "coherent Markdown chapter block. Preserve all factual claims, "
+                "source refs, headings, and confidence markers. Reduce only "
+                "clear repetition.\n\n"
+                f"Original task:\n{_json_block(brief, limit=6000)}\n\n"
+                f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
+                f"Cluster draft sections:\n{cluster_markdown[:36000]}"
+            )
+            merged = await self._stream_llm_text(
+                purpose="merge_cluster",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_output_tokens=_final_output_token_budget(cluster_markdown),
+                extra_metadata={
+                    "cluster_index": cluster_index,
+                    "section_count": len(cluster),
+                },
+            )
+            merged = merged.strip() or cluster_markdown
+            if _information_units(merged) < int(
+                _information_units(cluster_markdown)
+                * self._contract.final_retention_ratio
+            ):
+                merged = cluster_markdown
+            merged_clusters.append(merged)
+            await self._emit(
+                "document.final.merge_cluster_completed",
+                status="complete",
+                cluster_index=cluster_index,
+                section_count=len(cluster),
+                length_profile=self._contract.length_profile,
+            )
+
+        cluster_drafts = [
+            SectionDraft(
+                plan=SectionPlan(
+                    section_id=f"merged-cluster-{index}",
+                    title=f"Merged Cluster {index}",
+                    min_words=1,
+                ),
+                markdown=markdown,
+            )
+            for index, markdown in enumerate(merged_clusters, start=1)
+        ]
+        return await self._single_polish_final(
+            brief=brief,
+            drafts=cluster_drafts,
+            combined=_join_markdown(merged_clusters),
+        )
 
     async def _record_outline(
         self,
@@ -536,10 +1281,10 @@ class SectionedLongformAuthor:
             "length_profile": length_profile,
             "sections": [asdict(plan) for plan in outline],
         }
-        result = await _create_and_record_strict(
-            self._ledger,
+        result = await self._record_artifact_with_events(
             artifact_type=self._contract.outline_artifact_type
             or f"{self._artifact_type}.outline",
+            role="outline",
             content=content,
             kind="outline",
             title=f"{self._artifact_type} outline",
@@ -547,9 +1292,7 @@ class SectionedLongformAuthor:
             summary=f"{self._artifact_type} outline with {len(outline)} sections",
             workflow_id=workflow_id,
             thread_id=thread_id,
-            step_id=self._step_id,
             agent_id=agent_id,
-            capability_id=self._capability_id,
             metadata={
                 "role": "outline",
                 "authoring_strategy": "sectioned_longform",
@@ -580,10 +1323,10 @@ class SectionedLongformAuthor:
             return {}
         if not self._ledger.is_available:
             return {"available": False, "error": "artifact_ledger_unavailable"}
-        result = await _create_and_record_strict(
-            self._ledger,
+        result = await self._record_artifact_with_events(
             artifact_type=self._contract.section_artifact_type
             or f"{self._artifact_type}.section",
+            role="section_draft",
             content=markdown,
             kind="section_draft",
             title=plan.title,
@@ -591,9 +1334,7 @@ class SectionedLongformAuthor:
             summary=_preview(markdown),
             workflow_id=workflow_id,
             thread_id=thread_id,
-            step_id=self._step_id,
             agent_id=agent_id,
-            capability_id=self._capability_id,
             metadata={
                 "role": "section_draft",
                 "section_id": plan.section_id,
@@ -624,9 +1365,9 @@ class SectionedLongformAuthor:
             return {}
         if not self._ledger.is_available:
             return {"available": False, "error": "artifact_ledger_unavailable"}
-        result = await _create_and_record_strict(
-            self._ledger,
+        result = await self._record_artifact_with_events(
             artifact_type=self._contract.final_artifact_type or self._artifact_type,
+            role="final_deliverable",
             content=markdown,
             kind="final_deliverable",
             title=f"{self._artifact_type} final deliverable",
@@ -634,9 +1375,7 @@ class SectionedLongformAuthor:
             summary=_preview(markdown),
             workflow_id=workflow_id,
             thread_id=thread_id,
-            step_id=self._step_id,
             agent_id=agent_id,
-            capability_id=self._capability_id,
             metadata={
                 "role": "final_deliverable",
                 "authoring_strategy": "sectioned_longform",
@@ -666,6 +1405,79 @@ class SectionedLongformAuthor:
                     f"{final_result.get('error') or 'workpad_final_unavailable'}"
                 )
         return artifact
+
+    async def _record_artifact_with_events(
+        self,
+        *,
+        artifact_type: str,
+        role: str,
+        content: Any,
+        kind: str,
+        title: str,
+        content_type: str,
+        summary: str,
+        workflow_id: str | None,
+        thread_id: str | None,
+        agent_id: str | None,
+        metadata: Mapping[str, Any],
+        workpad_metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        tool_call_id = self._next_tool_call_id("artifact-write")
+        await self._emit(
+            "agent.tool_call",
+            tool_name="artifact.write",
+            tool_call_id=tool_call_id,
+            status="running",
+            artifact_type=artifact_type,
+            role=role,
+            title=title,
+        )
+        try:
+            result = await _create_and_record_strict(
+                self._ledger,
+                artifact_type=artifact_type,
+                content=content,
+                kind=kind,
+                title=title,
+                content_type=content_type,
+                summary=summary,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                step_id=self._step_id,
+                agent_id=agent_id,
+                capability_id=self._capability_id,
+                metadata=dict(metadata),
+                workpad_metadata=dict(workpad_metadata),
+            )
+        except Exception as exc:
+            await self._emit(
+                "agent.tool_error",
+                tool_name="artifact.write",
+                tool_call_id=tool_call_id,
+                status="failed",
+                artifact_type=artifact_type,
+                role=role,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
+        artifact = result.get("artifact") if isinstance(result, Mapping) else None
+        artifact_ref = (
+            str(artifact.get("artifact_ref") or artifact.get("artifact_id") or "")
+            if isinstance(artifact, Mapping)
+            else ""
+        )
+        await self._emit(
+            "agent.tool_result",
+            tool_name="artifact.write",
+            tool_call_id=tool_call_id,
+            status="complete",
+            artifact_type=artifact_type,
+            role=role,
+            artifact_ref=artifact_ref,
+            result_preview=summary,
+        )
+        return result
 
 
 async def _create_and_record_strict(ledger: ArtifactLedger, **kwargs: Any) -> dict[str, Any]:
@@ -711,9 +1523,22 @@ def _evaluate_section_quality(
     information_units = _information_units(text)
     evidence_items = _evidence_items(evidence_pack)
     citation_count = _citation_count(text, evidence_items)
+    url_citation_count = len(_URL_RE.findall(text))
+    unique_sources_available = _unique_source_count(evidence_items)
+    unique_sources_cited = _unique_sources_cited(text, evidence_items)
+    # The gate can only ask for as many unique sources as the evidence pack
+    # actually contains. Counting cited (not merely available) sources measures
+    # the section, and capping by availability keeps the bar satisfiable when
+    # upstream evidence is thin — otherwise the step dead-ends forever.
+    required_unique_sources = min(
+        contract.min_unique_sources_per_core_section,
+        unique_sources_available,
+    )
 
     if not text:
         failures.append("empty_section")
+    if _PLACEHOLDER_SECTION_RE.search(text):
+        failures.append("placeholder_section")
     if not _section_has_heading(text, plan.title):
         failures.append("missing_section_heading")
     if information_units < plan.min_words:
@@ -722,6 +1547,21 @@ def _evaluate_section_quality(
         failures.append("internal_process_language")
     if contract.require_evidence_refs and evidence_items and citation_count == 0:
         failures.append("missing_evidence_reference")
+    if (
+        contract.forbid_step_artifact_only_citations
+        and evidence_items
+        and citation_count > 0
+        and url_citation_count == 0
+    ):
+        failures.append("artifact_only_citations")
+    if (
+        required_unique_sources
+        and evidence_items
+        and unique_sources_cited < required_unique_sources
+    ):
+        failures.append("insufficient_unique_sources")
+    if contract.require_confidence_layer and not _has_confidence_layer(text):
+        failures.append("missing_confidence_layer")
 
     return SectionQualityGateResult(
         failures=tuple(dict.fromkeys(failures)),
@@ -729,6 +1569,8 @@ def _evaluate_section_quality(
         citation_count=citation_count,
         evidence_item_count=len(evidence_items),
         revision_rounds=revision_rounds,
+        unique_sources_available=unique_sources_available,
+        unique_sources_cited=unique_sources_cited,
     )
 
 
@@ -738,6 +1580,13 @@ def _section_has_heading(markdown: str, title: str) -> bool:
         if _normalise_heading(match.group(1)) == wanted:
             return True
     return False
+
+
+def _ensure_section_heading(markdown: str, title: str) -> str:
+    text = str(markdown or "").strip()
+    if _section_has_heading(text, title):
+        return text
+    return f"## {title}\n\n{text}" if text else f"## {title}"
 
 
 def _normalise_heading(value: str) -> str:
@@ -772,23 +1621,169 @@ def _citation_count(markdown: str, evidence_items: list[dict[str, Any]]) -> int:
     return count
 
 
+def _unique_source_count(evidence_items: list[dict[str, Any]]) -> int:
+    sources: set[str] = set()
+    for item in evidence_items:
+        for key in ("url", "source_url", "ref", "artifact_id", "title", "source"):
+            value = str(item.get(key) or "").strip().lower()
+            if value:
+                sources.add(value)
+                break
+    return len(sources)
+
+
+def _unique_sources_cited(markdown: str, evidence_items: list[dict[str, Any]]) -> int:
+    """Count distinct evidence sources actually referenced in the section text.
+
+    Unlike :func:`_unique_source_count` (which measures what the evidence pack
+    *offers*), this measures what the drafted section *uses* — inline URLs plus
+    any evidence identifier (url/ref/artifact_id/title) that appears verbatim in
+    the markdown. This is what the quality gate should grade.
+    """
+    text = str(markdown or "")
+    if not text:
+        return 0
+    cited: set[str] = set()
+    for url in _URL_RE.findall(text):
+        normalised = url.strip().lower()
+        if normalised:
+            cited.add(normalised)
+    for item in evidence_items:
+        for key in ("url", "source_url", "ref", "artifact_id", "title", "source"):
+            value = str(item.get(key) or "").strip()
+            if value and value in text:
+                cited.add(value.lower())
+                break
+    return len(cited)
+
+
+def _has_confidence_layer(markdown: str) -> bool:
+    lowered = str(markdown or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "confirmed",
+            "inferred",
+            "open gap",
+            "open_gap",
+            "confidence:",
+            "evidence strength",
+        )
+    )
+
+
+def _join_markdown(items: Any) -> str:
+    return "\n\n".join(str(item or "").strip() for item in items if str(item or "").strip())
+
+
+def _section_output_token_budget(
+    plan: SectionPlan,
+    contract: SectionedAuthoringContract,
+) -> int:
+    target_units = _clamp_int(
+        max(plan.min_words, contract.default_section_words),
+        minimum=contract.min_section_words,
+        maximum=max(contract.max_section_words, contract.min_section_words),
+    )
+    return _clamp_int(target_units * 5, minimum=1200, maximum=4096)
+
+
+def _final_output_token_budget(markdown: str) -> int:
+    units = max(_information_units(markdown), 1)
+    return _clamp_int(units * 3, minimum=2400, maximum=16000)
+
+
+def _llm_stream_event_delta(event: Any) -> str:
+    if not isinstance(event, Mapping):
+        return ""
+    delta = event.get("delta")
+    if isinstance(delta, Mapping):
+        content = delta.get("content") or delta.get("text_delta") or delta.get("text")
+        text = _llm_content_to_text(content)
+        if text:
+            return text
+    content = event.get("content") or event.get("text_delta") or event.get("text")
+    return _llm_content_to_text(content)
+
+
+def _llm_stream_event_result(event: Any) -> Mapping[str, Any] | None:
+    if not isinstance(event, Mapping):
+        return None
+    event_type = str(event.get("type") or event.get("event") or "").strip().lower()
+    result = event.get("result")
+    if isinstance(result, Mapping):
+        normalised = dict(result)
+        content = _llm_content_to_text(
+            normalised.get("content")
+            or normalised.get("text")
+            or normalised.get("output_text")
+            or normalised.get("message")
+        )
+        if content:
+            normalised["content"] = content
+        return normalised
+    if event_type in {"completed", "complete", "done"}:
+        content = _llm_content_to_text(event.get("content") or event.get("message"))
+        if content:
+            return {"content": content}
+        return {}
+    return None
+
+
+def _llm_content_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "output_text"):
+            text = _llm_content_to_text(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "".join(_llm_content_to_text(item) for item in value)
+    return str(value)
+
+
+def _is_transient_llm_stream_error(exc: Exception) -> bool:
+    if bool(getattr(exc, "is_transient", False)):
+        return True
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if error_code in _TRANSIENT_LLM_ERROR_CODES:
+        return True
+    detail = str(getattr(exc, "detail", "") or exc).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "incomplete chunked read",
+            "peer closed connection",
+            "stream_heartbeat_timeout",
+            "readtimeout",
+            "connection reset",
+            "transport error",
+        )
+    )
+
+
 def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
+    profile = str(contract.length_profile or "").strip().lower()
+    profile_enum = [profile] if profile in {"short", "medium", "long"} else ["short", "medium", "long"]
     return {
         # LangChain uses the title as the structured-output function name;
         # a title-less dict schema is rejected by with_structured_output.
-        "title": "report_outline_plan",
+        "title": "document_outline_plan",
         "type": "object",
         "additionalProperties": False,
         "required": ["length_profile", "sections"],
         "properties": {
             "length_profile": {
                 "type": "string",
-                "enum": ["short", "medium", "long"],
+                "enum": profile_enum,
             },
             "sections": {
                 "type": "array",
-                "minItems": contract.min_outline_sections,
-                "maxItems": contract.max_outline_sections,
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -819,6 +1814,58 @@ def _json_block(value: Any, *, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _section_plan_from_mapping(value: Any) -> SectionPlan | None:
+    raw = _mapping(value)
+    section_id = str(raw.get("section_id") or "").strip()
+    title = str(raw.get("title") or "").strip()
+    if not section_id or not title:
+        return None
+    return SectionPlan(
+        section_id=section_id,
+        title=title,
+        objective=str(raw.get("objective") or ""),
+        evidence_query=str(raw.get("evidence_query") or ""),
+        min_words=_positive_int(raw.get("min_words"), 1),
+    )
+
+
+def _section_plans_from_resume_state(
+    state: Mapping[str, Any],
+) -> tuple[SectionPlan, ...]:
+    raw_outline = state.get("outline")
+    if not isinstance(raw_outline, list):
+        return ()
+    plans = [
+        plan
+        for item in raw_outline
+        if (plan := _section_plan_from_mapping(item)) is not None
+    ]
+    return tuple(plans)
+
+
+def _draft_resume_record(draft: SectionDraft) -> dict[str, Any]:
+    return {
+        "plan": asdict(draft.plan),
+        "artifact_ref": dict(draft.artifact_ref),
+        "quality": dict(draft.quality),
+    }
+
+
+def _artifact_id_from_ref(ref: Mapping[str, Any]) -> str:
+    for key in ("artifact_id", "id"):
+        value = str(ref.get(key) or "").strip()
+        if value:
+            return value
+    artifact_ref = str(ref.get("artifact_ref") or ref.get("ref") or "").strip()
+    if artifact_ref.startswith("artifact://"):
+        return artifact_ref.removeprefix("artifact://").strip()
+    return artifact_ref
+
+
 def _slug(value: Any, *, fallback: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
     return slug[:80] or fallback
@@ -840,6 +1887,14 @@ def _int(value: Any, default: int) -> int:
 
 def _positive_int(value: Any, default: int) -> int:
     parsed = _int(value, default)
+    return parsed if parsed >= 0 else default
+
+
+def _non_negative_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
     return parsed if parsed >= 0 else default
 
 
@@ -867,3 +1922,27 @@ def _ratio(value: Any, default: float) -> float:
     if parsed < 0:
         return default
     return min(parsed, 1.0)
+
+
+def _gate_enforcement(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in _GATE_ENFORCEMENT_MODES else _GATE_ENFORCEMENT_DEGRADE
+
+
+def _append_quality_gap_note(markdown: str, soft_failures: tuple[str, ...]) -> str:
+    """Append an explicit, reader-visible gap marker to a degraded section.
+
+    Keeps the deliverable honest: the section is recorded best-effort, but the
+    unmet quality dimensions are surfaced so downstream readers (and the merge
+    step) treat the affected claims as provisional rather than confirmed.
+    """
+    text = str(markdown or "").rstrip()
+    if not soft_failures:
+        return text
+    reasons = ", ".join(soft_failures)
+    note = (
+        "\n\n> **Evidence gap (auto-flagged):** this section did not meet the "
+        f"full quality bar ({reasons}). Treat the affected claims as "
+        "provisional pending stronger evidence."
+    )
+    return f"{text}{note}"

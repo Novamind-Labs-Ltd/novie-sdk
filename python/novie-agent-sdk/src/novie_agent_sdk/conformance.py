@@ -70,7 +70,7 @@ _log = logging.getLogger(__name__)
 # ── Compatibility matrix ────────────────────────────────────────────────────
 
 
-SDK_VERSION = "0.3.0"
+SDK_VERSION = "0.3.15"
 MANIFEST_SCHEMA_VERSION = "v2"
 PLATFORM_PROTOCOL_VERSION = "v2"
 SUPPORTED_AGENT_KINDS: tuple[str, ...] = (

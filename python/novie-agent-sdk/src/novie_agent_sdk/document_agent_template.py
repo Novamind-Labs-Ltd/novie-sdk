@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import HumanMessage
 from novie_protocol.agents import AgentStreamEvent
 
 from .context_budget import (
@@ -264,6 +263,14 @@ class DocumentAgentTemplate:
         extract_values_text: Callable[[Any], str] | None = None,
     ) -> AsyncIterator[AgentStreamEvent | DocumentGraphStreamResult]:
         """Drive a LangGraph/DeepAgents stream into content events and result."""
+        try:
+            from langchain_core.messages import HumanMessage
+        except ImportError as exc:
+            raise RuntimeError(
+                "langchain-core is required for DocumentAgentTemplate.stream_graph_run. "
+                "Install novie-agent-sdk with the agent's LangChain dependencies."
+            ) from exc
+
         run_input = {"messages": [HumanMessage(content=prompt)]}
         narrative_parts: list[str] = []
         last_messages: list[Any] = []

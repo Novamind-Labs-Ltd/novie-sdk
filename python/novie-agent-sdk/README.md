@@ -44,6 +44,17 @@ if __name__ == "__main__":
 `Agent.serve()` hosts health, manifest, invoke/stream/tasks endpoints when FastAPI
 is installed.
 
+## SDK responsibility
+
+The SDK is the platform access layer for external agents. It helps any agent type
+expose an A2A-compatible runtime, report lifecycle/progress/workpad/artifact
+state, and call platform-owned capabilities such as LLM, search, artifacts,
+checkpoints, knowledge, and future tool namespaces.
+
+Agent packages own their domain workflow, prompts, skills, artifact taxonomy, and
+business-specific fallback policy. SDK modules should stay generic unless the
+specific behavior is supplied by an agent or skill runtime contract.
+
 ## Project brief injection
 
 ```python
@@ -69,7 +80,7 @@ behaviour, put structured policy in `contract.yaml` next to the skill:
 
 ```yaml
 version: 1
-name: report-synthesis
+name: document-authoring
 runtime:
   strategy: sectioned_longform
   context_policy: evidence_pack_v1
@@ -90,9 +101,9 @@ document:
   final:
     min_retention_ratio: 0.8
 artifacts:
-  outline_type: management_report.outline
-  section_type: management_report.section
-  final_type: management_report
+  outline_type: document.outline
+  section_type: document.section
+  final_type: document
 workpad:
   record_outline_ref: true
   record_section_refs: true
@@ -106,7 +117,7 @@ from novie_agent_sdk import SkillContractResolver
 
 resolver = SkillContractResolver(root_dir="/app/my-agent")
 contract = resolver.resolve(
-    ["/skills/shared/", "/skills/report_synthesis/"],
+    ["/skills/shared/", "/skills/document_authoring/"],
     required=True,
 )
 
@@ -137,13 +148,13 @@ from novie_agent_sdk import (
 author = SectionedLongformAuthor(
     llm_facade=llm_facade,
     platform=platform_ns,
-    artifact_type="management_report",
+    artifact_type="document",
     step_id=step_id,
     capability_id=capability_id,
     context_budget=context_budget,
     authoring_contract=sectioned_authoring_contract_from_skill(
         contract,
-        artifact_type="management_report",
+        artifact_type="document",
     ),
 )
 result = await author.author(
@@ -151,7 +162,7 @@ result = await author.author(
     upstream=upstream,
     workflow_id=ctx.workflow_id,
     thread_id=ctx.thread_id,
-    agent_id="analyst",
+    agent_id="writer",
 )
 ```
 
@@ -259,8 +270,8 @@ Use `strict=True` when the artifact and workpad entry are part of the same
 durable authoring ledger. In strict mode, `create_and_record` raises if artifact
 creation or workpad ref recording fails, instead of returning a partial result.
 
-`EvidencePackBuilder` remains available as a backwards-compatible alias for
-research/analyst agents. New generic agents should prefer `ContextPackBuilder`.
+`EvidencePackBuilder` remains available as a backwards-compatible alias for older
+agent packages. New agents should prefer `ContextPackBuilder`.
 
 ## Observability and usage
 

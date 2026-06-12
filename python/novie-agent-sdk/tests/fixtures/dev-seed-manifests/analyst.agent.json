@@ -464,7 +464,7 @@
         "report synthesis"
       ],
       "idempotent": true,
-      "expected_duration_class": "<1min",
+      "expected_duration_class": ">1h",
       "consumes": [
         "task_brief"
       ],
@@ -566,8 +566,8 @@
   "protocol_mode": "stream",
   "endpoint": "http://analyst:8010",
   "execution": {
-    "expected_duration_seconds": 180,
-    "max_duration_seconds": 3600,
+    "expected_duration_seconds": 3600,
+    "max_duration_seconds": 14400,
     "idempotent": false,
     "supports_cancel": false,
     "supports_resume": false,

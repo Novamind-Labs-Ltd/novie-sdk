@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .skill_contracts import SkillContractError, SkillRuntimeContract
+
 _log = logging.getLogger(__name__)
 
 _MATERIALIZED_SKILL_SOURCE = "/skills/"
@@ -82,11 +84,27 @@ def build_deep_agent_executor(
     middleware: Sequence[Any] = (),
     subagents: Sequence[Any] | None = None,
     native_skill_loading: bool = False,
+    strict_skills: bool = False,
+    skill_contract: SkillRuntimeContract | None = None,
     cache_namespace: str = "novie-document-agent",
 ) -> Any:
     """Build a DeepAgents executor for one bounded document capability scope."""
     from deepagents import create_deep_agent  # type: ignore[import-untyped]
     from deepagents.backends.filesystem import FilesystemBackend  # type: ignore[import-untyped]
+
+    if strict_skills:
+        if not skill_sources:
+            raise SkillContractError("strict DeepAgents runtime requires skill_sources")
+        if skill_contract is None or skill_contract.is_empty:
+            raise SkillContractError("strict DeepAgents runtime requires a skill contract")
+        native_skill_loading = True
+
+    if skill_contract is not None and not skill_contract.is_empty:
+        _validate_required_tools(
+            tools,
+            required_tools=skill_contract.required_tools,
+            subagents=skill_contract.subagents,
+        )
 
     if native_skill_loading and skill_sources:
         collection_root, deepagent_skill_sources = materialize_skill_collection(
@@ -112,6 +130,31 @@ def build_deep_agent_executor(
         subagents=list(subagents or ()),
         middleware=tuple(middleware),
     )
+
+
+def _validate_required_tools(
+    tools: Sequence[Any],
+    *,
+    required_tools: Sequence[str],
+    subagents: Sequence[Any],
+) -> None:
+    available = {str(getattr(tool, "name", "") or "") for tool in tools}
+    missing = [name for name in required_tools if name and name not in available]
+    for subagent in subagents:
+        raw_tools = getattr(subagent, "tools", ())
+        for name in raw_tools:
+            if name and name not in available:
+                missing.append(f"{getattr(subagent, 'name', 'subagent')}:{name}")
+        raw_skills = getattr(subagent, "skills", ())
+        for source in raw_skills:
+            if str(source or "").strip():
+                continue
+            missing.append(f"{getattr(subagent, 'name', 'subagent')}:empty_skill")
+    if missing:
+        raise SkillContractError(
+            "strict DeepAgents runtime missing required tools/skills: "
+            + ", ".join(dict.fromkeys(missing))
+        )
 
 
 __all__ = [
