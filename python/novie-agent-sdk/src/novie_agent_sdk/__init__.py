@@ -190,6 +190,7 @@ from .runtime_config import (
 )
 from .deliverables import bounded_handoff_output, markdown_deliverable_output
 from .document_final import (
+    build_document_deliverable_event,
     capability_provides_artifacts,
     document_final_event,
     document_final_output,
@@ -262,7 +263,9 @@ from .context_budget import (
 from .document_capabilities import (
     DocumentAgentInput,
     DocumentCapabilitySpec,
+    DocumentRuntimeProfile,
     resolve_document_agent_input,
+    resolve_document_runtime_profile,
 )
 from .document_plan import (
     CoverageReview,
@@ -473,6 +476,7 @@ __all__ = [
     "is_upstream_handoff",
     "bounded_handoff_output",
     "markdown_deliverable_output",
+    "build_document_deliverable_event",
     "capability_provides_artifacts",
     "document_final_event",
     "document_final_output",
@@ -522,7 +526,9 @@ __all__ = [
     "wall_clock_deadline",
     "DocumentAgentInput",
     "DocumentCapabilitySpec",
+    "DocumentRuntimeProfile",
     "resolve_document_agent_input",
+    "resolve_document_runtime_profile",
     "CoverageReview",
     "CoverageStatus",
     "DocumentDepth",

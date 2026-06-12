@@ -129,7 +129,174 @@ def document_final_event(
     )
 
 
+def _dump_model(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        return dict(dumped) if isinstance(dumped, Mapping) else {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def build_document_deliverable_event(
+    *,
+    card: AgentCard | None,
+    structured: Any,
+    artifact_type: str,
+    artifact_family: str,
+    capability_id: str | None,
+    analysis: str,
+    narrative: str,
+    final_payload_type: type[Any],
+    recovery_type: type[Any],
+    mode_key: str | None = None,
+    mode: str | None = None,
+    phase_key: str | None = None,
+    phase: str | None = None,
+    plan_id: str | None = None,
+    finalize_strategy: str = "native",
+    finalize_attempts: int = 1,
+    degraded_flags: Iterable[str] | None = None,
+    checkpoint_id: str = "",
+    resumed_from_checkpoint: bool = False,
+    fallback_used: bool = False,
+    fallback_reason: str = "",
+    quality: Mapping[str, Any] | None = None,
+    budget_summary: Mapping[str, Any] | None = None,
+    authoring_ledger: Mapping[str, Any] | None = None,
+    skill_contract: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    payload_metadata: Mapping[str, Any] | None = None,
+    recovery_metadata_extra: Mapping[str, Any] | None = None,
+    output_extra: Mapping[str, Any] | None = None,
+    title: str | None = None,
+    authoring_strategy: str = "sectioned_longform",
+) -> AgentStreamEvent:
+    """Build the standard final deliverable event for document agents.
+
+    Agent code still owns analysis rendering and domain payload classes. This
+    helper owns the repeated envelope: recovery, final_payload,
+    provides_artifacts, metadata, and the final ``AgentStreamEvent``.
+    """
+    structured_dump = _dump_model(structured)
+    flags = [str(flag) for flag in degraded_flags or () if str(flag)]
+    common_metadata: dict[str, Any] = {
+        "artifact_type": artifact_type,
+        "artifact_family": artifact_family,
+        **({mode_key: mode} if mode_key and mode is not None else {}),
+        **({phase_key: phase} if phase_key and phase is not None else {}),
+        **({"capability_id": capability_id} if capability_id else {}),
+        "finalize_strategy": finalize_strategy,
+        "finalize_attempts": max(1, int(finalize_attempts or 1)),
+    }
+    event_metadata = {**common_metadata, **dict(metadata or {})}
+    if fallback_used:
+        event_metadata["delivery_mode"] = "non_stream_fallback"
+    if checkpoint_id:
+        event_metadata["checkpoint_id"] = checkpoint_id
+    if resumed_from_checkpoint:
+        event_metadata["resumed_from_checkpoint"] = True
+    if budget_summary:
+        event_metadata["budget_summary"] = dict(budget_summary)
+    if flags:
+        event_metadata["degraded_flags"] = list(flags)
+    if quality:
+        event_metadata["quality"] = dict(quality)
+    if authoring_ledger:
+        event_metadata["authoring_strategy"] = authoring_strategy
+        event_metadata["authoring_ledger"] = dict(authoring_ledger)
+    if skill_contract:
+        event_metadata["skill_contract"] = dict(skill_contract)
+
+    recovery_metadata = {
+        "finalize_strategy": finalize_strategy,
+        **(
+            {"authoring_ledger": dict(authoring_ledger)}
+            if authoring_ledger
+            else {}
+        ),
+        **({"quality": dict(quality)} if quality else {}),
+        **({"budget_summary": dict(budget_summary)} if budget_summary else {}),
+        **dict(recovery_metadata_extra or {}),
+    }
+    recovery = recovery_type(
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        resumed_from_checkpoint=resumed_from_checkpoint,
+        checkpoint_id=checkpoint_id,
+        finalize_attempts=max(1, int(finalize_attempts or 1)),
+        metadata=recovery_metadata,
+    )
+
+    final_payload_metadata = {
+        "narrative_preview": narrative[:500] if narrative else "",
+        "artifact_type": artifact_type,
+        "artifact_family": artifact_family,
+        **({mode_key: mode} if mode_key and mode is not None else {}),
+        **({phase_key: phase} if phase_key and phase is not None else {}),
+        **({"quality": dict(quality)} if quality else {}),
+        **(
+            {
+                "authoring_strategy": authoring_strategy,
+                "authoring_ledger": dict(authoring_ledger),
+            }
+            if authoring_ledger
+            else {}
+        ),
+        **({"checkpoint_id": checkpoint_id} if checkpoint_id else {}),
+        **({"budget_summary": dict(budget_summary)} if budget_summary else {}),
+        **dict(payload_metadata or {}),
+    }
+    final_payload = final_payload_type(
+        plan_id=plan_id or capability_id or artifact_type,
+        final_markdown=analysis,
+        structured_output=structured_dump,
+        degraded_flags=list(flags),
+        recovery=recovery,
+        metadata=final_payload_metadata,
+    )
+
+    output = document_final_output(
+        artifact_type=artifact_type,
+        artifact_family=artifact_family,
+        capability_id=capability_id or "",
+        analysis=analysis,
+        narrative=narrative,
+        structured_output=structured_dump,
+        final_payload=_dump_model(final_payload),
+        card=card,
+        mode_key=mode_key,
+        mode=mode,
+        phase_key=phase_key,
+        phase=phase,
+        checkpoint_id=checkpoint_id,
+        budget_summary=budget_summary,
+        degraded_flags=flags,
+        quality=quality,
+        resumed_from_checkpoint=resumed_from_checkpoint,
+        extra=output_extra,
+    )
+    output.update(
+        {
+            "kind": "document_deliverable",
+            "title": str(
+                title
+                or structured_dump.get("summary")
+                or capability_id
+                or "Final Deliverable"
+            )[:120],
+            "final_markdown": analysis,
+            "content": analysis,
+            "authoring_strategy": authoring_strategy,
+        }
+    )
+    if authoring_ledger:
+        output["authoring_ledger"] = dict(authoring_ledger)
+    return document_final_event(output=output, metadata=event_metadata)
+
+
 __all__ = [
+    "build_document_deliverable_event",
     "capability_provides_artifacts",
     "document_final_event",
     "document_final_output",

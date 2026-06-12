@@ -4,15 +4,19 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
+from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
     DocumentAgentTemplate,
     DocumentCapabilitySpec,
+    build_document_deliverable_event,
     external_agent_checkpoint_service,
     put_external_agent_checkpoint,
     compile_skill_scope,
     resolve_document_agent_input,
+    resolve_document_runtime_profile,
 )
 
 
@@ -103,6 +107,125 @@ def test_resolve_document_agent_input_hides_upstream_when_access_is_none(tmp_pat
 
     assert resolved.upstream == {}
     assert resolved.uses_upstream_summary is False
+
+
+def test_resolve_document_runtime_profile_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="demo capability_id is required"):
+        resolve_document_runtime_profile(
+            agent_name="demo",
+            inputs={},
+            resolve_capability=lambda _capability_id: None,
+        )
+
+    with pytest.raises(RuntimeError, match="unknown demo capability_id"):
+        resolve_document_runtime_profile(
+            agent_name="demo",
+            capability_id="agent.demo.unknown",
+            resolve_capability=lambda _capability_id: None,
+        )
+
+
+def test_resolve_document_runtime_profile_loads_required_skill_contract(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / "demo" / "write"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: demo-write
+metadata:
+  novie:
+    runtime_contract:
+      version: 1
+      runtime:
+        strategy: sectioned_longform
+---
+
+# Demo Write
+""",
+        encoding="utf-8",
+    )
+    spec = DocumentCapabilitySpec(
+        capability_id="agent.demo.write",
+        skill_sources=["/skills/demo/write/"],
+        mode="write",
+        phase="default",
+        artifact_type="demo_document",
+        artifact_family="demo",
+        package_root=tmp_path,
+    )
+
+    profile = resolve_document_runtime_profile(
+        agent_name="demo",
+        capability_id="agent.demo.write",
+        resolve_capability=lambda _capability_id: spec,
+        require_skill_contract=True,
+    )
+
+    assert profile.capability_id == "agent.demo.write"
+    assert profile.mode == "write"
+    assert profile.artifact_family == "demo"
+    assert profile.skill_contract is not None
+    assert profile.skill_contract.strategy == "sectioned_longform"
+
+
+class _Recovery(BaseModel):
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    resumed_from_checkpoint: bool = False
+    checkpoint_id: str = ""
+    finalize_attempts: int = Field(default=1, ge=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class _FinalPayload(BaseModel):
+    plan_id: str
+    final_markdown: str
+    structured_output: dict[str, Any] = Field(default_factory=dict)
+    degraded_flags: list[str] = Field(default_factory=list)
+    recovery: _Recovery = Field(default_factory=_Recovery)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class _Structured(BaseModel):
+    summary: str
+
+
+def test_build_document_deliverable_event_builds_common_envelope() -> None:
+    event = build_document_deliverable_event(
+        card=None,
+        structured=_Structured(summary="Demo"),
+        artifact_type="demo_document",
+        artifact_family="demo",
+        capability_id="agent.demo.write",
+        analysis="# Demo",
+        narrative="Draft narrative",
+        final_payload_type=_FinalPayload,
+        recovery_type=_Recovery,
+        mode_key="demo_mode",
+        mode="write",
+        phase_key="demo_phase",
+        phase="default",
+        finalize_strategy="sectioned_longform",
+        finalize_attempts=2,
+        degraded_flags=["tool.degraded"],
+        checkpoint_id="ckpt-1",
+        quality={"quality_status": "skipped"},
+        authoring_ledger={"sections": 3},
+        skill_contract={"strategy": "sectioned_longform"},
+    )
+
+    assert event.kind == "final"
+    assert event.output["kind"] == "document_deliverable"
+    assert event.output["analysis"] == "# Demo"
+    assert event.output["final_markdown"] == "# Demo"
+    assert event.output["demo_mode"] == "write"
+    payload = event.output["final_payload"]
+    assert payload["plan_id"] == "agent.demo.write"
+    assert payload["recovery"]["checkpoint_id"] == "ckpt-1"
+    assert payload["recovery"]["finalize_attempts"] == 2
+    assert payload["recovery"]["metadata"]["authoring_ledger"] == {"sections": 3}
+    assert event.metadata["skill_contract"] == {"strategy": "sectioned_longform"}
 
 
 def test_document_agent_template_streams_graph_content_and_result() -> None:
