@@ -10,7 +10,10 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
+from novie_protocol.agents import AgentStreamEvent
+
 from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
+from .document_quality import DocumentQualityLoopResult, skipped_quality_result
 from .skill_contracts import SkillRuntimeContract
 
 _SECTIONED_AUTHORING_ENV = "NOVIE_SECTIONED_AUTHORING_V2"
@@ -209,6 +212,22 @@ class SectionedAuthoringResult:
     ledger: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class SectionedDocumentFinalizationResult:
+    """Output of the high-level sectioned finalization runner."""
+
+    authoring_result: SectionedAuthoringResult
+    quality_result: DocumentQualityLoopResult
+    started_event: AgentStreamEvent
+    completed_event: AgentStreamEvent
+    finalize_strategy: str = "sectioned_longform"
+    finalize_attempts: int = 1
+
+    @property
+    def authoring_ledger(self) -> dict[str, Any]:
+        return dict(self.authoring_result.ledger)
+
+
 def sectioned_authoring_enabled(
     env: Mapping[str, str] | None = None,
     *,
@@ -234,6 +253,147 @@ def sectioned_authoring_enabled(
         if raw in _FALSY_ENV_VALUES:
             return False
     return True
+
+
+def platform_namespace_from_llm_facade(llm_facade: Any | None) -> Any | None:
+    """Return the platform namespace exposed by an SDK LLM facade."""
+    if llm_facade is None:
+        return None
+    platform_ns = getattr(llm_facade, "platform_ns", None)
+    if platform_ns is None:
+        platform_ns = getattr(llm_facade, "_platform_ns", None)
+    if platform_ns is not None:
+        return platform_ns
+    if getattr(llm_facade, "artifacts", None) is not None:
+        return llm_facade
+    return None
+
+
+async def run_sectioned_document_finalization(
+    *,
+    llm_facade: Any | None,
+    skill_contract: SkillRuntimeContract | None,
+    artifact_type: str,
+    step_id: str,
+    capability_id: str,
+    context_budget: Mapping[str, Any],
+    brief: Mapping[str, Any],
+    upstream: Mapping[str, Any],
+    workflow_id: str | None = None,
+    thread_id: str | None = None,
+    agent_id: str | None = None,
+    mode_metadata: Mapping[str, Any] | None = None,
+    draft_narrative: str = "",
+    draft_narrative_key: str = "",
+    draft_narrative_artifact_type: str = "",
+    draft_narrative_summary: str = "",
+    document_input: Mapping[str, Any] | None = None,
+    agent_disabled_env_var: str | None = None,
+    agent_enabled_env_var: str | None = None,
+    required_strategy: str = "sectioned_longform",
+    quality_reason: str = "sectioned_authoring_quality_gates",
+    quality_metadata: Mapping[str, Any] | None = None,
+) -> SectionedDocumentFinalizationResult:
+    """Run sectioned longform finalization for document agents.
+
+    This is intentionally a coarse runner: agents still own the graph, prompt,
+    structured artifact construction, and final event envelope. The SDK owns
+    the repeated sectioned-authoring checks, author construction, trace
+    metadata, and skipped-quality result wiring.
+    """
+    if skill_contract is None or skill_contract.is_empty:
+        raise RuntimeError(
+            "sectioned_authoring_required: document finalization requires "
+            "a skill runtime contract"
+        )
+    if skill_contract.strategy != required_strategy:
+        raise RuntimeError(
+            "sectioned_authoring_required: document finalization requires "
+            f"runtime.strategy={required_strategy} skill contracts"
+        )
+    if not sectioned_authoring_enabled(
+        agent_disabled_env_var=agent_disabled_env_var,
+        agent_enabled_env_var=agent_enabled_env_var,
+    ):
+        raise RuntimeError("sectioned_authoring_disabled")
+    if llm_facade is None:
+        raise RuntimeError("sectioned_authoring_llm_unavailable")
+    platform_ns = platform_namespace_from_llm_facade(llm_facade)
+    if platform_ns is None:
+        raise RuntimeError("sectioned_authoring_platform_namespace_unavailable")
+
+    mode_meta = dict(mode_metadata or {})
+    started_event = AgentStreamEvent(
+        kind="trace",
+        metadata={
+            "event": "sectioned_authoring_started",
+            "runtime_phase": "sectioned_authoring",
+            "semantic_phase": "finalizing_output",
+            **mode_meta,
+            "capability_id": capability_id,
+            "authoring_strategy": required_strategy,
+            "skill_contract": skill_contract.to_metadata(),
+        },
+    )
+    author = SectionedLongformAuthor(
+        llm_facade=llm_facade,
+        platform=platform_ns,
+        artifact_type=artifact_type,
+        step_id=step_id or "",
+        capability_id=capability_id,
+        context_budget=dict(context_budget),
+        authoring_contract=sectioned_authoring_contract_from_skill(
+            skill_contract,
+            artifact_type=artifact_type,
+        ),
+    )
+    authoring_upstream: dict[str, Any] = dict(upstream)
+    if draft_narrative_key:
+        authoring_upstream[draft_narrative_key] = {
+            "artifact_type": draft_narrative_artifact_type or draft_narrative_key,
+            "summary": draft_narrative_summary,
+            "content": draft_narrative,
+        }
+    if document_input:
+        authoring_upstream["_document_input"] = dict(document_input)
+
+    authoring_result = await author.author(
+        brief=brief,
+        upstream=authoring_upstream,
+        workflow_id=workflow_id,
+        thread_id=thread_id,
+        agent_id=agent_id,
+    )
+    completed_event = AgentStreamEvent(
+        kind="trace",
+        metadata={
+            "event": "sectioned_authoring_completed",
+            "runtime_phase": "sectioned_authoring",
+            "semantic_phase": "finalizing_output",
+            **mode_meta,
+            "capability_id": capability_id,
+            "finalize_strategy": required_strategy,
+            "section_count": len(authoring_result.drafts),
+            "authoring_ledger": dict(authoring_result.ledger),
+        },
+    )
+    quality_result = skipped_quality_result(
+        authoring_result.markdown,
+        reason=quality_reason,
+        metadata={
+            **dict(quality_metadata or {}),
+            "section_count": len(authoring_result.drafts),
+            "authoring_ledger": dict(authoring_result.ledger),
+        },
+    )
+    return SectionedDocumentFinalizationResult(
+        authoring_result=authoring_result,
+        quality_result=quality_result,
+        started_event=started_event,
+        completed_event=completed_event,
+        finalize_strategy=required_strategy,
+        finalize_attempts=1,
+    )
 
 
 def sectioned_authoring_contract_from_skill(

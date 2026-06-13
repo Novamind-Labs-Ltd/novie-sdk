@@ -8,6 +8,7 @@ from novie_agent_sdk import (
     PlatformLlmCallError,
     SectionedLongformAuthor,
     SkillContractResolver,
+    run_sectioned_document_finalization,
     sectioned_authoring_contract_from_skill,
 )
 from novie_agent_sdk.sectioned_authoring import (
@@ -409,6 +410,91 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         event["event"] == "agent.tool_result" and event.get("tool_name") == "artifact.write"
         for event in phase_events
     )
+
+
+@pytest.mark.asyncio
+async def test_run_sectioned_document_finalization_returns_trace_and_quality(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    skill = tmp_path / "skills" / "report"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: report
+metadata:
+  novie:
+    runtime_contract:
+      version: 1
+      runtime:
+        strategy: sectioned_longform
+      document:
+        outline:
+          min_sections: 2
+          max_sections: 2
+        section:
+          min_units: 5
+          default_units: 5
+          max_units: 20
+        final:
+          min_retention_ratio: 0.8
+---
+
+# Report
+""",
+        encoding="utf-8",
+    )
+    contract = SkillContractResolver(root_dir=tmp_path).resolve(
+        ["skills/report"],
+        required=True,
+    )
+
+    llm = _FakeLlm()
+    llm.platform_ns = _FakePlatform()
+
+    result = await run_sectioned_document_finalization(
+        llm_facade=llm,
+        skill_contract=contract,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        context_budget={},
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+        mode_metadata={"example_mode": "write", "example_phase": "default"},
+        draft_narrative="Draft narrative.",
+        draft_narrative_key="_draft_narrative",
+        draft_narrative_artifact_type="draft_narrative",
+        draft_narrative_summary="Draft before final authoring.",
+        document_input={"artifact_access": "summary_then_fetch"},
+    )
+
+    assert "## Context" in result.authoring_result.markdown
+    assert result.finalize_strategy == "sectioned_longform"
+    assert result.finalize_attempts == 1
+    assert result.quality_result.outcome.status == "skipped"
+    assert result.started_event.metadata["event"] == "sectioned_authoring_started"
+    assert result.started_event.metadata["example_mode"] == "write"
+    assert result.completed_event.metadata["event"] == "sectioned_authoring_completed"
+    assert result.completed_event.metadata["section_count"] == 2
+    assert result.authoring_ledger["section_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_sectioned_document_finalization_requires_sectioned_contract() -> None:
+    with pytest.raises(RuntimeError, match="skill runtime contract"):
+        await run_sectioned_document_finalization(
+            llm_facade=_FakeLlm(),
+            skill_contract=None,
+            artifact_type="example_document",
+            step_id="s2",
+            capability_id="agent.example.write_document",
+            context_budget={},
+            brief={"title": "Example document"},
+            upstream={},
+        )
 
 
 @pytest.mark.asyncio
