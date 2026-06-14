@@ -101,6 +101,17 @@ class TestPlatformMode:
         assert kwargs["method"] == "json_schema"
         assert kwargs["strict"] is True
 
+    def test_structured_forwards_timeout_to_platform(self) -> None:
+        ns = _make_available_platform_ns(responses={"structured": {"structured": {"a": 1}}})
+        facade = LlmFacade(ns)
+        _run(facade.structured(
+            [{"role": "user", "content": "extract"}],
+            {"type": "object", "properties": {"a": {"type": "integer"}}},
+            timeout_seconds=240,
+        ))
+        kwargs = ns.llm.structured.await_args.kwargs
+        assert kwargs["timeout_seconds"] == 240
+
     def test_structured_omits_method_strict_when_unspecified(self) -> None:
         # Defaults stay ``None`` so the platform side picks its own defaults;
         # this preserves backwards compatibility with older platform builds

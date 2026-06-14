@@ -31,6 +31,7 @@ import pytest
 from novie_agent_sdk import (
     CapabilityCallDiagnostics,
     PlatformLlmCallError,
+    PlatformLlmTimeoutError,
     PlatformLlmTransportError,
     PlatformNamespace,
     QuotaExceededError,
@@ -756,8 +757,62 @@ async def test_llm_structured_raises_transport_error_instead_of_returning_empty(
             output_schema={"type": "object", "required": ["summary"]},
         )
     assert excinfo.value.capability_id == "platform.llm.structured"
-    assert excinfo.value.kind == "transport_error"
+    assert excinfo.value.kind == "timeout"
     assert excinfo.value.is_transient is True
+
+
+@pytest.mark.asyncio
+async def test_llm_structured_preserves_platform_timeout_envelope() -> None:
+    envelope = {
+        "kind": "timeout",
+        "capability_id": "platform.llm.structured",
+        "model": "openai/gpt-5.4",
+        "phase": "structured_output",
+        "timeout_seconds": 120,
+        "retryable": True,
+        "reason_code": "platform_llm_structured_timeout",
+        "raw_detail": "ReadTimeout",
+    }
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "denied",
+                "error_code": "platform_llm_structured_timeout",
+                "explanation": "structured timed out",
+                "metadata": {"error_envelope": envelope},
+            },
+        )
+
+    ns = _build_with_responder(responder)
+    with pytest.raises(PlatformLlmTimeoutError) as excinfo:
+        await ns.llm.structured(
+            [{"role": "user", "content": "hi"}],
+            output_schema={"type": "object"},
+        )
+    assert excinfo.value.reason_code == "platform_llm_structured_timeout"
+    assert excinfo.value.timeout_seconds == 120
+    assert excinfo.value.error_envelope["model"] == "openai/gpt-5.4"
+    assert excinfo.value.is_transient is True
+
+
+@pytest.mark.asyncio
+async def test_llm_structured_forwards_per_call_timeout() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body["arguments"])
+        return httpx.Response(200, json=_ok_envelope({"structured": {"ok": True}}))
+
+    ns = _build_with_responder(responder)
+    await ns.llm.structured(
+        [{"role": "user", "content": "hi"}],
+        output_schema={"type": "object"},
+        timeout_seconds=240,
+    )
+    assert captured["timeout_seconds"] == 240.0
 
 
 @pytest.mark.asyncio

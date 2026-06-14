@@ -19,16 +19,13 @@ not instantiate it directly.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .byok_llm import ByokLlmClient
     from .platform_namespace import (
-        LlmNamespace,
         PlatformNamespace,
-        QuotaExceededError,
         _UnavailablePlatformNamespace,
     )
 
@@ -183,8 +180,10 @@ class LlmFacade:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         method: str | None = None,
         strict: bool | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Invoke the LLM with a JSON-schema structured output contract.
 
@@ -210,8 +209,10 @@ class LlmFacade:
                 output_schema,
                 model=model,
                 temperature=temperature,
+                max_output_tokens=max_output_tokens,
                 method=method,
                 strict=strict,
+                timeout_seconds=timeout_seconds,
             )
             return {**result, "llm_mode": "platform"}
 
@@ -221,6 +222,7 @@ class LlmFacade:
                 output_schema,
                 model=model,
                 temperature=temperature,
+                max_output_tokens=max_output_tokens,
                 method=method,
                 strict=strict,
             )

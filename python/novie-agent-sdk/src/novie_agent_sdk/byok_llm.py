@@ -21,6 +21,7 @@ Requires ``langchain_openai`` (``pip install langchain-openai``).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -195,8 +196,10 @@ class ByokLlmClient:
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_output_tokens: int | None = None,
         method: str | None = None,
         strict: bool | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Structured JSON-schema output using the agent's own key.
 
@@ -224,14 +227,22 @@ class ByokLlmClient:
                 return AIMessage(content=content)
             return HumanMessage(content=content)
 
-        llm = self._build_chat_model(model=model, temperature=temperature)
+        llm = self._build_chat_model(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         structured_kwargs: dict[str, Any] = {}
         if method is not None:
             structured_kwargs["method"] = method
         if strict is not None:
             structured_kwargs["strict"] = strict
         structured_llm = llm.with_structured_output(output_schema, **structured_kwargs)
-        response = await structured_llm.ainvoke([_to_msg(m) for m in messages])
+        invocation = structured_llm.ainvoke([_to_msg(m) for m in messages])
+        if timeout_seconds is not None:
+            response = await asyncio.wait_for(invocation, timeout=float(timeout_seconds))
+        else:
+            response = await invocation
         if hasattr(response, "model_dump"):
             value = response.model_dump()
         elif isinstance(response, dict):

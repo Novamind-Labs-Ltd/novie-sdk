@@ -69,6 +69,10 @@ _log = logging.getLogger(__name__)
 DegradationKind = Literal[
     "binding_denied",
     "transport_error",
+    "timeout",
+    "provider_error",
+    "schema_error",
+    "quota_error",
     "platform_unavailable",
     "schema_violation",
     "no_results",
@@ -127,17 +131,31 @@ class CapabilityCallDiagnostics:
     kind: DegradationKind | None = None
     error_code: str = ""
     detail: str = ""
+    error_envelope: dict[str, Any] | None = None
+    retryable: bool | None = None
+    timeout_seconds: float | None = None
+    provider_status_code: int | None = None
+    raw_detail: Any | None = None
 
     def to_metadata_entry(self) -> dict[str, Any]:
         """Render as a small dict the handler can stuff into
         ``ArtifactResult.metadata`` so consumers see degradation
         without needing the full diagnostics object."""
-        return {
+        entry = {
             "capability_id": self.capability_id,
             "ok": self.ok,
             "kind": self.kind,
             "error_code": self.error_code,
         }
+        if self.error_envelope:
+            entry["error_envelope"] = dict(self.error_envelope)
+        if self.retryable is not None:
+            entry["retryable"] = self.retryable
+        if self.timeout_seconds is not None:
+            entry["timeout_seconds"] = self.timeout_seconds
+        if self.provider_status_code is not None:
+            entry["provider_status_code"] = self.provider_status_code
+        return entry
 
 
 def classify_envelope_error(
@@ -188,6 +206,8 @@ class _CapabilityCaller:
         self,
         capability_id: str,
         arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
         path = f"/capabilities/{capability_id}/invoke"
         headers = sign_platform_callback_headers(
@@ -200,43 +220,74 @@ class _CapabilityCaller:
             "caller_mode": "execute",
             "mode": "execute",
         }
+        call_timeout = _effective_timeout(timeout_seconds, self._timeout)
         try:
             if self._client is not None:
                 response = await self._client.post(
-                    path, json=body, headers=headers,
+                    path, json=body, headers=headers, timeout=call_timeout,
                 )
             else:
                 async with httpx.AsyncClient(
                     base_url=self._base_url,
-                    timeout=self._timeout,
+                    timeout=call_timeout,
                 ) as client:
                     response = await client.post(
                         path, json=body, headers=headers,
                     )
+        except httpx.TimeoutException as exc:
+            envelope = _timeout_error_envelope(
+                capability_id,
+                timeout_seconds=call_timeout,
+                detail=str(exc),
+            )
+            _log.warning(
+                "platform capability timeout capability=%s timeout_seconds=%s reason=%r",
+                capability_id, call_timeout, exc,
+            )
+            return _diagnostics_from_error_envelope(
+                capability_id=capability_id,
+                envelope=envelope,
+                default_kind="timeout",
+                detail=str(exc),
+            )
         except httpx.TransportError as exc:
             _log.warning(
                 "platform capability transport error capability=%s reason=%r",
                 capability_id, exc,
             )
+            envelope = {
+                "kind": "transport_error",
+                "capability_id": capability_id,
+                "retryable": True,
+                "reason_code": "platform_llm_transport_error"
+                if capability_id.startswith("platform.llm.")
+                else "platform_transport_error",
+                "raw_detail": str(exc),
+            }
             return CapabilityCallDiagnostics(
                 ok=False,
                 capability_id=capability_id,
                 kind="transport_error",
+                error_code=str(envelope["reason_code"]),
                 detail=str(exc),
+                error_envelope=envelope,
+                retryable=True,
+                raw_detail=str(exc),
             )
 
         if response.status_code >= 400:
-            envelope_code = _extract_envelope_code(response)
-            kind = classify_envelope_error(envelope_code, response.status_code)
+            error_envelope = _extract_error_envelope(response)
+            envelope_code = _error_envelope_reason_code(error_envelope) or _extract_envelope_code(response)
+            kind = _error_envelope_kind(error_envelope) or classify_envelope_error(envelope_code, response.status_code)
             _log.warning(
                 "platform capability call failed capability=%s status=%s code=%s kind=%s",
                 capability_id, response.status_code, envelope_code, kind,
             )
-            return CapabilityCallDiagnostics(
-                ok=False,
+            return _diagnostics_from_error_envelope(
                 capability_id=capability_id,
-                kind=kind,
-                error_code=envelope_code or "",
+                envelope=error_envelope,
+                default_kind=kind,
+                default_error_code=envelope_code or "",
                 detail=_safe_text(response),
             )
 
@@ -260,13 +311,14 @@ class _CapabilityCaller:
                 error_code="non_object_envelope",
             )
         if str(envelope.get("status")) != "ok":
-            envelope_code = str(envelope.get("error_code") or "") or None
-            kind = classify_envelope_error(envelope_code, http_status=None)
-            return CapabilityCallDiagnostics(
-                ok=False,
+            error_envelope = _extract_error_envelope_from_mapping(envelope)
+            envelope_code = _error_envelope_reason_code(error_envelope) or str(envelope.get("error_code") or "") or None
+            kind = _error_envelope_kind(error_envelope) or classify_envelope_error(envelope_code, http_status=None)
+            return _diagnostics_from_error_envelope(
                 capability_id=capability_id,
-                kind=kind,
-                error_code=envelope_code or "",
+                envelope=error_envelope,
+                default_kind=kind,
+                default_error_code=envelope_code or "",
                 detail=str(envelope.get("explanation") or ""),
             )
         result = envelope.get("result")
@@ -605,6 +657,140 @@ def _safe_text(response: httpx.Response) -> str:
         return ""
 
 
+def _effective_timeout(value: float | None, default: float) -> float:
+    try:
+        timeout = float(value) if value is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+    return timeout if timeout > 0 else float(default)
+
+
+def _structured_timeout_reason_code(capability_id: str) -> str:
+    if capability_id == _LLM_STRUCTURED_CAP:
+        return "platform_llm_structured_timeout"
+    return f"{capability_id.replace('.', '_')}_timeout"
+
+
+def _timeout_error_envelope(
+    capability_id: str,
+    *,
+    timeout_seconds: float,
+    detail: str,
+    model: str | None = None,
+    phase: str = "transport",
+) -> dict[str, Any]:
+    envelope: dict[str, Any] = {
+        "kind": "timeout",
+        "capability_id": capability_id,
+        "phase": phase,
+        "timeout_seconds": timeout_seconds,
+        "retryable": True,
+        "reason_code": _structured_timeout_reason_code(capability_id),
+        "raw_detail": detail,
+    }
+    if model:
+        envelope["model"] = model
+    return envelope
+
+
+def _extract_error_envelope(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except (ValueError, httpx.DecodingError):
+        return None
+    if isinstance(payload, dict):
+        return _extract_error_envelope_from_mapping(payload)
+    return None
+
+
+def _extract_error_envelope_from_mapping(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        envelope = metadata.get("error_envelope")
+        if isinstance(envelope, dict):
+            return dict(envelope)
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        envelope = detail.get("error_envelope")
+        if isinstance(envelope, dict):
+            return dict(envelope)
+        if "kind" in detail or "reason_code" in detail:
+            return dict(detail)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return dict(error)
+    if "kind" in payload or "reason_code" in payload:
+        return dict(payload)
+    return None
+
+
+def _error_envelope_kind(envelope: Mapping[str, Any] | None) -> DegradationKind | None:
+    if not envelope:
+        return None
+    kind = str(envelope.get("kind") or "").strip()
+    if kind in {
+        "binding_denied",
+        "transport_error",
+        "timeout",
+        "provider_error",
+        "schema_error",
+        "quota_error",
+        "platform_unavailable",
+        "schema_violation",
+        "no_results",
+        "unconfigured",
+    }:
+        return kind  # type: ignore[return-value]
+    return None
+
+
+def _error_envelope_reason_code(envelope: Mapping[str, Any] | None) -> str:
+    if not envelope:
+        return ""
+    return str(envelope.get("reason_code") or envelope.get("error_code") or "").strip()
+
+
+def _diagnostics_from_error_envelope(
+    *,
+    capability_id: str,
+    envelope: Mapping[str, Any] | None,
+    default_kind: DegradationKind | None,
+    default_error_code: str = "",
+    detail: str = "",
+    provider_status_code: int | None = None,
+) -> CapabilityCallDiagnostics:
+    copied = dict(envelope or {})
+    kind = _error_envelope_kind(copied) or default_kind
+    error_code = _error_envelope_reason_code(copied) or default_error_code
+    retryable = copied.get("retryable")
+    timeout_seconds_raw = copied.get("timeout_seconds")
+    timeout_seconds: float | None = None
+    if timeout_seconds_raw is not None:
+        try:
+            timeout_seconds = float(timeout_seconds_raw)
+        except (TypeError, ValueError):
+            timeout_seconds = None
+    provider_status = provider_status_code
+    if provider_status is None and copied.get("provider_status_code") is not None:
+        try:
+            provider_status = int(copied["provider_status_code"])
+        except (TypeError, ValueError):
+            provider_status = None
+    raw_detail = copied.get("raw_detail", detail)
+    return CapabilityCallDiagnostics(
+        ok=False,
+        capability_id=capability_id,
+        kind=kind,
+        error_code=error_code,
+        detail=detail or str(raw_detail or ""),
+        error_envelope=copied or None,
+        retryable=bool(retryable) if retryable is not None else None,
+        timeout_seconds=timeout_seconds,
+        provider_status_code=provider_status,
+        raw_detail=raw_detail,
+    )
+
+
 # ── Namespaces ──────────────────────────────────────────────────────────────
 
 
@@ -666,6 +852,11 @@ class PlatformLlmCallError(RuntimeError):
         kind: DegradationKind | None,
         error_code: str = "",
         detail: str = "",
+        error_envelope: Mapping[str, Any] | None = None,
+        retryable: bool | None = None,
+        timeout_seconds: float | None = None,
+        provider_status_code: int | None = None,
+        raw_detail: Any | None = None,
     ) -> None:
         message = (
             f"platform LLM capability {capability_id!r} failed: "
@@ -676,6 +867,17 @@ class PlatformLlmCallError(RuntimeError):
         self.kind = kind
         self.error_code = error_code
         self.detail = detail
+        self.error_envelope = dict(error_envelope or {})
+        self.reason_code = str(
+            self.error_envelope.get("reason_code")
+            or self.error_envelope.get("error_code")
+            or error_code
+            or ""
+        )
+        self.retryable = retryable
+        self.timeout_seconds = timeout_seconds
+        self.provider_status_code = provider_status_code
+        self.raw_detail = raw_detail
 
     @property
     def is_transient(self) -> bool:
@@ -687,7 +889,9 @@ class PlatformLlmCallError(RuntimeError):
         are not — retrying without changing the request will yield the
         same outcome.
         """
-        return self.kind in {"transport_error", "platform_unavailable"}
+        if self.retryable is not None:
+            return bool(self.retryable)
+        return self.kind in {"transport_error", "timeout", "platform_unavailable"}
 
 
 class PlatformLlmTransportError(PlatformLlmCallError):
@@ -699,13 +903,70 @@ class PlatformLlmTransportError(PlatformLlmCallError):
     ``.kind``.
     """
 
-    def __init__(self, *, capability_id: str, detail: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        capability_id: str,
+        detail: str = "",
+        error_code: str = "",
+        error_envelope: Mapping[str, Any] | None = None,
+        retryable: bool | None = True,
+        timeout_seconds: float | None = None,
+        provider_status_code: int | None = None,
+        raw_detail: Any | None = None,
+    ) -> None:
         super().__init__(
             capability_id=capability_id,
             kind="transport_error",
-            error_code="",
+            error_code=error_code,
             detail=detail,
+            error_envelope=error_envelope,
+            retryable=retryable,
+            timeout_seconds=timeout_seconds,
+            provider_status_code=provider_status_code,
+            raw_detail=raw_detail,
         )
+
+
+class PlatformLlmTimeoutError(PlatformLlmTransportError):
+    """``platform.llm.*`` call exceeded the per-call or platform timeout."""
+
+    def __init__(
+        self,
+        *,
+        capability_id: str,
+        detail: str = "",
+        error_code: str = "",
+        error_envelope: Mapping[str, Any] | None = None,
+        retryable: bool | None = True,
+        timeout_seconds: float | None = None,
+        provider_status_code: int | None = None,
+        raw_detail: Any | None = None,
+    ) -> None:
+        PlatformLlmCallError.__init__(
+            self,
+            capability_id=capability_id,
+            kind="timeout",
+            error_code=error_code,
+            detail=detail,
+            error_envelope=error_envelope,
+            retryable=retryable,
+            timeout_seconds=timeout_seconds,
+            provider_status_code=provider_status_code,
+            raw_detail=raw_detail,
+        )
+
+
+class PlatformLlmProviderError(PlatformLlmCallError):
+    """Provider returned a non-timeout LLM capability error."""
+
+
+class PlatformLlmSchemaError(PlatformLlmCallError):
+    """Platform or provider returned an invalid structured-output contract."""
+
+
+class PlatformLlmQuotaError(PlatformLlmCallError):
+    """Platform reported an LLM quota error in capability-error form."""
 
 
 class PlatformNamespaceProtocol(Protocol):
@@ -722,7 +983,11 @@ class PlatformNamespaceProtocol(Protocol):
     ) -> CapabilityCallDiagnostics: ...
 
     async def invoke_llm_capability(
-        self, capability_id: str, arguments: Mapping[str, Any],
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics: ...
 
     def last_diagnostics(self) -> tuple[CapabilityCallDiagnostics, ...]: ...
@@ -1404,6 +1669,7 @@ class LlmNamespace:
         max_output_tokens: int | None = None,
         method: str | None = None,
         strict: bool | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM with a JSON-schema structured output.
 
@@ -1439,7 +1705,13 @@ class LlmNamespace:
             args["method"] = method
         if strict is not None:
             args["strict"] = strict
-        diagnostics = await self._parent.invoke_llm_capability(_LLM_STRUCTURED_CAP, args)
+        if timeout_seconds is not None:
+            args["timeout_seconds"] = float(timeout_seconds)
+        diagnostics = await self._parent.invoke_llm_capability(
+            _LLM_STRUCTURED_CAP,
+            args,
+            timeout_seconds=timeout_seconds,
+        )
         return self._unwrap(diagnostics, _LLM_STRUCTURED_CAP)
 
     async def embed(
@@ -1514,12 +1786,78 @@ class LlmNamespace:
                 raise PlatformLlmTransportError(
                     capability_id=capability_id,
                     detail=diagnostics.detail,
+                    error_code=diagnostics.error_code,
+                    error_envelope=diagnostics.error_envelope,
+                    retryable=diagnostics.retryable,
+                    timeout_seconds=diagnostics.timeout_seconds,
+                    provider_status_code=diagnostics.provider_status_code,
+                    raw_detail=diagnostics.raw_detail,
+                )
+            if diagnostics.kind == "timeout" or "timeout" in diagnostics.error_code:
+                raise PlatformLlmTimeoutError(
+                    capability_id=capability_id,
+                    detail=diagnostics.detail,
+                    error_code=diagnostics.error_code,
+                    error_envelope=diagnostics.error_envelope,
+                    retryable=diagnostics.retryable,
+                    timeout_seconds=diagnostics.timeout_seconds,
+                    provider_status_code=diagnostics.provider_status_code,
+                    raw_detail=diagnostics.raw_detail,
+                )
+            if diagnostics.kind == "schema_error" or diagnostics.error_code in {
+                "invalid_args",
+                "schema_violation",
+                "structured_output_schema_error",
+            }:
+                raise PlatformLlmSchemaError(
+                    capability_id=capability_id,
+                    kind=diagnostics.kind,
+                    error_code=diagnostics.error_code,
+                    detail=diagnostics.detail,
+                    error_envelope=diagnostics.error_envelope,
+                    retryable=diagnostics.retryable,
+                    timeout_seconds=diagnostics.timeout_seconds,
+                    provider_status_code=diagnostics.provider_status_code,
+                    raw_detail=diagnostics.raw_detail,
+                )
+            if diagnostics.kind == "quota_error" or diagnostics.error_code in {
+                "quota_exceeded",
+                "rate_limited",
+                "llm_quota_exceeded",
+            }:
+                raise PlatformLlmQuotaError(
+                    capability_id=capability_id,
+                    kind=diagnostics.kind,
+                    error_code=diagnostics.error_code,
+                    detail=diagnostics.detail,
+                    error_envelope=diagnostics.error_envelope,
+                    retryable=diagnostics.retryable,
+                    timeout_seconds=diagnostics.timeout_seconds,
+                    provider_status_code=diagnostics.provider_status_code,
+                    raw_detail=diagnostics.raw_detail,
+                )
+            if diagnostics.kind == "provider_error" or diagnostics.provider_status_code:
+                raise PlatformLlmProviderError(
+                    capability_id=capability_id,
+                    kind=diagnostics.kind,
+                    error_code=diagnostics.error_code,
+                    detail=diagnostics.detail,
+                    error_envelope=diagnostics.error_envelope,
+                    retryable=diagnostics.retryable,
+                    timeout_seconds=diagnostics.timeout_seconds,
+                    provider_status_code=diagnostics.provider_status_code,
+                    raw_detail=diagnostics.raw_detail,
                 )
             raise PlatformLlmCallError(
                 capability_id=capability_id,
                 kind=diagnostics.kind,
                 error_code=diagnostics.error_code,
                 detail=diagnostics.detail,
+                error_envelope=diagnostics.error_envelope,
+                retryable=diagnostics.retryable,
+                timeout_seconds=diagnostics.timeout_seconds,
+                provider_status_code=diagnostics.provider_status_code,
+                raw_detail=diagnostics.raw_detail,
             )
         result = diagnostics.result or {}
         if result.get("error") == "quota_exceeded":
@@ -1614,6 +1952,8 @@ class PlatformNamespace:
         self,
         capability_id: str,
         arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
         """Invoke a ``platform.llm.*`` capability with the long-timeout caller.
 
@@ -1634,7 +1974,9 @@ class PlatformNamespace:
             return diagnostics
 
         diagnostics = await self._llm_caller.invoke_with_diagnostics(
-            capability_id, arguments,
+            capability_id,
+            arguments,
+            timeout_seconds=timeout_seconds,
         )
         if not diagnostics.ok:
             self._diagnostics.append(diagnostics)
@@ -1702,7 +2044,10 @@ class _UnavailablePlatformNamespace:
         self,
         capability_id: str,
         arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
+        del timeout_seconds
         return await self.invoke_capability(capability_id, arguments)
 
     def last_diagnostics(self) -> tuple[CapabilityCallDiagnostics, ...]:
@@ -1789,6 +2134,10 @@ __all__ = [
     "KnowledgeNamespace",
     "LlmNamespace",
     "PlatformLlmCallError",
+    "PlatformLlmProviderError",
+    "PlatformLlmQuotaError",
+    "PlatformLlmSchemaError",
+    "PlatformLlmTimeoutError",
     "PlatformLlmTransportError",
     "PlatformNamespace",
     "PlatformNamespaceProtocol",
