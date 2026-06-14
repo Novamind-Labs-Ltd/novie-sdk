@@ -36,7 +36,13 @@ def _make_ns(*, responses: dict[str, CapabilityCallDiagnostics]) -> PlatformName
     """Build a PlatformNamespace with a fake caller that returns canned responses."""
     caller = MagicMock(spec=_CapabilityCaller)
 
-    async def _invoke(cap_id: str, args: Any) -> CapabilityCallDiagnostics:
+    async def _invoke(
+        cap_id: str,
+        args: Any,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> CapabilityCallDiagnostics:
+        del timeout_seconds
         return responses.get(
             cap_id,
             CapabilityCallDiagnostics(
@@ -68,9 +74,12 @@ class TestLlmChat:
                 self,
                 cap_id: str,
                 args: Any,
+                *,
+                timeout_seconds: float | None = None,
             ) -> CapabilityCallDiagnostics:
                 captured["cap_id"] = cap_id
                 captured["args"] = args
+                captured["timeout_seconds"] = timeout_seconds
                 return CapabilityCallDiagnostics(
                     ok=True,
                     capability_id=cap_id,
@@ -108,7 +117,40 @@ class TestLlmChat:
         assert captured["args"]["tools"][0]["function"]["name"] == "lookup"
         assert captured["args"]["tool_choice"] == "auto"
         assert captured["args"]["parallel_tool_calls"] is False
+        assert captured["timeout_seconds"] is None
         assert result["tool_calls"][0]["name"] == "lookup"
+
+    def test_structured_timeout_is_forwarded_to_llm_caller(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class _Caller:
+            async def invoke_with_diagnostics(
+                self,
+                cap_id: str,
+                args: Any,
+                *,
+                timeout_seconds: float | None = None,
+            ) -> CapabilityCallDiagnostics:
+                captured["cap_id"] = cap_id
+                captured["args"] = args
+                captured["timeout_seconds"] = timeout_seconds
+                return CapabilityCallDiagnostics(
+                    ok=True,
+                    capability_id=cap_id,
+                    result={"title": "Draft"},
+                )
+
+        ns = PlatformNamespace(_Caller())  # type: ignore[arg-type]
+        result = _run(ns.llm.structured(
+            [{"role": "user", "content": "Draft tickets"}],
+            {"type": "object", "properties": {"title": {"type": "string"}}},
+            timeout_seconds=42,
+        ))
+
+        assert captured["cap_id"] == "platform.llm.structured"
+        assert captured["args"]["timeout_seconds"] == 42
+        assert captured["timeout_seconds"] == 42
+        assert result == {"title": "Draft"}
 
     def test_chat_returns_canonical_tool_calls_from_provider_shape(self) -> None:
         ns = _make_ns(responses={
