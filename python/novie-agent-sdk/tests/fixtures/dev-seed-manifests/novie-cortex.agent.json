@@ -129,7 +129,6 @@
     "durability": "task_store"
   },
   "required_secrets": [
-    "GITHUB_TOKEN",
     "ANTHROPIC_API_KEY"
   ],
   "supports_streaming": false,

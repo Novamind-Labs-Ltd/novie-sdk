@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(m.execution.durability, DurabilityLevel::TaskStore);
         assert_eq!(
             m.required_secrets,
-            vec!["GITHUB_TOKEN", "ANTHROPIC_API_KEY"]
+            vec!["ANTHROPIC_API_KEY"]
         );
         assert_eq!(m.task_bundles_path, "/task-bundles");
         assert!(!m.capability_manifest.is_empty());
