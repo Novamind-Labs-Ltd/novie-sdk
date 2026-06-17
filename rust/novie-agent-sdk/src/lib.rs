@@ -82,6 +82,7 @@ pub mod agent_status;
 pub mod agent_status_client;
 pub mod call_scope;
 pub mod error;
+pub mod github_operations;
 pub mod long_task;
 pub mod memory;
 pub mod payload;
@@ -94,6 +95,7 @@ pub mod transport;
 pub use agent_status_client::{AgentStatusClient, ReportOptions};
 pub use call_scope::{AgentCallScope, extract_call_scope};
 pub use error::{Error, Result};
+pub use github_operations::GitHubOperationsClient;
 pub use long_task::{LongTaskCompletion, LongTaskStatus, notify_long_task_complete};
 pub use payload::{AgentInvokePayload, AgentStatusCallbackConfig, PlatformCallbackConfig};
 pub use platform_llm::{

@@ -75,6 +75,11 @@ from .platform_callback import (
     build_platform_callback_headers,
     sign_platform_callback_headers,
 )
+from .github_operations import (
+    GitHubOperationError,
+    GitHubOperationsClient,
+    build_github_operations_client,
+)
 from .tenant_scoping import (
     TenantScopedCache,
     validate_tenant_context,
@@ -468,6 +473,9 @@ __all__ = [
     "TaskContext",
     "TaskRecord",
     "PlatformCallbackClient",
+    "GitHubOperationError",
+    "GitHubOperationsClient",
+    "build_github_operations_client",
     "ArtifactReadCache",
     "ArtifactReader",
     "artifact_read_cache_key",
