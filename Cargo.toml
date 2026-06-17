@@ -1,0 +1,3 @@
+[workspace]
+members = ["rust/novie-agent-sdk"]
+resolver = "3"
