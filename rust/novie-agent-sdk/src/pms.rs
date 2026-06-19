@@ -126,6 +126,51 @@ impl PmsIssueClient {
         ))
     }
 
+    pub async fn list_issues_by_states(
+        &self,
+        states: Vec<String>,
+        project_ids: Vec<String>,
+        organization_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<PmsIssue>> {
+        let payload = self
+            .post(
+                "/pms/issues/by-states",
+                json!({
+                    "states": states,
+                    "projectIds": project_ids,
+                    "organizationId": organization_id,
+                    "workspaceId": workspace_id,
+                }),
+            )
+            .await?;
+        Ok(list_field(&payload, &["issues", "nodes", "items"])
+            .into_iter()
+            .map(pms_issue_from_value)
+            .collect())
+    }
+
+    pub async fn fetch_active_cycle_id(
+        &self,
+        organization_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let payload = self
+            .post(
+                "/pms/issues/active-cycle",
+                json!({
+                    "organizationId": organization_id,
+                    "workspaceId": workspace_id,
+                }),
+            )
+            .await?;
+        let value = str_field(
+            &payload,
+            &["activeCycleId", "active_cycle_id", "cycleId", "id"],
+        );
+        Ok((!value.trim().is_empty()).then_some(value))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn transition_issue_status(
         &self,

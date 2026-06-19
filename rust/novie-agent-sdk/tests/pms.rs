@@ -67,6 +67,63 @@ async fn list_candidate_issues_calls_pms_api_boundary() {
 }
 
 #[tokio::test]
+async fn list_issues_by_states_calls_pms_api_boundary() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/pms/issues/by-states"))
+        .and(bearer_token("runtime-token"))
+        .and(body_json(json!({
+            "states": ["Done"],
+            "projectIds": ["project-1"],
+            "organizationId": "tenant-1",
+            "workspaceId": "workspace-1"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "issues": [{ "id": "issue-1", "state": "Done" }] }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let issues = client
+        .list_issues_by_states(
+            vec!["Done".to_string()],
+            vec!["project-1".to_string()],
+            Some("tenant-1"),
+            Some("workspace-1"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(issues[0].id, "issue-1");
+}
+
+#[tokio::test]
+async fn fetch_active_cycle_id_calls_pms_api_boundary() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/pms/issues/active-cycle"))
+        .and(bearer_token("runtime-token"))
+        .and(body_json(json!({
+            "organizationId": "tenant-1",
+            "workspaceId": "workspace-1"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "activeCycleId": "cycle-1" }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let cycle_id = client
+        .fetch_active_cycle_id(Some("tenant-1"), Some("workspace-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(cycle_id.as_deref(), Some("cycle-1"));
+}
+
+#[tokio::test]
 async fn update_agentic_orchestration_values_uses_durable_contract() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

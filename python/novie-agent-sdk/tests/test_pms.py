@@ -74,6 +74,67 @@ async def test_list_candidate_issues_calls_pms_api_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_issues_by_states_calls_pms_api_boundary() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["authorization"] = request.headers.get("authorization")
+        captured["json"] = request.read()
+        return httpx.Response(200, json={"data": {"issues": [{"id": "issue-1", "state": "Done"}]}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(responder),
+        base_url="http://platform.test",
+    ) as http:
+        client = build_pms_issue_client(
+            {"Authorization": "Bearer runtime-token"},
+            base_url="http://platform.test",
+            client=http,
+        )
+        issues = await client.list_issues_by_states(
+            states=["Done"],
+            project_ids=["project-1"],
+            organization_id="tenant-1",
+            workspace_id="workspace-1",
+        )
+
+    assert captured["path"] == "/pms/issues/by-states"
+    assert captured["authorization"] == "Bearer runtime-token"
+    assert b'"states":["Done"]' in captured["json"]
+    assert b'"projectIds":["project-1"]' in captured["json"]
+    assert issues[0].id == "issue-1"
+
+
+@pytest.mark.asyncio
+async def test_fetch_active_cycle_id_calls_pms_api_boundary() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["json"] = request.read()
+        return httpx.Response(200, json={"data": {"activeCycleId": "cycle-1"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(responder),
+        base_url="http://platform.test",
+    ) as http:
+        client = build_pms_issue_client(
+            {"Authorization": "Bearer runtime-token"},
+            base_url="http://platform.test",
+            client=http,
+        )
+        cycle_id = await client.fetch_active_cycle_id(
+            organization_id="tenant-1",
+            workspace_id="workspace-1",
+        )
+
+    assert captured["path"] == "/pms/issues/active-cycle"
+    assert b'"organizationId":"tenant-1"' in captured["json"]
+    assert cycle_id == "cycle-1"
+
+
+@pytest.mark.asyncio
 async def test_update_agentic_orchestration_values_uses_durable_contract() -> None:
     captured: dict[str, Any] = {}
 

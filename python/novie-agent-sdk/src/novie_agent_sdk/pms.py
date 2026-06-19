@@ -125,6 +125,42 @@ class PmsIssueClient:
         row = _mapping_field(payload, "issue") or payload
         return pms_issue_from_mapping(row)
 
+    async def list_issues_by_states(
+        self,
+        *,
+        states: Sequence[str],
+        project_ids: Sequence[str] = (),
+        organization_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> tuple[PmsIssue, ...]:
+        payload = await self._post(
+            "/pms/issues/by-states",
+            {
+                "states": [value for value in states if value],
+                "projectIds": [value for value in project_ids if value],
+                "organizationId": organization_id,
+                "workspaceId": workspace_id,
+            },
+        )
+        rows = _list_field(payload, "issues", "nodes", "items")
+        return tuple(pms_issue_from_mapping(row) for row in rows)
+
+    async def fetch_active_cycle_id(
+        self,
+        *,
+        organization_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> str | None:
+        payload = await self._post(
+            "/pms/issues/active-cycle",
+            {
+                "organizationId": organization_id,
+                "workspaceId": workspace_id,
+            },
+        )
+        value = _str_field(payload, "activeCycleId", "active_cycle_id", "cycleId", "id")
+        return value or None
+
     async def transition_issue_status(
         self,
         issue_id: str,
