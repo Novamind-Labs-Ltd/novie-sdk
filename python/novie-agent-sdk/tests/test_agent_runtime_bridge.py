@@ -64,6 +64,26 @@ def test_context_block_from_sdk_request_projects_headers() -> None:
     assert block["identity"]["principal_id"] == "user-1"
 
 
+def test_context_block_from_sdk_request_treats_org_id_as_legacy_tenant() -> None:
+    ctx = SimpleNamespace(
+        input={},
+        headers=RequestHeaders.from_request(
+            {
+                "x-novie-org-id": "org-1",
+                "x-novie-project-id": "project-1",
+                "x-novie-user-id": "user-1",
+                "x-novie-session-id": "session-1",
+            }
+        ),
+    )
+
+    block = context_block_from_sdk_request(ctx, agent_id="demo")
+
+    assert block["tenant"]["tenant_id"] == "org-1"
+    assert block["tenant"]["workspace_id"] == "org-1"
+    assert block["tenant"]["project_id"] == "project-1"
+
+
 def test_execution_context_from_sdk_request_preserves_project_id() -> None:
     exec_ctx = execution_context_from_sdk_request(_ctx({}), agent_id="demo")
 

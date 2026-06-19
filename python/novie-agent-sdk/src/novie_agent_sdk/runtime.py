@@ -133,12 +133,14 @@ class RequestHeaders:
     def from_request(cls, headers: Any) -> "RequestHeaders":
         """从 FastAPI Request.headers 提取 Novie 标准 headers。"""
         h = dict(headers)
+        org_id = h.get("x-novie-org-id") or h.get("x-novie-tenant-id", "")
+        workspace_id = h.get("x-novie-workspace-id") or org_id
         return cls(
-            tenant_id=h.get("x-novie-tenant-id", ""),
+            tenant_id=org_id,
             session_id=h.get("x-novie-session-id", ""),
             step_id=h.get("x-novie-step-id", ""),
             trace_id=h.get("x-novie-trace-id", ""),
-            workspace_id=h.get("x-novie-workspace-id", ""),
+            workspace_id=workspace_id,
             project_id=h.get("x-novie-project-id", ""),
             user_id=h.get("x-novie-user-id", ""),
             service_principal=h.get("x-novie-service-principal", ""),

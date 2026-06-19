@@ -104,7 +104,7 @@ pub use platform_llm::{
     StructuredOptions, TokenUsage, UsageReport,
 };
 pub use platform_services::PlatformServicesClient;
-pub use pms::{PmsComment, PmsIssue, PmsIssueClient, PmsStatus};
+pub use pms::{PmsComment, PmsIssue, PmsIssueClient, PmsIssueIdentity, PmsStatus};
 pub use token::{
     CallbackTokenClaims, MintContext, mint_callback_token, mint_with_clock, verify_callback_token,
     verify_with_clock,

@@ -60,7 +60,7 @@ def context_block_from_request(
     )
     tenant = dict(block.get("tenant") or {})
     tenant.setdefault("tenant_id", headers.tenant_id or "t")
-    tenant.setdefault("workspace_id", headers.workspace_id or "w")
+    tenant.setdefault("workspace_id", headers.workspace_id or headers.tenant_id or "w")
     project_id = raw.get("x-novie-project-id") or getattr(headers, "project_id", None)
     if project_id:
         tenant.setdefault("project_id", project_id)

@@ -613,10 +613,7 @@ impl LlmBudgetGuard {
             }
             Err(e) => return Err(e),
             Ok(budget) => {
-                let allow = budget
-                    .get("allow")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
+                let allow = budget.get("allow").and_then(Value::as_bool).unwrap_or(true);
                 let exhausted = budget
                     .get("exhausted")
                     .and_then(Value::as_bool)

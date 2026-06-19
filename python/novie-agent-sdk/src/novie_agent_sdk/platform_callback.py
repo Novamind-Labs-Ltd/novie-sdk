@@ -28,7 +28,7 @@ def build_platform_callback_headers(
     org_id = source.pick("x-novie-org-id", "x-novie-tenant-id") or os.getenv(
         "NOVIE_ORG_ID", ""
     ).strip()
-    workspace_id = source.pick("x-novie-workspace-id")
+    workspace_id = source.pick("x-novie-workspace-id") or org_id
     project_id = (
         source.pick("x-novie-project-id")
         or os.getenv("NOVIE_PROJECT_ID", "").strip()

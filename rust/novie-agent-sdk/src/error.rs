@@ -73,9 +73,7 @@ pub enum Error {
     /// without budget enforcement when governance is unavailable, or fail-safe
     /// depending on their policy.
     #[error("governance unavailable: {message}")]
-    GovernanceUnavailable {
-        message: String,
-    },
+    GovernanceUnavailable { message: String },
 
     /// `verify_callback_token` rejected because exp ≤ now.
     #[error("callback token expired")]

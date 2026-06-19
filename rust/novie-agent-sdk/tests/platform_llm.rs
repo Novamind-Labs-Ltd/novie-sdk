@@ -157,7 +157,10 @@ async fn budget_guard_preflight_allows_when_budget_ok() {
         .await;
 
     let guard = make_budget_guard(&server);
-    guard.preflight().await.expect("preflight should pass when allow=true");
+    guard
+        .preflight()
+        .await
+        .expect("preflight should pass when allow=true");
     assert!(!guard.should_stop());
 }
 
@@ -180,7 +183,10 @@ async fn budget_guard_preflight_denies_when_exhausted() {
         .await;
 
     let guard = make_budget_guard(&server);
-    let err = guard.preflight().await.expect_err("preflight should fail when exhausted");
+    let err = guard
+        .preflight()
+        .await
+        .expect_err("preflight should fail when exhausted");
     match err {
         Error::BudgetExceeded { message, .. } => {
             assert!(!message.is_empty());
@@ -226,7 +232,10 @@ async fn budget_guard_report_usage_sets_exceeded_on_exhausted_response() {
         .await;
 
     let guard = make_budget_guard(&server);
-    assert!(!guard.should_stop(), "should not stop before reporting usage");
+    assert!(
+        !guard.should_stop(),
+        "should not stop before reporting usage"
+    );
 
     guard
         .report_usage(&TokenUsage {
@@ -238,7 +247,10 @@ async fn budget_guard_report_usage_sets_exceeded_on_exhausted_response() {
         })
         .await;
 
-    assert!(guard.should_stop(), "should stop after platform reports exhausted");
+    assert!(
+        guard.should_stop(),
+        "should stop after platform reports exhausted"
+    );
 }
 
 #[tokio::test]

@@ -5,7 +5,12 @@
 //! surface and keeps the backend transport shape out of consumers.
 
 use crate::error::{Error, Result};
+use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmsStatus {
@@ -51,11 +56,65 @@ pub struct PmsIssue {
 pub struct PmsIssueClient {
     base_url: String,
     runtime_token: String,
+    identity: PmsIssueIdentity,
     http: reqwest::Client,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PmsIssueIdentity {
+    pub org_id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub service_principal: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub auth_source: String,
+}
+
+impl PmsIssueIdentity {
+    pub fn service(
+        org_id: impl Into<String>,
+        project_id: impl Into<String>,
+        service_principal: impl Into<String>,
+    ) -> Self {
+        Self {
+            org_id: org_id.into(),
+            project_id: project_id.into(),
+            service_principal: service_principal.into(),
+            auth_source: "pms_sdk".to_owned(),
+            ..Self::default()
+        }
+    }
+
+    pub fn from_env(service_principal: impl Into<String>) -> Self {
+        let org_id = std::env::var("NOVIE_ORG_ID").unwrap_or_default();
+        let project_id = std::env::var("NOVIE_PROJECT_ID").unwrap_or_default();
+        Self {
+            org_id,
+            project_id,
+            user_id: std::env::var("NOVIE_USER_ID").unwrap_or_default(),
+            service_principal: service_principal.into(),
+            session_id: std::env::var("NOVIE_SESSION_ID").unwrap_or_default(),
+            request_id: std::env::var("NOVIE_REQUEST_ID").unwrap_or_default(),
+            auth_source: "pms_sdk".to_owned(),
+        }
+    }
 }
 
 impl PmsIssueClient {
     pub fn new(base_url: impl Into<String>, runtime_token: impl Into<String>) -> Result<Self> {
+        Self::with_identity(
+            base_url,
+            runtime_token,
+            PmsIssueIdentity::from_env("agent:pms-sdk"),
+        )
+    }
+
+    pub fn with_identity(
+        base_url: impl Into<String>,
+        runtime_token: impl Into<String>,
+        identity: PmsIssueIdentity,
+    ) -> Result<Self> {
         let base_url = base_url.into();
         let runtime_token = runtime_token.into();
         if base_url.trim().is_empty() {
@@ -68,6 +127,7 @@ impl PmsIssueClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
             runtime_token: runtime_token.trim().to_owned(),
+            identity,
             http,
         })
     }
@@ -84,8 +144,8 @@ impl PmsIssueClient {
         project_ids: Vec<String>,
         automation_actions: Vec<String>,
         include_human_review: bool,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<Vec<PmsIssue>> {
         let payload = self
             .post(
@@ -94,8 +154,6 @@ impl PmsIssueClient {
                     "projectIds": project_ids,
                     "automationActions": automation_actions,
                     "includeHumanReview": include_human_review,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -108,16 +166,14 @@ impl PmsIssueClient {
     pub async fn get_issue(
         &self,
         issue_id: &str,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<PmsIssue> {
         let payload = self
             .post(
                 "/pms/issues/get",
                 json!({
                     "issueId": issue_id,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -130,8 +186,8 @@ impl PmsIssueClient {
         &self,
         states: Vec<String>,
         project_ids: Vec<String>,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<Vec<PmsIssue>> {
         let payload = self
             .post(
@@ -139,8 +195,6 @@ impl PmsIssueClient {
                 json!({
                     "states": states,
                     "projectIds": project_ids,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -152,18 +206,10 @@ impl PmsIssueClient {
 
     pub async fn fetch_active_cycle_id(
         &self,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<Option<String>> {
-        let payload = self
-            .post(
-                "/pms/issues/active-cycle",
-                json!({
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
-                }),
-            )
-            .await?;
+        let payload = self.post("/pms/issues/active-cycle", json!({})).await?;
         let value = str_field(
             &payload,
             &["activeCycleId", "active_cycle_id", "cycleId", "id"],
@@ -180,8 +226,8 @@ impl PmsIssueClient {
         title: Option<&str>,
         actor_user_id: Option<&str>,
         reason: Option<&str>,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<PmsIssue> {
         let payload = self
             .post(
@@ -193,8 +239,6 @@ impl PmsIssueClient {
                     "title": title,
                     "actorUserId": actor_user_id,
                     "reason": reason,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -208,8 +252,8 @@ impl PmsIssueClient {
         issue_id: &str,
         patch: Value,
         actor_user_id: Option<&str>,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<Map<String, Value>> {
         let payload = self
             .post(
@@ -218,8 +262,6 @@ impl PmsIssueClient {
                     "issueId": issue_id,
                     "patch": patch,
                     "actorUserId": actor_user_id,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -235,8 +277,8 @@ impl PmsIssueClient {
         issue_id: &str,
         content: &str,
         author_id: &str,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<PmsComment> {
         let payload = self
             .post(
@@ -245,8 +287,6 @@ impl PmsIssueClient {
                     "issueId": issue_id,
                     "content": content,
                     "authorId": author_id,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -261,8 +301,8 @@ impl PmsIssueClient {
         marker: &str,
         content: &str,
         author_id: &str,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<PmsComment> {
         let payload = self
             .post(
@@ -272,8 +312,6 @@ impl PmsIssueClient {
                     "marker": marker,
                     "content": content,
                     "authorId": author_id,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -286,8 +324,8 @@ impl PmsIssueClient {
         &self,
         issue_id: &str,
         first: Option<u32>,
-        organization_id: Option<&str>,
-        workspace_id: Option<&str>,
+        _organization_id: Option<&str>,
+        _workspace_id: Option<&str>,
     ) -> Result<Vec<PmsComment>> {
         let payload = self
             .post(
@@ -295,8 +333,6 @@ impl PmsIssueClient {
                 json!({
                     "issueId": issue_id,
                     "first": first,
-                    "organizationId": organization_id,
-                    "workspaceId": workspace_id,
                 }),
             )
             .await?;
@@ -312,12 +348,129 @@ impl PmsIssueClient {
             .http
             .post(url)
             .bearer_auth(&self.runtime_token)
-            .header(reqwest::header::ACCEPT, "application/json")
+            .headers(self.trusted_headers("POST", path)?)
             .json(&compact(payload))
             .send()
             .await?;
         parse_pms_response(response).await
     }
+
+    fn trusted_headers(&self, method: &str, path: &str) -> Result<reqwest::header::HeaderMap> {
+        use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+
+        let org_id = self.identity.org_id.trim();
+        let project_id = self.identity.project_id.trim();
+        let user_id = self.identity.user_id.trim();
+        let service_principal = self.identity.service_principal.trim();
+        if org_id.is_empty() {
+            return Err(Error::InvalidArgument("pms org_id is required".into()));
+        }
+        if project_id.is_empty() {
+            return Err(Error::InvalidArgument("pms project_id is required".into()));
+        }
+        if user_id.is_empty() && service_principal.is_empty() {
+            return Err(Error::InvalidArgument(
+                "pms user_id or service_principal is required".into(),
+            ));
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        insert_header(&mut headers, "x-novie-org-id", org_id)?;
+        insert_header(&mut headers, "x-novie-project-id", project_id)?;
+        insert_header(&mut headers, "x-novie-workspace-id", org_id)?;
+        insert_optional_header(&mut headers, "x-novie-user-id", user_id)?;
+        insert_optional_header(&mut headers, "x-novie-service-principal", service_principal)?;
+        insert_optional_header(
+            &mut headers,
+            "x-novie-session-id",
+            &self.identity.session_id,
+        )?;
+        insert_optional_header(
+            &mut headers,
+            "x-novie-request-id",
+            &self.identity.request_id,
+        )?;
+        let auth_source = if self.identity.auth_source.trim().is_empty() {
+            "pms_sdk"
+        } else {
+            self.identity.auth_source.trim()
+        };
+        insert_header(&mut headers, "x-novie-auth-source", auth_source)?;
+
+        let secret = std::env::var("NOVIE_TRUSTED_HEADER_SECRET").unwrap_or_default();
+        if !secret.trim().is_empty() {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Error::InvalidArgument(format!("system clock before epoch: {e}")))?
+                .as_secs()
+                .to_string();
+            insert_header(&mut headers, "x-novie-timestamp", &timestamp)?;
+            let signature =
+                trusted_header_signature(method, path, &self.identity, &timestamp, &secret);
+            insert_header(&mut headers, "x-novie-sig", &format!("sha256={signature}"))?;
+        }
+
+        let _ = HeaderName::from_static("accept");
+        Ok(headers)
+    }
+}
+
+fn insert_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<()> {
+    let value = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|e| Error::InvalidArgument(format!("invalid header {name}: {e}")))?;
+    headers.insert(reqwest::header::HeaderName::from_static(name), value);
+    Ok(())
+}
+
+fn insert_optional_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    insert_header(headers, name, value.trim())
+}
+
+fn trusted_header_signature(
+    method: &str,
+    path: &str,
+    identity: &PmsIssueIdentity,
+    timestamp: &str,
+    secret: &str,
+) -> String {
+    let canonical = [
+        method.to_uppercase(),
+        path.to_owned(),
+        identity.org_id.clone(),
+        identity.project_id.clone(),
+        identity.org_id.clone(),
+        identity.user_id.clone(),
+        identity.service_principal.clone(),
+        identity.session_id.clone(),
+        identity.request_id.clone(),
+        timestamp.to_owned(),
+    ]
+    .join("\n");
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(canonical.as_bytes());
+    bytes_to_lower_hex(&mac.finalize().into_bytes())
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 pub fn normalize_pms_automation_action(value: &str) -> String {

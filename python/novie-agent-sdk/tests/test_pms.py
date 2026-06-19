@@ -11,6 +11,13 @@ from novie_agent_sdk.pms import (
     normalize_pms_automation_action,
 )
 
+_INCOMING_HEADERS = {
+    "Authorization": "Bearer runtime-token",
+    "x-novie-org-id": "tenant-1",
+    "x-novie-project-id": "project-1",
+    "x-novie-service-principal": "agent:pms-test",
+}
+
 
 @pytest.mark.asyncio
 async def test_list_candidate_issues_calls_pms_api_boundary() -> None:
@@ -19,6 +26,10 @@ async def test_list_candidate_issues_calls_pms_api_boundary() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
         captured["authorization"] = request.headers.get("authorization")
+        captured["org_id"] = request.headers.get("x-novie-org-id")
+        captured["project_id"] = request.headers.get("x-novie-project-id")
+        captured["workspace_id"] = request.headers.get("x-novie-workspace-id")
+        captured["service_principal"] = request.headers.get("x-novie-service-principal")
         captured["json"] = request.read()
         return httpx.Response(
             200,
@@ -49,7 +60,7 @@ async def test_list_candidate_issues_calls_pms_api_boundary() -> None:
     transport = httpx.MockTransport(responder)
     async with httpx.AsyncClient(transport=transport, base_url="http://platform.test") as http:
         client = build_pms_issue_client(
-            {"Authorization": "Bearer runtime-token"},
+            _INCOMING_HEADERS,
             base_url="http://platform.test",
             client=http,
         )
@@ -63,9 +74,15 @@ async def test_list_candidate_issues_calls_pms_api_boundary() -> None:
 
     assert captured["path"] == "/pms/issues/candidates"
     assert captured["authorization"] == "Bearer runtime-token"
+    assert captured["org_id"] == "tenant-1"
+    assert captured["project_id"] == "project-1"
+    assert captured["workspace_id"] == "tenant-1"
+    assert captured["service_principal"] == "agent:pms-test"
     assert b'"projectIds":["project-1"]' in captured["json"]
     assert b'"automationActions":["Review","Rework"]' in captured["json"]
     assert b'"includeHumanReview":true' in captured["json"]
+    assert b"organizationId" not in captured["json"]
+    assert b"workspaceId" not in captured["json"]
     assert issues[0].id == "issue-1"
     assert issues[0].automation_action == "Review"
     assert issues[0].status_title == "QA Gate"
@@ -80,6 +97,7 @@ async def test_list_issues_by_states_calls_pms_api_boundary() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
         captured["authorization"] = request.headers.get("authorization")
+        captured["org_id"] = request.headers.get("x-novie-org-id")
         captured["json"] = request.read()
         return httpx.Response(200, json={"data": {"issues": [{"id": "issue-1", "state": "Done"}]}})
 
@@ -88,7 +106,7 @@ async def test_list_issues_by_states_calls_pms_api_boundary() -> None:
         base_url="http://platform.test",
     ) as http:
         client = build_pms_issue_client(
-            {"Authorization": "Bearer runtime-token"},
+            _INCOMING_HEADERS,
             base_url="http://platform.test",
             client=http,
         )
@@ -101,8 +119,11 @@ async def test_list_issues_by_states_calls_pms_api_boundary() -> None:
 
     assert captured["path"] == "/pms/issues/by-states"
     assert captured["authorization"] == "Bearer runtime-token"
+    assert captured["org_id"] == "tenant-1"
     assert b'"states":["Done"]' in captured["json"]
     assert b'"projectIds":["project-1"]' in captured["json"]
+    assert b"organizationId" not in captured["json"]
+    assert b"workspaceId" not in captured["json"]
     assert issues[0].id == "issue-1"
 
 
@@ -120,7 +141,7 @@ async def test_fetch_active_cycle_id_calls_pms_api_boundary() -> None:
         base_url="http://platform.test",
     ) as http:
         client = build_pms_issue_client(
-            {"Authorization": "Bearer runtime-token"},
+            _INCOMING_HEADERS,
             base_url="http://platform.test",
             client=http,
         )
@@ -130,7 +151,7 @@ async def test_fetch_active_cycle_id_calls_pms_api_boundary() -> None:
         )
 
     assert captured["path"] == "/pms/issues/active-cycle"
-    assert b'"organizationId":"tenant-1"' in captured["json"]
+    assert captured["json"] == b"{}"
     assert cycle_id == "cycle-1"
 
 
@@ -157,7 +178,7 @@ async def test_update_agentic_orchestration_values_uses_durable_contract() -> No
         base_url="http://platform.test",
     ) as http:
         client = build_pms_issue_client(
-            {"Authorization": "Bearer runtime-token"},
+            _INCOMING_HEADERS,
             base_url="http://platform.test",
             client=http,
         )
@@ -172,6 +193,8 @@ async def test_update_agentic_orchestration_values_uses_durable_contract() -> No
     assert captured["path"] == "/pms/issues/update-agentic-orchestration-values"
     assert b'"issueId":"issue-1"' in captured["json"]
     assert b'"actorUserId":"agent-user"' in captured["json"]
+    assert b"organizationId" not in captured["json"]
+    assert b"workspaceId" not in captured["json"]
     assert values["rework"]["lastDeniedReason"] == "rework_required_missing_human_input"
 
 
@@ -199,7 +222,7 @@ async def test_list_comments_maps_created_at_and_author() -> None:
         base_url="http://platform.test",
     ) as http:
         client = build_pms_issue_client(
-            {"Authorization": "Bearer runtime-token"},
+            _INCOMING_HEADERS,
             base_url="http://platform.test",
             client=http,
         )

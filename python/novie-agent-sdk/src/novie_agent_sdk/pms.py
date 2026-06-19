@@ -13,6 +13,10 @@ from typing import Any
 
 import httpx
 
+from .platform_callback import (
+    build_platform_callback_headers,
+    sign_platform_callback_headers,
+)
 from .runtime import RequestHeaders
 
 
@@ -84,6 +88,11 @@ class PmsIssueClient:
         self._runtime_token = (runtime_token or _runtime_token_from_headers(incoming_headers) or "").strip()
         self._timeout_seconds = timeout_seconds
         self._client = client
+        self._platform_headers = build_platform_callback_headers(
+            incoming_headers or {},
+            agent_id="pms-sdk",
+            auth_source="pms_sdk",
+        )
 
     async def list_candidate_issues(
         self,
@@ -100,8 +109,6 @@ class PmsIssueClient:
                 "projectIds": [value for value in project_ids if value],
                 "automationActions": [value for value in automation_actions if value],
                 "includeHumanReview": include_human_review,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         rows = _list_field(payload, "issues", "nodes", "items")
@@ -118,8 +125,6 @@ class PmsIssueClient:
             "/pms/issues/get",
             {
                 "issueId": issue_id,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         row = _mapping_field(payload, "issue") or payload
@@ -138,8 +143,6 @@ class PmsIssueClient:
             {
                 "states": [value for value in states if value],
                 "projectIds": [value for value in project_ids if value],
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         rows = _list_field(payload, "issues", "nodes", "items")
@@ -153,10 +156,7 @@ class PmsIssueClient:
     ) -> str | None:
         payload = await self._post(
             "/pms/issues/active-cycle",
-            {
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
-            },
+            {},
         )
         value = _str_field(payload, "activeCycleId", "active_cycle_id", "cycleId", "id")
         return value or None
@@ -182,8 +182,6 @@ class PmsIssueClient:
                 "title": title,
                 "actorUserId": actor_user_id,
                 "reason": reason,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         row = _mapping_field(payload, "issue") or payload
@@ -204,8 +202,6 @@ class PmsIssueClient:
                 "issueId": issue_id,
                 "patch": dict(patch),
                 "actorUserId": actor_user_id,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         return _mapping_field(payload, "agenticOrchestrationValues") or payload
@@ -225,8 +221,6 @@ class PmsIssueClient:
                 "issueId": issue_id,
                 "content": content,
                 "authorId": author_id,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         row = _mapping_field(payload, "comment") or payload
@@ -249,8 +243,6 @@ class PmsIssueClient:
                 "marker": marker,
                 "content": content,
                 "authorId": author_id,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         row = _mapping_field(payload, "comment") or payload
@@ -269,8 +261,6 @@ class PmsIssueClient:
             {
                 "issueId": issue_id,
                 "first": first,
-                "organizationId": organization_id,
-                "workspaceId": workspace_id,
             },
         )
         rows = _list_field(payload, "comments", "nodes", "items")
@@ -281,11 +271,28 @@ class PmsIssueClient:
             raise PmsApiError("pms_api_unconfigured", "NOVIE_PLATFORM_BASE_URL is not set.")
         if not self._runtime_token:
             raise PmsApiError("pms_api_token_required", "A runtime token is required for PMS API calls.")
+        if not self._platform_headers.get("x-novie-org-id") or not self._platform_headers.get("x-novie-project-id"):
+            raise PmsApiError(
+                "pms_api_scope_required",
+                "PMS API calls require x-novie-org-id and x-novie-project-id.",
+            )
+        if not (
+            self._platform_headers.get("x-novie-user-id")
+            or self._platform_headers.get("x-novie-service-principal")
+        ):
+            raise PmsApiError(
+                "pms_api_identity_required",
+                "PMS API calls require x-novie-user-id or x-novie-service-principal.",
+            )
         body = {key: value for key, value in payload.items() if value is not None}
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self._runtime_token}",
-        }
+        headers = sign_platform_callback_headers(
+            {
+                **self._platform_headers,
+                "Authorization": f"Bearer {self._runtime_token}",
+            },
+            method="POST",
+            path=path,
+        )
         try:
             if self._client is not None:
                 response = await self._client.post(

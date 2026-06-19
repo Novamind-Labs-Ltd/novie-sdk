@@ -1,7 +1,16 @@
-use novie_agent_sdk::{Error, PmsIssueClient};
+use novie_agent_sdk::{Error, PmsIssueClient, PmsIssueIdentity};
 use serde_json::json;
-use wiremock::matchers::{bearer_token, body_json, method, path};
+use wiremock::matchers::{bearer_token, body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn pms_client(base_url: String) -> PmsIssueClient {
+    PmsIssueClient::with_identity(
+        base_url,
+        "runtime-token",
+        PmsIssueIdentity::service("tenant-1", "project-1", "agent:pms-test"),
+    )
+    .unwrap()
+}
 
 #[tokio::test]
 async fn list_candidate_issues_calls_pms_api_boundary() {
@@ -9,12 +18,14 @@ async fn list_candidate_issues_calls_pms_api_boundary() {
     Mock::given(method("POST"))
         .and(path("/pms/issues/candidates"))
         .and(bearer_token("runtime-token"))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-workspace-id", "tenant-1"))
+        .and(header("x-novie-service-principal", "agent:pms-test"))
         .and(body_json(json!({
             "projectIds": ["project-1"],
             "automationActions": ["Review", "Rework"],
-            "includeHumanReview": true,
-            "organizationId": "tenant-1",
-            "workspaceId": "workspace-1"
+            "includeHumanReview": true
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
@@ -41,7 +52,7 @@ async fn list_candidate_issues_calls_pms_api_boundary() {
         .mount(&server)
         .await;
 
-    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let client = pms_client(server.uri());
     let issues = client
         .list_candidate_issues(
             vec!["project-1".to_string()],
@@ -72,11 +83,13 @@ async fn list_issues_by_states_calls_pms_api_boundary() {
     Mock::given(method("POST"))
         .and(path("/pms/issues/by-states"))
         .and(bearer_token("runtime-token"))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-workspace-id", "tenant-1"))
+        .and(header("x-novie-service-principal", "agent:pms-test"))
         .and(body_json(json!({
             "states": ["Done"],
-            "projectIds": ["project-1"],
-            "organizationId": "tenant-1",
-            "workspaceId": "workspace-1"
+            "projectIds": ["project-1"]
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "issues": [{ "id": "issue-1", "state": "Done" }] }
@@ -84,7 +97,7 @@ async fn list_issues_by_states_calls_pms_api_boundary() {
         .mount(&server)
         .await;
 
-    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let client = pms_client(server.uri());
     let issues = client
         .list_issues_by_states(
             vec!["Done".to_string()],
@@ -104,17 +117,18 @@ async fn fetch_active_cycle_id_calls_pms_api_boundary() {
     Mock::given(method("POST"))
         .and(path("/pms/issues/active-cycle"))
         .and(bearer_token("runtime-token"))
-        .and(body_json(json!({
-            "organizationId": "tenant-1",
-            "workspaceId": "workspace-1"
-        })))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-workspace-id", "tenant-1"))
+        .and(header("x-novie-service-principal", "agent:pms-test"))
+        .and(body_json(json!({})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "activeCycleId": "cycle-1" }
         })))
         .mount(&server)
         .await;
 
-    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let client = pms_client(server.uri());
     let cycle_id = client
         .fetch_active_cycle_id(Some("tenant-1"), Some("workspace-1"))
         .await
@@ -129,14 +143,16 @@ async fn update_agentic_orchestration_values_uses_durable_contract() {
     Mock::given(method("POST"))
         .and(path("/pms/issues/update-agentic-orchestration-values"))
         .and(bearer_token("runtime-token"))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-workspace-id", "tenant-1"))
+        .and(header("x-novie-service-principal", "agent:pms-test"))
         .and(body_json(json!({
             "issueId": "issue-1",
             "patch": {
                 "rework": { "lastDeniedReason": "rework_required_missing_human_input" }
             },
-            "actorUserId": "agent-user",
-            "organizationId": "tenant-1",
-            "workspaceId": "workspace-1"
+            "actorUserId": "agent-user"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
@@ -148,7 +164,7 @@ async fn update_agentic_orchestration_values_uses_durable_contract() {
         .mount(&server)
         .await;
 
-    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let client = pms_client(server.uri());
     let values = client
         .update_agentic_orchestration_values(
             "issue-1",
@@ -172,6 +188,10 @@ async fn list_comments_maps_created_at_and_author() {
     Mock::given(method("POST"))
         .and(path("/pms/issues/comments"))
         .and(bearer_token("runtime-token"))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-workspace-id", "tenant-1"))
+        .and(header("x-novie-service-principal", "agent:pms-test"))
         .and(body_json(json!({
             "issueId": "issue-1",
             "first": 20
@@ -189,7 +209,7 @@ async fn list_comments_maps_created_at_and_author() {
         .mount(&server)
         .await;
 
-    let client = PmsIssueClient::new(server.uri(), "runtime-token").unwrap();
+    let client = pms_client(server.uri());
     let comments = client
         .list_comments("issue-1", Some(20), None, None)
         .await
