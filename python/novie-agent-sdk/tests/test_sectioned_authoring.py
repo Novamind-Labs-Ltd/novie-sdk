@@ -6,7 +6,9 @@ import pytest
 
 from novie_agent_sdk import (
     PlatformLlmCallError,
+    SectionDraft,
     SectionedLongformAuthor,
+    SectionPlan,
     SkillContractResolver,
     run_sectioned_document_finalization,
     sectioned_authoring_contract_from_skill,
@@ -94,6 +96,7 @@ class _FlakyStreamLlm:
         *,
         temperature: float,
         max_output_tokens: int,
+        model: str | None = None,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -961,3 +964,158 @@ async def test_sectioned_author_excludes_current_step_workpad_refs_from_evidence
     assert draft_prompts
     assert "evidence from upstream-s1-evidence" in draft_prompts[0]
     assert "stale-s2-section" not in draft_prompts[0]
+
+
+class _BridgeLlm:
+    """Minimal LLM double for the boundary-stitch finalize path."""
+
+    def __init__(self, bridge: str = "With that established, the next theme follows.") -> None:
+        self.bridge = bridge
+        self.chat_kwargs: list[dict[str, Any]] = []
+        self.chat_prompts: list[str] = []
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        self.chat_prompts.append(messages[0]["content"])
+        return {"content": self.bridge}
+
+
+def _stitch_author(
+    llm: Any,
+    *,
+    phase_events: list[dict[str, Any]],
+    contract_extra: dict[str, Any] | None = None,
+) -> SectionedLongformAuthor:
+    contract: dict[str, Any] = {
+        "coverage_model": "example_document",
+        "finalization": "boundary_stitch",
+    }
+    if contract_extra:
+        contract.update(contract_extra)
+    return SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        authoring_contract=contract,
+        phase_event_sink=phase_events.append,
+    )
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="With that established, attention turns to the next theme.")
+    author = _stitch_author(llm, phase_events=phase_events)
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Context"),
+            markdown="## Context\n\nalpha beta gamma.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s2", title="Findings"),
+            markdown="## Findings\n\ndelta epsilon zeta.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s3", title="Recommendation"),
+            markdown="## Recommendation\n\neta theta iota.",
+        ),
+    ]
+    combined = "\n\n".join(draft.markdown for draft in drafts)
+
+    result = await author._boundary_stitch_final(
+        brief={"title": "Doc"}, drafts=drafts, combined=combined
+    )
+
+    # Every section body is preserved verbatim — the seam pass cannot drop content.
+    for draft in drafts:
+        assert draft.markdown in result
+    # A transition bridge was inserted between sections.
+    assert "With that established" in result
+    # One LLM call per seam (3 sections -> 2 seams), all seam-stitch prompts.
+    assert len(llm.chat_prompts) == 2
+    assert all("smoothing the seam" in prompt for prompt in llm.chat_prompts)
+    events = [event["event"] for event in phase_events]
+    assert events.count("document.final.seam_stitch_started") == 2
+    assert events.count("document.final.seam_stitch_completed") == 2
+    # Normal-size document must not trigger a truncation warning.
+    assert "document.final.truncation_warning" not in events
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_single_section_skips_llm() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm()
+    author = _stitch_author(llm, phase_events=phase_events)
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Only"),
+            markdown="## Only\n\nalpha beta gamma.",
+        )
+    ]
+
+    result = await author._boundary_stitch_final(
+        brief={}, drafts=drafts, combined=drafts[0].markdown
+    )
+
+    assert result == drafts[0].markdown
+    assert llm.chat_prompts == []
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_forwards_finalize_model_override() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="Next.")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={"finalize_model": "custom-finalize-model"},
+    )
+    drafts = [
+        SectionDraft(plan=SectionPlan(section_id="s1", title="A"), markdown="## A\n\nalpha beta."),
+        SectionDraft(plan=SectionPlan(section_id="s2", title="B"), markdown="## B\n\ngamma delta."),
+    ]
+
+    await author._boundary_stitch_final(
+        brief={}, drafts=drafts, combined="\n\n".join(d.markdown for d in drafts)
+    )
+
+    assert llm.chat_kwargs
+    assert all(kw.get("model") == "custom-finalize-model" for kw in llm.chat_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_bounded_for_final_prompt_emits_truncation_warning() -> None:
+    phase_events: list[dict[str, Any]] = []
+    author = _stitch_author(_BridgeLlm(), phase_events=phase_events)
+
+    short = "x" * 100
+    assert (
+        await author._bounded_for_final_prompt(short, limit=200, phase="single_polish")
+        == short
+    )
+    assert all(
+        event["event"] != "document.final.truncation_warning" for event in phase_events
+    )
+
+    long = "y" * 500
+    bounded = await author._bounded_for_final_prompt(
+        long, limit=200, phase="single_polish"
+    )
+    assert bounded == "y" * 200
+    warnings = [
+        event
+        for event in phase_events
+        if event["event"] == "document.final.truncation_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["input_chars"] == 500
+    assert warnings[0]["dropped_chars"] == 300
+    assert warnings[0]["phase"] == "single_polish"

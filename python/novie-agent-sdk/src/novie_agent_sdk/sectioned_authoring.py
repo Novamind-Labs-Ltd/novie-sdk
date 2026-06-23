@@ -89,6 +89,8 @@ class SectionedAuthoringContract:
     max_section_words: int = 280
     max_section_revision_rounds: int = 1
     final_retention_ratio: float = 0.8
+    seam_context_chars: int = 1500
+    finalize_model: str = ""
     require_evidence_refs: bool = True
     require_confidence_layer: bool = False
     forbid_step_artifact_only_citations: bool = False
@@ -128,6 +130,8 @@ class SectionedAuthoringContract:
                 1,
             ),
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.8),
+            seam_context_chars=_positive_int(raw.get("seam_context_chars"), 1500),
+            finalize_model=str(raw.get("finalize_model") or ""),
             require_evidence_refs=_bool(raw.get("require_evidence_refs"), True),
             require_confidence_layer=_bool(
                 raw.get("require_confidence_layer"),
@@ -970,6 +974,7 @@ class SectionedLongformAuthor:
         messages: list[dict[str, Any]],
         temperature: float,
         max_output_tokens: int,
+        model: str | None = None,
         section: SectionPlan | None = None,
         section_index: int | None = None,
         extra_metadata: Mapping[str, Any] | None = None,
@@ -1008,6 +1013,7 @@ class SectionedLongformAuthor:
                         messages=messages,
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
+                        model=model,
                     )
                     content = str(result.get("content") or "")
                     if content:
@@ -1027,6 +1033,7 @@ class SectionedLongformAuthor:
                         messages,
                         temperature=temperature,
                         max_output_tokens=max_output_tokens,
+                        model=model,
                     ):
                         delta = _llm_stream_event_delta(event)
                         if delta:
@@ -1275,6 +1282,34 @@ class SectionedLongformAuthor:
             return ""
         return _ensure_section_heading(content, plan.title)
 
+    async def _bounded_for_final_prompt(
+        self,
+        text: str,
+        *,
+        limit: int,
+        phase: str,
+        seam_index: int | None = None,
+    ) -> str:
+        """Bound prompt input, emitting a warning event when truncation occurs.
+
+        Finalize prompts still cap their input, but truncation is never silent:
+        a ``document.final.truncation_warning`` event records the dropped span so
+        a degraded long-document finalize is observable rather than hidden.
+        """
+        if len(text) <= limit:
+            return text
+        metadata: dict[str, Any] = {
+            "status": "degraded",
+            "phase": phase,
+            "input_chars": len(text),
+            "limit": limit,
+            "dropped_chars": len(text) - limit,
+        }
+        if seam_index is not None:
+            metadata["cluster_index"] = seam_index
+        await self._emit("document.final.truncation_warning", **metadata)
+        return text[:limit]
+
     async def _polish_final(
         self,
         *,
@@ -1282,6 +1317,12 @@ class SectionedLongformAuthor:
         drafts: list[SectionDraft],
     ) -> str:
         combined = _join_markdown(draft.markdown for draft in drafts)
+        if self._contract.finalization == "boundary_stitch":
+            return await self._boundary_stitch_final(
+                brief=brief,
+                drafts=drafts,
+                combined=combined,
+            )
         if self._contract.finalization == "progressive_section_merge":
             return await self._progressive_merge_final(
                 brief=brief,
@@ -1293,6 +1334,76 @@ class SectionedLongformAuthor:
             drafts=drafts,
             combined=combined,
         )
+
+    async def _boundary_stitch_final(
+        self,
+        *,
+        brief: Mapping[str, Any],
+        drafts: list[SectionDraft],
+        combined: str,
+    ) -> str:
+        """Smooth seams between sections without rewriting their bodies.
+
+        Section bodies are preserved verbatim; the LLM only produces a short
+        transition between adjacent sections. The prompt footprint is O(number
+        of seams) and independent of total document length, so this path never
+        truncates and cannot drop section content.
+        """
+        bodies = [draft.markdown.strip() for draft in drafts if draft.markdown.strip()]
+        if len(bodies) <= 1:
+            return combined
+        finalize_model = self._contract.finalize_model or None
+        limit = max(200, self._contract.seam_context_chars)
+
+        async def _bridge(seam_index: int) -> str:
+            before = bodies[seam_index]
+            after = bodies[seam_index + 1]
+            await self._emit(
+                "document.final.seam_stitch_started",
+                status="running",
+                seam_index=seam_index + 1,
+                seam_count=len(bodies) - 1,
+                length_profile=self._contract.length_profile,
+            )
+            prompt = (
+                "You are smoothing the seam between two adjacent sections of one "
+                "Markdown document. Write ONLY a short transition of at most two "
+                "sentences (no heading, no list) that leads from the first section "
+                "into the second. Do not repeat or summarize their content and do "
+                "not introduce new facts or citations. If the flow already reads "
+                "smoothly, return an empty string.\n\n"
+                f"Original task:\n{_json_block(brief, limit=4000)}\n\n"
+                f"End of preceding section:\n{before[-limit:]}\n\n"
+                f"Start of following section:\n{after[:limit]}"
+            )
+            bridge = await self._stream_llm_text(
+                purpose="seam_stitch",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_output_tokens=200,
+                model=finalize_model,
+                extra_metadata={"seam_index": seam_index + 1},
+            )
+            bridge = bridge.strip()
+            await self._emit(
+                "document.final.seam_stitch_completed",
+                status="complete",
+                seam_index=seam_index + 1,
+                bridged=bool(bridge),
+                length_profile=self._contract.length_profile,
+            )
+            return bridge
+
+        bridges = await asyncio.gather(
+            *(_bridge(seam_index) for seam_index in range(len(bodies) - 1))
+        )
+        parts: list[str] = [bodies[0]]
+        for index in range(1, len(bodies)):
+            bridge = bridges[index - 1]
+            if bridge:
+                parts.append(bridge)
+            parts.append(bodies[index])
+        return _join_markdown(parts)
 
     async def _single_polish_final(
         self,
@@ -1309,19 +1420,25 @@ class SectionedLongformAuthor:
             }
             for draft in drafts
         ]
+        draft_sections = await self._bounded_for_final_prompt(
+            combined,
+            limit=48000,
+            phase="single_polish",
+        )
         prompt = (
             "Polish the concatenated sections into one coherent final Markdown deliverable. "
             "Preserve factual claims, source refs, and section substance. "
             "Improve transitions and remove repetition without shortening materially.\n\n"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
-            f"Draft sections:\n{combined[:48000]}"
+            f"Draft sections:\n{draft_sections}"
         )
         polished = await self._stream_llm_text(
             purpose="final_polish",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_output_tokens=_final_output_token_budget(combined),
+            model=self._contract.finalize_model or None,
             extra_metadata={"section_count": len(drafts)},
         )
         polished = polished.strip()
@@ -1370,6 +1487,12 @@ class SectionedLongformAuthor:
                 section_count=len(cluster),
                 length_profile=self._contract.length_profile,
             )
+            cluster_sections = await self._bounded_for_final_prompt(
+                cluster_markdown,
+                limit=36000,
+                phase="merge_cluster",
+                seam_index=cluster_index,
+            )
             prompt = (
                 "Merge this cluster of adjacent report sections into one "
                 "coherent Markdown chapter block. Preserve all factual claims, "
@@ -1377,13 +1500,14 @@ class SectionedLongformAuthor:
                 "clear repetition.\n\n"
                 f"Original task:\n{_json_block(brief, limit=6000)}\n\n"
                 f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
-                f"Cluster draft sections:\n{cluster_markdown[:36000]}"
+                f"Cluster draft sections:\n{cluster_sections}"
             )
             merged = await self._stream_llm_text(
                 purpose="merge_cluster",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_output_tokens=_final_output_token_budget(cluster_markdown),
+                model=self._contract.finalize_model or None,
                 extra_metadata={
                     "cluster_index": cluster_index,
                     "section_count": len(cluster),
