@@ -80,6 +80,17 @@ from .github_operations import (
     GitHubOperationsClient,
     build_github_operations_client,
 )
+from .pms import (
+    PmsApiError,
+    PmsComment,
+    PmsIssue,
+    PmsIssueClient,
+    PmsStatus,
+    build_pms_issue_client,
+    normalize_pms_automation_action,
+    pms_comment_from_mapping,
+    pms_issue_from_mapping,
+)
 from .tenant_scoping import (
     TenantScopedCache,
     validate_tenant_context,

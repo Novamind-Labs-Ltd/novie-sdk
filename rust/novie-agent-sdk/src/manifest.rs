@@ -502,10 +502,7 @@ mod tests {
         assert_eq!(m.agent_id, "novie-cortex");
         assert_eq!(m.protocol_mode, ProtocolMode::Tasks);
         assert_eq!(m.execution.durability, DurabilityLevel::TaskStore);
-        assert_eq!(
-            m.required_secrets,
-            vec!["ANTHROPIC_API_KEY"]
-        );
+        assert_eq!(m.required_secrets, vec!["ANTHROPIC_API_KEY"]);
         assert_eq!(m.task_bundles_path, "/task-bundles");
         assert!(!m.capability_manifest.is_empty());
         assert!(m.metadata.contains_key("owner_team"));

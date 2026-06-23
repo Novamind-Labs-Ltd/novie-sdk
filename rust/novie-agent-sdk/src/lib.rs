@@ -88,6 +88,7 @@ pub mod memory;
 pub mod payload;
 pub mod platform_llm;
 pub mod platform_services;
+pub mod pms;
 pub mod session;
 pub mod token;
 pub mod transport;
@@ -103,6 +104,7 @@ pub use platform_llm::{
     StructuredOptions, TokenUsage, UsageReport,
 };
 pub use platform_services::PlatformServicesClient;
+pub use pms::{PmsComment, PmsIssue, PmsIssueClient, PmsIssueIdentity, PmsStatus};
 pub use token::{
     CallbackTokenClaims, MintContext, mint_callback_token, mint_with_clock, verify_callback_token,
     verify_with_clock,

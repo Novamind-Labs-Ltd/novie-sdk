@@ -6,7 +6,9 @@ import pytest
 
 from novie_agent_sdk import (
     PlatformLlmCallError,
+    SectionDraft,
     SectionedLongformAuthor,
+    SectionPlan,
     SkillContractResolver,
     run_sectioned_document_finalization,
     sectioned_authoring_contract_from_skill,
@@ -94,6 +96,7 @@ class _FlakyStreamLlm:
         *,
         temperature: float,
         max_output_tokens: int,
+        model: str | None = None,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -961,3 +964,288 @@ async def test_sectioned_author_excludes_current_step_workpad_refs_from_evidence
     assert draft_prompts
     assert "evidence from upstream-s1-evidence" in draft_prompts[0]
     assert "stale-s2-section" not in draft_prompts[0]
+
+
+class _BridgeLlm:
+    """Minimal LLM double for the boundary-stitch finalize path."""
+
+    def __init__(self, bridge: str = "With that established, the next theme follows.") -> None:
+        self.bridge = bridge
+        self.chat_kwargs: list[dict[str, Any]] = []
+        self.chat_prompts: list[str] = []
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        self.chat_prompts.append(messages[0]["content"])
+        return {"content": self.bridge}
+
+
+def _stitch_author(
+    llm: Any,
+    *,
+    phase_events: list[dict[str, Any]],
+    contract_extra: dict[str, Any] | None = None,
+) -> SectionedLongformAuthor:
+    contract: dict[str, Any] = {
+        "coverage_model": "example_document",
+        "finalization": "boundary_stitch",
+    }
+    if contract_extra:
+        contract.update(contract_extra)
+    return SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        authoring_contract=contract,
+        phase_event_sink=phase_events.append,
+    )
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="With that established, attention turns to the next theme.")
+    author = _stitch_author(llm, phase_events=phase_events)
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Context"),
+            markdown="## Context\n\nalpha beta gamma.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s2", title="Findings"),
+            markdown="## Findings\n\ndelta epsilon zeta.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s3", title="Recommendation"),
+            markdown="## Recommendation\n\neta theta iota.",
+        ),
+    ]
+    combined = "\n\n".join(draft.markdown for draft in drafts)
+
+    result = await author._boundary_stitch_final(
+        brief={"title": "Doc"}, drafts=drafts, combined=combined
+    )
+
+    # Every section body is preserved verbatim — the seam pass cannot drop content.
+    for draft in drafts:
+        assert draft.markdown in result
+    # A transition bridge was inserted between sections.
+    assert "With that established" in result
+    # One LLM call per seam (3 sections -> 2 seams), all seam-stitch prompts.
+    assert len(llm.chat_prompts) == 2
+    assert all("smoothing the seam" in prompt for prompt in llm.chat_prompts)
+    events = [event["event"] for event in phase_events]
+    assert events.count("document.final.seam_stitch_started") == 2
+    assert events.count("document.final.seam_stitch_completed") == 2
+    # Normal-size document must not trigger a truncation warning.
+    assert "document.final.truncation_warning" not in events
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_single_section_skips_llm() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm()
+    author = _stitch_author(llm, phase_events=phase_events)
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Only"),
+            markdown="## Only\n\nalpha beta gamma.",
+        )
+    ]
+
+    result = await author._boundary_stitch_final(
+        brief={}, drafts=drafts, combined=drafts[0].markdown
+    )
+
+    assert result == drafts[0].markdown
+    assert llm.chat_prompts == []
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_forwards_finalize_model_override() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="Next.")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={"finalize_model": "custom-finalize-model"},
+    )
+    drafts = [
+        SectionDraft(plan=SectionPlan(section_id="s1", title="A"), markdown="## A\n\nalpha beta."),
+        SectionDraft(plan=SectionPlan(section_id="s2", title="B"), markdown="## B\n\ngamma delta."),
+    ]
+
+    await author._boundary_stitch_final(
+        brief={}, drafts=drafts, combined="\n\n".join(d.markdown for d in drafts)
+    )
+
+    assert llm.chat_kwargs
+    assert all(kw.get("model") == "custom-finalize-model" for kw in llm.chat_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_bounded_for_final_prompt_emits_truncation_warning() -> None:
+    phase_events: list[dict[str, Any]] = []
+    author = _stitch_author(_BridgeLlm(), phase_events=phase_events)
+
+    short = "x" * 100
+    assert (
+        await author._bounded_for_final_prompt(short, limit=200, phase="single_polish")
+        == short
+    )
+    assert all(
+        event["event"] != "document.final.truncation_warning" for event in phase_events
+    )
+
+    long = "y" * 500
+    bounded = await author._bounded_for_final_prompt(
+        long, limit=200, phase="single_polish"
+    )
+    assert bounded == "y" * 200
+    warnings = [
+        event
+        for event in phase_events
+        if event["event"] == "document.final.truncation_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["input_chars"] == 500
+    assert warnings[0]["dropped_chars"] == 300
+    assert warnings[0]["phase"] == "single_polish"
+
+
+def _running_context_author(
+    llm: Any,
+    *,
+    phase_events: list[dict[str, Any]],
+    contract_extra: dict[str, Any] | None = None,
+) -> SectionedLongformAuthor:
+    contract: dict[str, Any] = {
+        "coverage_model": "example_document",
+        "length_profile": "long",
+        "min_outline_sections": 5,
+        "max_outline_sections": 5,
+        "min_section_words": 5,
+        "default_section_words": 5,
+        "max_section_words": 20,
+        "running_context_window_k": 2,
+    }
+    if contract_extra:
+        contract.update(contract_extra)
+    return SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract=contract,
+        phase_event_sink=phase_events.append,
+    )
+
+
+def test_compose_running_context_windows_bodies_and_summarizes_older() -> None:
+    author = _stitch_author(
+        _BridgeLlm(), phase_events=[], contract_extra={"running_context_window_k": 2}
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id=f"s{i}", title=f"T{i}"),
+            markdown=f"## T{i}\n\nbody-{i}",
+        )
+        for i in range(1, 5)
+    ]
+
+    ctx = author._compose_running_context(drafts, running_summary="EARLIER-SUMMARY")
+
+    # Older sections are represented by the summary, not their verbatim bodies.
+    assert "EARLIER-SUMMARY" in ctx
+    assert "body-1" not in ctx
+    assert "body-2" not in ctx
+    # The last k=2 sections are included verbatim.
+    assert "body-3" in ctx
+    assert "body-4" in ctx
+
+
+@pytest.mark.asyncio
+async def test_fold_running_summary_forwards_model_and_emits_event() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="FOLDED SUMMARY")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={
+            "running_summary_model": "sum-model",
+            "running_summary_max_tokens": 400,
+        },
+    )
+    dropped = SectionDraft(
+        plan=SectionPlan(section_id="s1", title="T1"),
+        markdown="## T1\n\nalpha beta gamma.",
+    )
+
+    out = await author._fold_running_summary("prior summary", dropped)
+
+    assert out == "FOLDED SUMMARY"
+    assert llm.chat_kwargs
+    assert all(kw.get("model") == "sum-model" for kw in llm.chat_kwargs)
+    assert any("Maintain a running summary" in prompt for prompt in llm.chat_prompts)
+    assert any(
+        event["event"] == "document.running_summary.updated" for event in phase_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_running_context_feeds_prior_context_and_folds_incrementally() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _LongFakeLlm()
+    author = _running_context_author(llm, phase_events=phase_events)
+
+    await author.author(
+        brief={"title": "Doc"},
+        upstream={},
+        workflow_id="w",
+        thread_id="t",
+        agent_id="a",
+    )
+
+    # 5 sections, window k=2 -> one fold per section that leaves the window = 3.
+    fold_prompts = [p for p in llm.chat_prompts if "Maintain a running summary" in p]
+    assert len(fold_prompts) == 3
+    updates = [
+        event
+        for event in phase_events
+        if event["event"] == "document.running_summary.updated"
+    ]
+    assert len(updates) == 3
+    # Later section drafts carry the running-context block.
+    draft_prompts = [
+        p for p in llm.chat_prompts if "Write exactly this document section" in p
+    ]
+    assert any("Document so far" in p for p in draft_prompts)
+
+
+@pytest.mark.asyncio
+async def test_running_context_disabled_uses_refs_only() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _LongFakeLlm()
+    author = _running_context_author(
+        llm, phase_events=phase_events, contract_extra={"running_context": False}
+    )
+
+    await author.author(
+        brief={"title": "Doc"},
+        upstream={},
+        workflow_id="w",
+        thread_id="t",
+        agent_id="a",
+    )
+
+    assert all("Document so far" not in prompt for prompt in llm.chat_prompts)
+    assert all("Maintain a running summary" not in prompt for prompt in llm.chat_prompts)

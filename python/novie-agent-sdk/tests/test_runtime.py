@@ -936,6 +936,21 @@ async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     }
 
 
+def test_request_headers_treat_org_id_as_tenant_and_workspace_fallback() -> None:
+    headers = RequestHeaders.from_request(
+        {
+            "x-novie-org-id": "org-1",
+            "x-novie-project-id": "project-1",
+            "x-novie-user-id": "user-1",
+        }
+    )
+
+    assert headers.tenant_id == "org-1"
+    assert headers.workspace_id == "org-1"
+    assert headers.project_id == "project-1"
+    assert headers.user_id == "user-1"
+
+
 @pytest.mark.asyncio
 async def test_simple_agent_replays_duplicate_idempotency_key():
     import httpx
