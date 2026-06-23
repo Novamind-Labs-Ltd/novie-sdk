@@ -462,7 +462,7 @@ def sectioned_authoring_contract_from_skill(
         max_section_revision_rounds = document.section.max_revision_rounds or 1
         final_retention_ratio = document.final.min_retention_ratio or 0.8
 
-    return {
+    settings: dict[str, Any] = {
         "coverage_model": raw_document.get("coverage_model") or artifact_type,
         "length_profile": base_length_profile,
         "profile_source": profile_source,
@@ -502,6 +502,25 @@ def sectioned_authoring_contract_from_skill(
         "record_section_refs": contract.workpad.record_section_refs,
         "record_final_deliverable_ref": contract.workpad.record_final_deliverable_ref,
     }
+    # PR1 boundary-stitch / PR2 running-context tuning knobs. Forwarded only when
+    # the skill contract sets them — per length profile first, then the runtime
+    # block — so unspecified knobs fall through to the SectionedAuthoringContract
+    # defaults (running_context stays on, finalization unchanged, etc.).
+    runtime_raw = dict(contract.runtime.raw or {})
+    profile_raw = dict(profile.raw) if profile is not None else {}
+    for knob in (
+        "seam_context_chars",
+        "finalize_model",
+        "running_context",
+        "running_context_window_k",
+        "running_summary_max_tokens",
+        "running_summary_model",
+    ):
+        if profile_raw.get(knob) is not None:
+            settings[knob] = profile_raw[knob]
+        elif runtime_raw.get(knob) is not None:
+            settings[knob] = runtime_raw[knob]
+    return settings
 
 
 class SectionedLongformAuthor:

@@ -1,6 +1,6 @@
 [project]
 name = "novie-agent-sdk"
-version = "0.3.26"
+version = "0.3.27"
 description = "Novie Agent SDK: A2A task runtime (FastAPI), observability helpers, and protocol-aligned prompt utilities."
 readme = "README.md"
 requires-python = ">=3.14"
