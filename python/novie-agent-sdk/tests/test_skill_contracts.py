@@ -7,9 +7,12 @@ import pytest
 from novie_agent_sdk import (
     ContextPackBuilder,
     EvidencePackBuilder,
+    SectionedAuthoringContract,
     SkillContractError,
     SkillContractResolver,
+    sectioned_authoring_contract_from_skill,
 )
+from novie_agent_sdk.skill_contracts import _contract_from_mapping
 
 
 def test_skill_contract_resolver_merges_skill_frontmatter_sources(tmp_path: Path) -> None:
@@ -248,3 +251,95 @@ def test_skill_contract_resolver_required_raises_when_missing(tmp_path: Path) ->
 
 def test_context_pack_builder_is_generic_alias() -> None:
     assert issubclass(ContextPackBuilder, EvidencePackBuilder)
+
+
+def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> None:
+    raw = {
+        "version": 1,
+        "name": "report-synthesis",
+        "runtime": {
+            "strategy": "sectioned_longform",
+            "finalization": "section_ledger_polish",
+            "running_context": True,
+            "running_context_window_k": 2,
+            "running_summary_model": "summary-model",
+            "finalize_model": "finalize-model",
+        },
+        "document": {
+            "coverage_model": "management_report",
+            "length_profiles": {
+                "long": {
+                    "strategy": "sectioned_longform",
+                    "finalization": "boundary_stitch",
+                    "max_sections": 16,
+                    "running_context_window_k": 3,
+                    "seam_context_chars": 2400,
+                    "running_summary_max_tokens": 600,
+                },
+            },
+        },
+    }
+    contract = _contract_from_mapping(raw, sources=(), warnings=())
+
+    settings = sectioned_authoring_contract_from_skill(
+        contract, artifact_type="management_report", length_profile="long"
+    )
+
+    # Per-profile values win; runtime-level values fill the rest.
+    assert settings["finalization"] == "boundary_stitch"
+    assert settings["running_context_window_k"] == 3  # profile overrides runtime 2
+    assert settings["seam_context_chars"] == 2400  # profile only
+    assert settings["running_summary_max_tokens"] == 600  # profile only
+    assert settings["running_summary_model"] == "summary-model"  # runtime
+    assert settings["finalize_model"] == "finalize-model"  # runtime
+    assert settings["running_context"] is True  # runtime
+
+    typed = SectionedAuthoringContract.from_mapping(settings)
+    assert typed.finalization == "boundary_stitch"
+    assert typed.running_context_window_k == 3
+    assert typed.seam_context_chars == 2400
+    assert typed.running_summary_max_tokens == 600
+    assert typed.running_summary_model == "summary-model"
+    assert typed.finalize_model == "finalize-model"
+    assert typed.running_context is True
+
+
+def test_sectioned_contract_omits_tuning_knobs_when_unspecified() -> None:
+    raw = {
+        "version": 1,
+        "name": "report-synthesis",
+        "runtime": {"strategy": "sectioned_longform"},
+        "document": {
+            "length_profiles": {
+                "long": {
+                    "strategy": "sectioned_longform",
+                    "finalization": "single_polish",
+                    "max_sections": 16,
+                },
+            },
+        },
+    }
+    contract = _contract_from_mapping(raw, sources=(), warnings=())
+
+    settings = sectioned_authoring_contract_from_skill(
+        contract, artifact_type="r", length_profile="long"
+    )
+
+    for knob in (
+        "seam_context_chars",
+        "finalize_model",
+        "running_context",
+        "running_context_window_k",
+        "running_summary_max_tokens",
+        "running_summary_model",
+    ):
+        assert knob not in settings
+
+    # Unspecified knobs fall through to the SectionedAuthoringContract defaults.
+    typed = SectionedAuthoringContract.from_mapping(settings)
+    assert typed.running_context is True
+    assert typed.running_context_window_k == 2
+    assert typed.running_summary_max_tokens == 400
+    assert typed.seam_context_chars == 1500
+    assert typed.finalize_model == ""
+    assert typed.running_summary_model == ""
