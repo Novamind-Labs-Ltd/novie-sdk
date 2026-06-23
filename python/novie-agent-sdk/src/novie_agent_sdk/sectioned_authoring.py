@@ -91,6 +91,10 @@ class SectionedAuthoringContract:
     final_retention_ratio: float = 0.8
     seam_context_chars: int = 1500
     finalize_model: str = ""
+    running_context: bool = True
+    running_context_window_k: int = 2
+    running_summary_max_tokens: int = 400
+    running_summary_model: str = ""
     require_evidence_refs: bool = True
     require_confidence_layer: bool = False
     forbid_step_artifact_only_citations: bool = False
@@ -132,6 +136,14 @@ class SectionedAuthoringContract:
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.8),
             seam_context_chars=_positive_int(raw.get("seam_context_chars"), 1500),
             finalize_model=str(raw.get("finalize_model") or ""),
+            running_context=_bool(raw.get("running_context"), True),
+            running_context_window_k=_positive_int(
+                raw.get("running_context_window_k"), 2
+            ),
+            running_summary_max_tokens=_positive_int(
+                raw.get("running_summary_max_tokens"), 400
+            ),
+            running_summary_model=str(raw.get("running_summary_model") or ""),
             require_evidence_refs=_bool(raw.get("require_evidence_refs"), True),
             require_confidence_layer=_bool(
                 raw.get("require_confidence_layer"),
@@ -616,6 +628,13 @@ class SectionedLongformAuthor:
         degraded_sections: list[dict[str, Any]] = list(
             state.get("degraded_sections") if isinstance(state.get("degraded_sections"), list) else []
         )
+        window_k = max(0, self._contract.running_context_window_k)
+        running_summary = str(state.get("running_summary") or "")
+        if self._contract.running_context and not running_summary and len(drafts) > window_k:
+            # Resuming a checkpoint that predates running-summary state: rebuild it
+            # by folding the sections already outside the recent-body window.
+            for dropped in drafts[: len(drafts) - window_k]:
+                running_summary = await self._fold_running_summary(running_summary, dropped)
         for index, plan in enumerate(outline[len(drafts) :], start=len(drafts) + 1):
             await self._emit(
                 "document.section.started",
@@ -680,12 +699,18 @@ class SectionedLongformAuthor:
                     reasons=list(evidence_pack.warnings)
                     or ["empty_evidence_pack"],
                 )
+            running_context = (
+                self._compose_running_context(drafts, running_summary)
+                if self._contract.running_context
+                else ""
+            )
             markdown = await self._draft_section(
                 brief=brief,
                 plan=plan,
                 section_index=index,
                 previous=drafts,
                 evidence_pack=evidence_pack_input,
+                running_context=running_context,
             )
             quality = _evaluate_section_quality(
                 plan=plan,
@@ -714,6 +739,7 @@ class SectionedLongformAuthor:
                     section_index=index,
                     previous=drafts,
                     evidence_pack=evidence_pack_input,
+                    running_context=running_context,
                     revision_feedback=quality,
                 )
                 quality = _evaluate_section_quality(
@@ -797,6 +823,11 @@ class SectionedLongformAuthor:
                     quality=quality.to_metadata(),
                 )
             )
+            if self._contract.running_context and len(drafts) > window_k:
+                # The section that just left the recent-body window is folded once
+                # into the running summary (incremental fold).
+                dropped = drafts[len(drafts) - window_k - 1]
+                running_summary = await self._fold_running_summary(running_summary, dropped)
             await self._checkpoint(
                 current_phase="draft_sections",
                 length_profile=length_profile,
@@ -804,6 +835,7 @@ class SectionedLongformAuthor:
                 outline_ref=outline_ref,
                 drafts=[_draft_resume_record(draft) for draft in drafts],
                 degraded_sections=degraded_sections,
+                running_summary=running_summary,
             )
 
         await self._emit(
@@ -1230,6 +1262,68 @@ class SectionedLongformAuthor:
             tuple(fallback[: max(self._contract.min_outline_sections, 1)]),
         )
 
+    def _compose_running_context(
+        self,
+        drafts: list[SectionDraft],
+        running_summary: str,
+    ) -> str:
+        """Build the bounded "document so far" context for the next section.
+
+        Recent sections (last ``running_context_window_k``) are included verbatim
+        so the most relevant continuity cues are exact; earlier sections are
+        represented by the rolling summary. The footprint is bounded by the window
+        plus the summary cap, independent of total document length.
+        """
+        window_k = max(0, self._contract.running_context_window_k)
+        window = drafts[-window_k:] if window_k else []
+        parts: list[str] = []
+        summary = running_summary.strip()
+        if summary:
+            parts.append(
+                "Earlier sections (running summary — covered points, key claims, "
+                f"terminology):\n{summary}"
+            )
+        for draft in window:
+            body = draft.markdown.strip()
+            if body:
+                parts.append(f"Recent section — {draft.plan.title}:\n{body}")
+        return "\n\n".join(parts)
+
+    async def _fold_running_summary(
+        self,
+        prior_summary: str,
+        dropped: SectionDraft,
+    ) -> str:
+        """Incrementally fold one section into the rolling running summary."""
+        prompt = (
+            "Maintain a running summary of a document being written section by "
+            "section. Fold the new section into the prior running summary. Keep it "
+            "factual and structural — covered points, key claims and numbers, "
+            "defined terms, and still-open threads. Do not add information that is "
+            "not in the sections and do not editorialize. Be concise.\n\n"
+            f"Prior running summary:\n{prior_summary.strip() or '(none yet)'}\n\n"
+            f"New section to fold in — {dropped.plan.title}:\n"
+            f"{dropped.markdown.strip()[:16000]}"
+        )
+        summary = await self._stream_llm_text(
+            purpose="running_summary",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_output_tokens=max(1, self._contract.running_summary_max_tokens),
+            model=self._contract.running_summary_model or None,
+            extra_metadata={"section_id": dropped.plan.section_id},
+        )
+        summary = summary.strip()
+        if not summary:
+            return prior_summary
+        await self._emit(
+            "document.running_summary.updated",
+            status="complete",
+            section_id=dropped.plan.section_id,
+            summary_chars=len(summary),
+        )
+        return summary
+
     async def _draft_section(
         self,
         *,
@@ -1238,6 +1332,7 @@ class SectionedLongformAuthor:
         section_index: int | None,
         previous: list[SectionDraft],
         evidence_pack: Mapping[str, Any],
+        running_context: str = "",
         revision_feedback: SectionQualityGateResult | None = None,
     ) -> str:
         previous_index = [
@@ -1248,13 +1343,22 @@ class SectionedLongformAuthor:
             }
             for draft in previous
         ]
+        story_block = ""
+        if running_context.strip():
+            story_block = (
+                "Document so far (maintain continuity; do not repeat what is already "
+                f"covered):\n{running_context.strip()}\n\n"
+            )
         prompt = (
             "Write exactly this document section in Markdown.\n"
-            "Use the original task, the prior section ledger, and the bounded evidence pack. "
+            "Use the original task, the document-so-far context, the prior section "
+            "ledger, and the bounded evidence pack. Continue naturally from what "
+            "earlier sections established and avoid repeating their content. "
             "Do not include process notes. Cite artifact refs or source refs when evidence is used. "
             f"Write at least {plan.min_words} substantive information units.\n\n"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Section plan:\n{_json_block(asdict(plan), limit=4000)}\n\n"
+            f"{story_block}"
             f"Prior section refs:\n{_json_block(previous_index, limit=4000)}\n\n"
             f"Evidence pack:\n{_json_block(evidence_pack, limit=24000)}"
         )
