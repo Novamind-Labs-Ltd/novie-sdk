@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .byok_llm import ByokLlmClient
+    from .observability import AgentObservability, UsageReport
     from .platform_namespace import (
         PlatformNamespace,
         _UnavailablePlatformNamespace,
@@ -49,9 +50,11 @@ class LlmFacade:
         platform_ns: "PlatformNamespace | _UnavailablePlatformNamespace",
         *,
         byok: "ByokLlmClient | None" = None,
+        observability: "AgentObservability | None" = None,
     ) -> None:
         self._platform_ns = platform_ns
         self._byok = byok
+        self._observability = observability
 
     @property
     def platform_ns(self) -> "PlatformNamespace | _UnavailablePlatformNamespace":
@@ -279,11 +282,57 @@ class LlmFacade:
             return await self._platform_ns.llm.usage_summary(scope=scope)
         return {}
 
+    async def report_usage(
+        self,
+        *,
+        provider: str,
+        model: str,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        latency_ms: float | None = None,
+        phase: str | None = None,
+        turn_id: str | None = None,
+        span_name: str | None = None,
+        idempotency_key: str | None = None,
+        raw_usage_metadata: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "UsageReport":
+        """Report usage for agent-owned direct provider calls."""
+        if self._observability is None:
+            raise RuntimeError("LlmFacade.report_usage requires an SDK request context.")
+        return await self._observability.report_llm_usage(
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+            phase=phase,
+            turn_id=turn_id,
+            span_name=span_name,
+            idempotency_key=idempotency_key,
+            raw_usage_metadata=raw_usage_metadata,
+            metadata=metadata,
+        )
+
+    def usage_callback(
+        self,
+        *,
+        phase: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Return a LangChain usage callback for agent-owned model clients."""
+        if self._observability is None:
+            raise RuntimeError("LlmFacade.usage_callback requires an SDK request context.")
+        return self._observability.langchain_callbacks(phase=phase, metadata=metadata)[0]
+
 
 def build_llm_facade(
     platform_ns: Any,
     *,
     agent_id: str = "agent",
+    observability: "AgentObservability | None" = None,
 ) -> LlmFacade:
     """Build an ``LlmFacade`` paired with a ``ByokLlmClient`` from env.
 
@@ -304,7 +353,7 @@ def build_llm_facade(
             byok = ByokLlmClient.from_env(agent_id=agent_id)
         except (RuntimeError, ImportError):
             byok = None
-    return LlmFacade(platform_ns, byok=byok)
+    return LlmFacade(platform_ns, byok=byok, observability=observability)
 
 
 def _byok_key_hint() -> str:

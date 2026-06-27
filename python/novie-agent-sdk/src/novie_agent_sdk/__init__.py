@@ -196,7 +196,6 @@ from .llm_contract import (
     normalise_tool_calls,
     sanitize_additional_kwargs,
 )
-from .platform_chat_model import PlatformChatModel, PlatformStructuredChatModel
 from .artifact_text import (
     ArtifactReadCache,
     ArtifactReader,
@@ -693,8 +692,6 @@ __all__ = [
     "LlmFacade",
     "LlmMode",
     "build_llm_facade",
-    "PlatformChatModel",
-    "PlatformStructuredChatModel",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)
     "CompatibilityMatrix",
     "ConformanceProbe",

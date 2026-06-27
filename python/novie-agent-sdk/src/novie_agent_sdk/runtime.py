@@ -89,7 +89,9 @@ from .tenant_scoping import validate_tenant_context
 
 
 def _build_ctx_platform_and_llm(
-    hdrs: "RequestHeaders", agent_id: str
+    hdrs: "RequestHeaders",
+    agent_id: str,
+    observability: AgentObservability | None = None,
 ) -> tuple[Any, Any]:
     """Build (platform_ns, llm_facade) for an incoming request.
 
@@ -101,7 +103,7 @@ def _build_ctx_platform_and_llm(
         from .llm_facade import build_llm_facade
 
         platform_ns = build_platform_namespace(hdrs, agent_id=agent_id)
-        llm = build_llm_facade(platform_ns, agent_id=agent_id)
+        llm = build_llm_facade(platform_ns, agent_id=agent_id, observability=observability)
         return platform_ns, llm
     except Exception as exc:  # noqa: BLE001 — best-effort
         _log.debug("ctx platform/llm build failed: %s", exc)
@@ -2178,16 +2180,23 @@ class Agent:
                         if invocation.status == "completed" and invocation.response is not None:
                             return invocation.response
                         return _duplicate_one_shot_response(invocation)
+                scoped_observability = self._observability.scoped(
+                    session_id=hdrs.session_id,
+                    step_id=hdrs.step_id,
+                    trace_id=hdrs.trace_id,
+                )
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    scoped_observability,
+                )
                 ctx = InvokeContext(
                     input=_extract_inputs(body),
                     headers=hdrs,
                     agent_manifest=m,
-                    observability=self._observability.scoped(
-                        session_id=hdrs.session_id,
-                        step_id=hdrs.step_id,
-                        trace_id=hdrs.trace_id,
-                    ),
-                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
+                    observability=scoped_observability,
+                    _platform=_platform,
+                    _llm=_llm,
                 )
                 invocation_resolved = False
                 try:
@@ -2276,17 +2285,24 @@ class Agent:
                 async def _emit_observability_event(event: dict[str, Any]) -> None:
                     await event_queue.put(("obs", event))
 
+                scoped_observability = self._observability.scoped(
+                    session_id=hdrs.session_id,
+                    step_id=hdrs.step_id,
+                    trace_id=hdrs.trace_id,
+                    task_event_emitter=_emit_observability_event,
+                )
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    scoped_observability,
+                )
                 ctx = StreamContext(
                     input=_extract_inputs(body),
                     headers=hdrs,
                     agent_manifest=m,
-                    observability=self._observability.scoped(
-                        session_id=hdrs.session_id,
-                        step_id=hdrs.step_id,
-                        trace_id=hdrs.trace_id,
-                        task_event_emitter=_emit_observability_event,
-                    ),
-                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
+                    observability=scoped_observability,
+                    _platform=_platform,
+                    _llm=_llm,
                 )
 
                 async def _gen() -> AsyncIterator[bytes]:
@@ -2486,7 +2502,11 @@ class Agent:
                     task_id=record.task_id,
                     task_event_emitter=_emit_usage_event,
                 )
-                _platform, _llm = _build_ctx_platform_and_llm(hdrs, m.agent_id)
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    task_observability,
+                )
                 ctx = TaskContext(
                     task_id=task_id,
                     input=record.input,
