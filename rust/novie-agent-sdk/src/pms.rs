@@ -5,6 +5,7 @@
 //! surface and keeps the backend transport shape out of consumers.
 
 use crate::error::{Error, Result};
+use crate::headers::agent_platform_shared_secret;
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
 use sha2::Sha256;
@@ -399,18 +400,17 @@ impl PmsIssueClient {
         };
         insert_header(&mut headers, "x-novie-auth-source", auth_source)?;
 
-        let secret = std::env::var("NOVIE_TRUSTED_HEADER_SECRET").unwrap_or_default();
-        if !secret.trim().is_empty() {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::InvalidArgument(format!("system clock before epoch: {e}")))?
-                .as_secs()
-                .to_string();
-            insert_header(&mut headers, "x-novie-timestamp", &timestamp)?;
-            let signature =
-                trusted_header_signature(method, path, &self.identity, &timestamp, &secret);
-            insert_header(&mut headers, "x-novie-sig", &format!("sha256={signature}"))?;
-        }
+        let secret = agent_platform_shared_secret().map_err(|err| {
+            Error::InvalidArgument(format!("agent-platform signing failed: {}", err.code()))
+        })?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::InvalidArgument(format!("system clock before epoch: {e}")))?
+            .as_secs()
+            .to_string();
+        insert_header(&mut headers, "x-novie-timestamp", &timestamp)?;
+        let signature = agent_platform_signature(method, path, &self.identity, &timestamp, &secret);
+        insert_header(&mut headers, "x-novie-sig", &format!("sha256={signature}"))?;
 
         let _ = HeaderName::from_static("accept");
         Ok(headers)
@@ -439,7 +439,7 @@ fn insert_optional_header(
     insert_header(headers, name, value.trim())
 }
 
-fn trusted_header_signature(
+fn agent_platform_signature(
     method: &str,
     path: &str,
     identity: &PmsIssueIdentity,

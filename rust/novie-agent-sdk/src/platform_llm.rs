@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
-use crate::headers::RequestHeaders;
+use crate::headers::{RequestHeaders, agent_platform_shared_secret};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -390,18 +390,17 @@ impl PlatformLlmClient {
             &self.identity.auth_source,
         )?;
 
-        let secret = std::env::var("NOVIE_TRUSTED_HEADER_SECRET").unwrap_or_default();
-        if !secret.trim().is_empty() {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::InvalidArgument(format!("system clock before epoch: {e}")))?
-                .as_secs()
-                .to_string();
-            insert_header(&mut headers, "x-novie-timestamp", &timestamp)?;
-            let signature =
-                trusted_header_signature(method, path, &self.identity, &timestamp, &secret);
-            insert_header(&mut headers, "x-novie-sig", &format!("sha256={signature}"))?;
-        }
+        let secret = agent_platform_shared_secret().map_err(|err| {
+            Error::InvalidArgument(format!("agent-platform signing failed: {}", err.code()))
+        })?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::InvalidArgument(format!("system clock before epoch: {e}")))?
+            .as_secs()
+            .to_string();
+        insert_header(&mut headers, "x-novie-timestamp", &timestamp)?;
+        let signature = agent_platform_signature(method, path, &self.identity, &timestamp, &secret);
+        insert_header(&mut headers, "x-novie-sig", &format!("sha256={signature}"))?;
 
         // Compile-time sanity: HeaderName import remains used when optional
         // insertions are optimized.
@@ -433,7 +432,7 @@ fn insert_header(
     Ok(())
 }
 
-fn trusted_header_signature(
+fn agent_platform_signature(
     method: &str,
     path: &str,
     identity: &PlatformLlmIdentity,

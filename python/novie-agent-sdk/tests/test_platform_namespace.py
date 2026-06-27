@@ -78,6 +78,16 @@ def _build_with_responder(
     return ns
 
 
+def test_platform_namespace_exposes_openai_proxy_headers(monkeypatch) -> None:
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "secret")
+    ns = _build_with_responder(lambda request: httpx.Response(200, json={"ok": True}))
+
+    assert ns.openai_base_url == "http://platform.test/v1"
+    headers = ns.openai_headers(path="/v1/chat/completions")
+    assert headers["x-novie-org-id"] == "tenant-1"
+    assert headers["x-novie-sig"].startswith("sha256=")
+
+
 def _ok_envelope(result: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "result": result}
 

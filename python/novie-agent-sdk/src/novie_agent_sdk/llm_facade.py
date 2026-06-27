@@ -74,6 +74,25 @@ class LlmFacade:
             return "byok"
         return "unavailable"
 
+    @property
+    def openai_base_url(self) -> str:
+        """OpenAI-compatible platform proxy base URL for direct client use."""
+        if not self.platform_available:
+            raise RuntimeError("LlmFacade: platform LLM proxy is unavailable")
+        return str(getattr(self._platform_ns, "openai_base_url"))
+
+    def openai_headers(
+        self,
+        *,
+        method: str = "POST",
+        path: str = "/v1/chat/completions",
+    ) -> dict[str, str]:
+        """Signed headers for the OpenAI-compatible platform proxy."""
+        if not self.platform_available:
+            raise RuntimeError("LlmFacade: platform LLM proxy is unavailable")
+        signer = getattr(self._platform_ns, "openai_headers")
+        return dict(signer(method=method, path=path))
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
