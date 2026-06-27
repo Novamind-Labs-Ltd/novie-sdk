@@ -2,13 +2,12 @@
 
 use novie_agent_sdk::{ChatMessage, ChatOptions, Error, PlatformLlmClient, PlatformLlmIdentity};
 use serde_json::json;
-use wiremock::matchers::{bearer_token, body_json, header, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_client(server: &MockServer) -> PlatformLlmClient {
     PlatformLlmClient::with_identity(
         server.uri(),
-        "platform-token",
         "rust-agent",
         PlatformLlmIdentity {
             org_id: "org-1".to_owned(),
@@ -25,11 +24,28 @@ fn make_client(server: &MockServer) -> PlatformLlmClient {
 }
 
 #[tokio::test]
+async fn exposes_openai_proxy_helpers() {
+    let server = MockServer::start().await;
+    let client = make_client(&server);
+
+    assert_eq!(client.openai_base_url(), format!("{}/v1", server.uri()));
+    let headers = client
+        .openai_headers("POST", "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(headers["x-novie-org-id"], "org-1");
+    assert!(
+        headers["x-novie-sig"]
+            .to_str()
+            .unwrap()
+            .starts_with("sha256=")
+    );
+}
+
+#[tokio::test]
 async fn chat_invokes_platform_llm_capability() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/capabilities/platform.llm.chat/invoke"))
-        .and(bearer_token("platform-token"))
         .and(header("x-novie-org-id", "org-1"))
         .and(header("x-novie-project-id", "project-1"))
         .and(header("x-novie-workspace-id", "workspace-1"))

@@ -130,48 +130,34 @@ impl PlatformLlmIdentity {
 #[derive(Debug, Clone)]
 pub struct PlatformLlmClient {
     base_url: String,
-    token: String,
     agent_id: String,
     identity: PlatformLlmIdentity,
     http: reqwest::Client,
 }
 
 impl PlatformLlmClient {
-    pub fn new(
-        base_url: impl Into<String>,
-        token: impl Into<String>,
-        agent_id: impl Into<String>,
-    ) -> Result<Self> {
+    pub fn new(base_url: impl Into<String>, agent_id: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
-        let token = token.into();
         let agent_id = agent_id.into();
         if base_url.trim().is_empty() {
             return Err(Error::InvalidArgument("base_url is required".into()));
-        }
-        if token.trim().is_empty() {
-            return Err(Error::InvalidArgument("token is required".into()));
         }
         if agent_id.trim().is_empty() {
             return Err(Error::InvalidArgument("agent_id is required".into()));
         }
         let identity = PlatformLlmIdentity::from_env(&agent_id);
-        Self::with_identity(base_url, token, agent_id, identity)
+        Self::with_identity(base_url, agent_id, identity)
     }
 
     pub fn with_identity(
         base_url: impl Into<String>,
-        token: impl Into<String>,
         agent_id: impl Into<String>,
         identity: PlatformLlmIdentity,
     ) -> Result<Self> {
         let base_url = base_url.into();
-        let token = token.into();
         let agent_id = agent_id.into();
         if base_url.trim().is_empty() {
             return Err(Error::InvalidArgument("base_url is required".into()));
-        }
-        if token.trim().is_empty() {
-            return Err(Error::InvalidArgument("token is required".into()));
         }
         if agent_id.trim().is_empty() {
             return Err(Error::InvalidArgument("agent_id is required".into()));
@@ -186,7 +172,6 @@ impl PlatformLlmClient {
             .map_err(|e| Error::InvalidArgument(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
-            token,
             agent_id,
             identity,
             http,
@@ -195,21 +180,29 @@ impl PlatformLlmClient {
 
     pub fn from_request_headers(
         base_url: impl Into<String>,
-        token: impl Into<String>,
         agent_id: impl Into<String>,
         headers: &RequestHeaders,
     ) -> Result<Self> {
         let agent_id = agent_id.into();
         let identity = PlatformLlmIdentity::from_request_headers(headers, &agent_id);
-        Self::with_identity(base_url, token, agent_id, identity)
+        Self::with_identity(base_url, agent_id, identity)
     }
 
     pub fn from_env(agent_id: impl Into<String>) -> Result<Self> {
         let base_url = std::env::var("NOVIE_PLATFORM_BASE_URL").unwrap_or_default();
-        let token = std::env::var("NOVIE_PLATFORM_TOKEN")
-            .or_else(|_| std::env::var("NOVIE_PLATFORM_CALLBACK_TOKEN"))
-            .unwrap_or_default();
-        Self::new(base_url, token, agent_id)
+        Self::new(base_url, agent_id)
+    }
+
+    pub fn platform_headers(&self, method: &str, path: &str) -> Result<reqwest::header::HeaderMap> {
+        self.signed_headers(method, path)
+    }
+
+    pub fn openai_base_url(&self) -> String {
+        format!("{}/v1", self.base_url)
+    }
+
+    pub fn openai_headers(&self, method: &str, path: &str) -> Result<reqwest::header::HeaderMap> {
+        self.signed_headers(method, path)
     }
 
     pub async fn chat(
@@ -323,7 +316,6 @@ impl PlatformLlmClient {
         let response = self
             .http
             .post(url)
-            .bearer_auth(&self.token)
             .headers(self.signed_headers("POST", &path)?)
             .json(&body)
             .send()
