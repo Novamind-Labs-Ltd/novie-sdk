@@ -2,6 +2,7 @@
 name = "novie-prompts"
 version = "0.1.0"
 description = "Fail-soft Langfuse-managed prompt fetch with in-repo fallback (ADR-075)."
+readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "langfuse>=2.50,<3",

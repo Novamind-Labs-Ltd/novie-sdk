@@ -1,15 +1,25 @@
 """Lazy Langfuse v2 client. Construction is non-network; any failure = None = instant fallback."""
 from __future__ import annotations
 
+from typing import Any, Protocol
+
 from . import config
 
-_UNSET: object = object()
 
-_cached: object | None = _UNSET
-_override: object | None = _UNSET
+class PromptClient(Protocol):
+    """Structural type of the client seam — both the Langfuse v2 client and the
+    test FakeClient satisfy this. Keeps `registry` type-sound under mypy."""
+
+    def get_prompt(self, name: str, **kwargs: Any) -> Any: ...
 
 
-def set_client_for_test(client: object | None) -> None:
+_UNSET: Any = object()
+
+_cached: PromptClient | None = _UNSET
+_override: PromptClient | None = _UNSET
+
+
+def set_client_for_test(client: PromptClient | None) -> None:
     global _override
     _override = client
 
@@ -27,13 +37,13 @@ def invalidate_cache() -> None:
     _cached = _UNSET
 
 
-def _build_client(conn: "config.Connection") -> object:
+def _build_client(conn: "config.Connection") -> PromptClient:
     from langfuse import Langfuse  # imported lazily so the package loads without it at rest
 
     return Langfuse(host=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
 
 
-def get_client() -> object | None:
+def get_client() -> PromptClient | None:
     if _override is not _UNSET:
         return _override
     global _cached
