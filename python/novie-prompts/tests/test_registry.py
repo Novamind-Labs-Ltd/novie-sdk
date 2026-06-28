@@ -18,16 +18,17 @@ def test_disabled_returns_fallback_and_records(monkeypatch):
     assert rec.lives == []
 
 
-def test_no_client_returns_fallback_disabled(monkeypatch):
+def test_no_client_returns_fallback_unconfigured(monkeypatch):
     monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")
     from novie_prompts import client, telemetry
 
-    client.set_client_for_test(None)  # enabled but no client (construction failed)
+    client.set_client_for_test(None)  # enabled but no client (forgot configure / bad creds)
     rec = testing.RecordingRecorder()
     telemetry.set_recorder(rec)
     out = get_managed_prompt("pm/system", fallback="CONST")
     assert out == "CONST"
-    assert rec.fallbacks == [("pm/system", "disabled")]
+    # distinct from "disabled" (kill switch) so a silent misconfig shows in metrics
+    assert rec.fallbacks == [("pm/system", "unconfigured")]
 
 
 def test_enabled_live_returns_langfuse_text_and_records(monkeypatch):

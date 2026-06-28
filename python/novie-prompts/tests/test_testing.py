@@ -36,3 +36,8 @@ def test_install_fake_wires_client_and_recorder():
     assert client.get_client() is fake
     assert telemetry.has_recorder() is True
     assert isinstance(rec, testing.RecordingRecorder)
+
+
+def test_fake_registry_is_the_published_alias():
+    # spec/§8 name the seam `fake_registry`; 6 consumer repos import it — lock the alias.
+    assert testing.fake_registry is testing.install_fake

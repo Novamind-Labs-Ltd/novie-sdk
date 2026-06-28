@@ -5,3 +5,4 @@ def test_public_surface_is_importable():
     assert callable(novie_prompts.configure)
     assert callable(novie_prompts.set_recorder)
     assert callable(novie_prompts.has_recorder)
+    assert novie_prompts.Recorder is not None  # Protocol consumers type their recorder against

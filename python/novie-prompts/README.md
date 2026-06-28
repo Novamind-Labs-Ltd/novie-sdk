@@ -28,15 +28,19 @@ from .prompts import _ANALYST_SYSTEM_PROMPT
 system_prompt = novie_prompts.get_managed_prompt("analyst/system", fallback=_ANALYST_SYSTEM_PROMPT)
 ```
 
-`get_managed_prompt` NEVER raises and is latency-bounded. It returns the constant when Langfuse is disabled (`NOVIE_OBSERVABILITY_LANGFUSE_ENABLED=false`), unreachable, slow, missing, chat-type, or has a blank body, recording a per-reason counter (`disabled | timeout | missing | chat_type | empty | exception`) on every exit.
+`get_managed_prompt` NEVER raises and is latency-bounded. It returns the constant when Langfuse is disabled (`NOVIE_OBSERVABILITY_LANGFUSE_ENABLED=false`), unconfigured (`configure()` not called / bad creds), unreachable, slow, missing, chat-type, or has a blank body, recording a per-reason counter (`disabled | unconfigured | timeout | missing | chat_type | empty | exception`) on every exit. (`unconfigured` is distinct from `disabled` so a silent misconfiguration is visible in metrics.)
+
+Type your recorder against the published `novie_prompts.Recorder` protocol (it needs `record_fallback(name, reason)` + `record_live(name)`).
 
 ## Testing (no Langfuse in CI)
 
 ```python
 from novie_prompts import testing
 
-def test_my_consumer():
-    fake, rec = testing.install_fake(text="LIVE BODY")
+def test_my_consumer(monkeypatch):
+    # Enable the fetch path, else get_managed_prompt short-circuits to the constant (reason="disabled").
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")
+    fake, rec = testing.install_fake(text="LIVE BODY")  # also exported as testing.fake_registry
     # ... call code that calls get_managed_prompt ...
     testing.reset()
 ```

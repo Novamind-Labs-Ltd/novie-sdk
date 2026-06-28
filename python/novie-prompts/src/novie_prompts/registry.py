@@ -15,13 +15,16 @@ except Exception:  # pragma: no cover - only if langfuse internals move
 
 def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -> str:
     """Langfuse-managed prompt with in-repo fallback. Returns `fallback` when
-    disabled / unreachable / slow / missing / chat-type / blank-body. NEVER raises."""
+    disabled / unconfigured / unreachable / slow / missing / chat-type / blank-body.
+    NEVER raises."""
     if not config.is_enabled():
         record_fallback(name, "disabled")
         return fallback
     client = get_client()
     if client is None:
-        record_fallback(name, "disabled")
+        # Enabled but no client = forgot configure() / bad creds / construction failed.
+        # Distinct from "disabled" (kill switch off) so a silent misconfig is visible.
+        record_fallback(name, "unconfigured")
         return fallback
     try:
         prompt = client.get_prompt(
