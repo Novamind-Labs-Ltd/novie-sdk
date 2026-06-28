@@ -16,6 +16,11 @@ class Connection:
     public_key: str
     secret_key: str
 
+    def __repr__(self) -> str:
+        # Redact creds: this object holds the Langfuse secret and is a module
+        # global — its repr can land in logs or a crash reporter's frame locals.
+        return f"Connection(host={self.host!r}, public_key=<redacted>, secret_key=<redacted>)"
+
 
 _connection: Connection | None = None
 

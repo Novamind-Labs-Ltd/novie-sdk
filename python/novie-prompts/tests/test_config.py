@@ -18,6 +18,15 @@ def test_configure_sets_connection():
     assert conn.secret_key == "sk"
 
 
+def test_connection_repr_redacts_credentials():
+    config.configure(host="https://lf", public_key="pk-lf-abc", secret_key="sk-lf-SECRET")
+    text = repr(config.get_connection())
+    assert "sk-lf-SECRET" not in text
+    assert "pk-lf-abc" not in text
+    assert "<redacted>" in text
+    assert "https://lf" in text  # host is fine to show
+
+
 def test_is_enabled_defaults_false(monkeypatch):
     monkeypatch.delenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", raising=False)
     assert config.is_enabled() is False

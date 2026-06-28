@@ -40,3 +40,8 @@ def test_my_consumer():
     # ... call code that calls get_managed_prompt ...
     testing.reset()
 ```
+
+## Security
+
+- `host`/`public_key`/`secret_key` must come from **trusted boot-time config**, never from user/request input — `host` receives your secret key in the auth header.
+- Never log the `Connection` object or any credential. Only the prompt `name` and the fixed `reason` code cross the telemetry boundary (never the prompt body or creds). `Connection.__repr__` redacts the keys, so an accidental log/crash-report won't leak them.
