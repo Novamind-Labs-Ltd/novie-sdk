@@ -37,7 +37,7 @@ def get_connection() -> Connection | None:
 
 def is_enabled() -> bool:
     """Re-read the kill switch per call so flip + restart pins the fleet to fallback."""
-    return os.environ.get("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "false").lower() in _TRUE
+    return os.environ.get("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "false").strip().lower() in _TRUE
 
 
 def reset() -> None:

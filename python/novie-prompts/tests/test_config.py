@@ -30,6 +30,11 @@ def test_is_enabled_reads_env_per_call(monkeypatch):
     assert config.is_enabled() is False  # re-read per call = kill switch
 
 
+def test_is_enabled_tolerates_surrounding_whitespace(monkeypatch):
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", " true ")
+    assert config.is_enabled() is True  # a stray space in the env file must not silently disable
+
+
 def test_timeout_constants():
     assert config.FETCH_TIMEOUT_SECONDS == 2
     assert config.CACHE_TTL_SECONDS == 60

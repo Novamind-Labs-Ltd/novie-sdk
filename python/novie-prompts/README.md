@@ -28,7 +28,7 @@ from .prompts import _ANALYST_SYSTEM_PROMPT
 system_prompt = novie_prompts.get_managed_prompt("analyst/system", fallback=_ANALYST_SYSTEM_PROMPT)
 ```
 
-`get_managed_prompt` NEVER raises and is latency-bounded. It returns the constant when Langfuse is disabled (`NOVIE_OBSERVABILITY_LANGFUSE_ENABLED=false`), unreachable, slow, missing, or chat-type, recording a per-reason counter (`disabled | timeout | missing | chat_type | exception`) on every exit.
+`get_managed_prompt` NEVER raises and is latency-bounded. It returns the constant when Langfuse is disabled (`NOVIE_OBSERVABILITY_LANGFUSE_ENABLED=false`), unreachable, slow, missing, chat-type, or has a blank body, recording a per-reason counter (`disabled | timeout | missing | chat_type | empty | exception`) on every exit.
 
 ## Testing (no Langfuse in CI)
 

@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - only if langfuse internals move
 
 def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -> str:
     """Langfuse-managed prompt with in-repo fallback. Returns `fallback` when
-    disabled / unreachable / slow / missing / chat-type. NEVER raises."""
+    disabled / unreachable / slow / missing / chat-type / blank-body. NEVER raises."""
     if not config.is_enabled():
         record_fallback(name, "disabled")
         return fallback
