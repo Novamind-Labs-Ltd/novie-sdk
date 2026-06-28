@@ -2,6 +2,10 @@
 get_managed_prompt (the content fetch arm). NEVER raises; fail-soft (ADR-040)."""
 from __future__ import annotations
 
+from . import client
+from .config import cache_ttl_seconds, fetch_timeout_seconds
+from .telemetry import record_fallback, record_live
+
 
 def _classify(e: Exception) -> str:
     import httpx
@@ -11,3 +15,31 @@ def _classify(e: Exception) -> str:
     if isinstance(e, NotFoundError):            # 404 missing prompt/label
         return "missing"
     return "exception"
+
+
+def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -> str:
+    """Langfuse-managed CONTENT prompt with in-repo fallback (ADR-040 fail-soft).
+
+    NEVER raises; latency-bounded (max_retries=1). Every exit emits one counter.
+    Do NOT pass fallback= to the SDK: it swallows the error and hides timeout/missing.
+    """
+    lf = client.get_client()
+    if lf is None:
+        record_fallback(name, reason="disabled")
+        return fallback
+    try:
+        prompt = lf.get_prompt(
+            name, label=label,
+            cache_ttl_seconds=cache_ttl_seconds(),
+            max_retries=1,                                  # NOT 0 — 0 retries forever
+            fetch_timeout_seconds=fetch_timeout_seconds(),  # per-attempt ceiling (seconds)
+        )
+        text = prompt.prompt
+        if not isinstance(text, str):                       # chat-typed prompt
+            record_fallback(name, reason="chat_type")
+            return fallback
+        record_live(name)
+        return text
+    except Exception as e:                                  # noqa: BLE001 — fail-soft
+        record_fallback(name, reason=_classify(e))
+        return fallback
