@@ -63,3 +63,27 @@ def test_chat_type_returns_fallback(monkeypatch, recorder):
     _patch_client(monkeypatch, C())
     assert registry.get_managed_prompt("p", fallback="FB") == "FB"
     assert recorder == ["prompt_fallback_total__p__chat_type"]
+
+
+def test_cache_ttl_and_timeout_passed_through(monkeypatch, recorder):
+    """Finding #6: cache_ttl_seconds and fetch_timeout_seconds arrive in the SDK call,
+    and a configured ttl=0 arrives floored to 1."""
+    from novie_prompts import config
+    config.set_config(cache_ttl_seconds=0, fetch_timeout_seconds=0,
+                      enabled=True, host="http://lf:3000",
+                      public_key="pk", secret_key="sk")
+
+    captured = {}
+
+    class C:
+        def get_prompt(self, name, **kw):
+            captured.update(kw)
+            return _Prompt("LIVE")
+
+    _patch_client(monkeypatch, C())
+    registry.get_managed_prompt("p", fallback="FB")
+    assert "cache_ttl_seconds" in captured
+    assert "fetch_timeout_seconds" in captured
+    assert captured["cache_ttl_seconds"] == 1       # 0 floored to 1
+    assert captured["fetch_timeout_seconds"] == 1   # 0 floored to 1
+    config.set_config()  # restore defaults

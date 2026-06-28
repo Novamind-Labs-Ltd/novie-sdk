@@ -32,3 +32,11 @@ def test_control_plane_nonprod_t2_off_uses_constant(monkeypatch):
     out = registry.resolve_prompt("p", fallback="C", tier="control_plane",
                                   is_prod=False, control_plane_fetch_enabled=False)
     assert out == "C"
+
+
+def test_content_ignores_env_flags(monkeypatch):
+    """Finding #6: content tier always fetches, regardless of is_prod / control_plane_fetch_enabled."""
+    _fake_fetch(monkeypatch)
+    out = registry.resolve_prompt("p", fallback="C", tier="content",
+                                  is_prod=False, control_plane_fetch_enabled=True)
+    assert out == "FETCHED"  # proves content never gates on env

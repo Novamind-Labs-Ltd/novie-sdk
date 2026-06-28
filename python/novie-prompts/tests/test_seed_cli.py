@@ -39,3 +39,12 @@ def test_never_overwrites_when_constant_differs():
     created = sync_push({"a": "A-DIFFERENT"}, client=c)
     assert created == []                    # differing local constant does NOT push
     assert c.created == []
+
+
+def test_middle_entry_skip_continues_iteration():
+    """Finding #6: a 3-entry dict where the MIDDLE one exists →
+    only the two absent are created (iteration continues past the skip)."""
+    c = FakeClient(existing={"b"})
+    created = sync_push({"a": "A", "b": "B", "c": "C"}, client=c)
+    assert created == ["a", "c"]
+    assert [name for name, _ in c.created] == ["a", "c"]

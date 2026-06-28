@@ -22,6 +22,9 @@ def set_config(**overrides) -> None:
     """Replace the process config. No args → defaults. Keyword overrides only."""
     global _config
     _config = replace(PromptConfig(), **overrides)
+    # Invalidate the client singleton so next get_client() picks up new config.
+    from . import client as _c  # lazy to avoid import cycle
+    _c.reset_client()
 
 
 def current() -> PromptConfig:
@@ -41,4 +44,4 @@ def cache_ttl_seconds() -> int:
 
 
 def fetch_timeout_seconds() -> int:
-    return _config.fetch_timeout_seconds
+    return max(1, _config.fetch_timeout_seconds)  # 0 means "always fall back"; floor it

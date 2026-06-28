@@ -14,6 +14,12 @@ def test_ttl_floored_at_1():
     assert config.cache_ttl_seconds() == 1  # 0 would disable caching; floor it
 
 
+def test_fetch_timeout_floored_at_1():
+    """Finding #5: fetch_timeout_seconds=0 means 'always fall back' silently; floor it."""
+    config.set_config(fetch_timeout_seconds=0)
+    assert config.fetch_timeout_seconds() == 1
+
+
 def test_overrides_round_trip():
     config.set_config(enabled=True, host="http://lf:3000",
                       cache_ttl_seconds=30, fetch_timeout_seconds=1,

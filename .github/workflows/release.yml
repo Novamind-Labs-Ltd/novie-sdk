@@ -126,7 +126,7 @@ jobs:
         working-directory: python/novie-prompts
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install build -e ".[dev]"
 
       - name: Run novie-prompts tests
         if: inputs.language == 'novie-prompts'
@@ -203,6 +203,8 @@ jobs:
           "novie-agent-sdk @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@{0}#subdirectory=python/novie-agent-sdk"
           ```', steps.tag.outputs.name) || '' }}${{ inputs.language == 'rust' && format('```toml
           novie-agent-sdk = {{ git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "{0}" }}
+          ```', steps.tag.outputs.name) || '' }}${{ inputs.language == 'novie-prompts' && format('```sh
+          pip install "git+https://github.com/Novamind-Labs-Ltd/novie-sdk@{0}#subdirectory=python/novie-prompts"
           ```', steps.tag.outputs.name) || '' }}
 
           See [examples/](https://github.com/Novamind-Labs-Ltd/novie-sdk/tree/main/examples) for full consumer setup.

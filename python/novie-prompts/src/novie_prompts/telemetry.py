@@ -14,9 +14,15 @@ def set_recorder(record: Callable[[str], None] | None) -> None:
 
 def record_fallback(name: str, reason: str) -> None:
     if _record is not None:
-        _record(f"prompt_fallback_total__{name}__{reason}")
+        try:
+            _record(f"prompt_fallback_total__{name}__{reason}")
+        except Exception:  # telemetry must never break fail-soft
+            pass
 
 
 def record_live(name: str) -> None:
     if _record is not None:
-        _record(f"prompt_served_live_total__{name}")
+        try:
+            _record(f"prompt_served_live_total__{name}")
+        except Exception:  # telemetry must never break fail-soft
+            pass
