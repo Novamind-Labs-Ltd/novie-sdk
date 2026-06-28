@@ -1,29 +1,40 @@
-"""Fail-soft telemetry. The recorder is INJECTED by the consumer (its rcp_metrics
-sink) — NEVER Langfuse (circular during an outage, §7). Recorder exceptions are
-swallowed to ensure telemetry never breaks the caller's fail-soft path. Labels are
-flattened into composite counter keys because rcp_metrics is a flat dict."""
+"""Fail-soft-not-fail-silent telemetry. Routes to an injected recorder, never to Langfuse."""
 from __future__ import annotations
-from collections.abc import Callable
 
-_record: Callable[[str], None] | None = None
+from typing import Protocol, runtime_checkable
 
 
-def set_recorder(record: Callable[[str], None] | None) -> None:
-    global _record
-    _record = record
+@runtime_checkable
+class Recorder(Protocol):
+    def record_fallback(self, name: str, reason: str) -> None: ...
+    def record_live(self, name: str) -> None: ...
+
+
+_recorder: Recorder | None = None
+
+
+def set_recorder(recorder: Recorder | None) -> None:
+    global _recorder
+    _recorder = recorder
+
+
+def has_recorder() -> bool:
+    return _recorder is not None
 
 
 def record_fallback(name: str, reason: str) -> None:
-    if _record is not None:
+    # Telemetry is best-effort: a buggy consumer-injected recorder must NEVER
+    # break get_managed_prompt's NEVER-raises contract (ADR-075 D6).
+    if _recorder is not None:
         try:
-            _record(f"prompt_fallback_total__{name}__{reason}")
-        except Exception:  # telemetry must never break fail-soft
+            _recorder.record_fallback(name, reason)
+        except Exception:
             pass
 
 
 def record_live(name: str) -> None:
-    if _record is not None:
+    if _recorder is not None:
         try:
-            _record(f"prompt_served_live_total__{name}")
-        except Exception:  # telemetry must never break fail-soft
+            _recorder.record_live(name)
+        except Exception:
             pass

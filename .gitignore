@@ -19,7 +19,6 @@ htmlcov/
 dist/
 build/
 .venv/
-.venv-*/
 venv/
 env/
 

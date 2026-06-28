@@ -1,58 +1,50 @@
 from novie_prompts import client, config
 
 
-def test_disabled_returns_none():
-    config.set_config(enabled=False)
+def setup_function():
+    config.reset()
     client.reset_client()
+
+
+def test_no_connection_returns_none():
     assert client.get_client() is None
 
 
-def test_enabled_constructs_non_network(monkeypatch):
-    # Construction must be non-network: a fake Langfuse that records it was built.
-    built = {}
-
-    class FakeLangfuse:
-        def __init__(self, **kw):
-            built.update(kw)
-
-    monkeypatch.setattr(client, "_Langfuse", FakeLangfuse)
-    config.set_config(enabled=True, host="http://lf:3000",
-                      public_key="pk", secret_key="sk")
-    client.reset_client()
-    c = client.get_client()
-    assert c is not None
-    assert built["host"] == "http://lf:3000"
+def test_test_override_takes_precedence():
+    sentinel = object()
+    client.set_client_for_test(sentinel)
+    assert client.get_client() is sentinel
 
 
-def test_construction_failure_returns_none(monkeypatch):
-    def boom(**kw):
-        raise RuntimeError("bad init")
-
-    monkeypatch.setattr(client, "_Langfuse", boom)
-    config.set_config(enabled=True, host="http://lf:3000",
-                      public_key="pk", secret_key="sk")
-    client.reset_client()
-    assert client.get_client() is None  # init failure = disabled mode = instant fallback
-
-
-def test_enabled_but_no_host_returns_none():
-    """Finding #6: enabled=True but host=None → the `or` guard → None."""
-    config.set_config(enabled=True, host=None)
-    client.reset_client()
+def test_override_none_is_respected():
+    client.set_client_for_test(None)
+    # even with a connection configured, an explicit None override wins
+    config.configure(host="http://lf", public_key="pk", secret_key="sk")
     assert client.get_client() is None
 
 
-def test_set_config_invalidates_singleton(monkeypatch):
-    """Finding #3: set_config must invalidate cached singleton."""
-    config.set_config(enabled=False)
-    assert client.get_client() is None          # disabled → None
+def test_configure_invalidates_a_poisoned_cache(monkeypatch):
+    # Fetch-before-configure: get_client caches None while unconfigured...
+    assert client.get_client() is None
+    # ...then configure() must invalidate that cache so a real client is built.
+    built = object()
+    monkeypatch.setattr(client, "_build_client", lambda conn: built)
+    config.configure(host="http://lf", public_key="pk", secret_key="sk")
+    assert client.get_client() is built
 
-    class FakeLangfuse:
-        def __init__(self, **kw):
-            pass
+    # Re-configure also takes effect (not pinned to the first connection).
+    built2 = object()
+    monkeypatch.setattr(client, "_build_client", lambda conn: built2)
+    config.configure(host="http://lf2", public_key="pk2", secret_key="sk2")
+    assert client.get_client() is built2
 
-    monkeypatch.setattr(client, "_Langfuse", FakeLangfuse)
-    config.set_config(enabled=True, host="http://lf:3000",
-                      public_key="pk", secret_key="sk")
-    # No explicit reset_client() — set_config must have done it
-    assert client.get_client() is not None
+
+def test_construction_failure_yields_none(monkeypatch):
+    # Point at a connection but force the langfuse import/construction to blow up.
+    config.configure(host="http://lf", public_key="pk", secret_key="sk")
+
+    def _boom(*a, **k):
+        raise RuntimeError("no langfuse")
+
+    monkeypatch.setattr(client, "_build_client", _boom)
+    assert client.get_client() is None  # construction failure = disabled mode = instant fallback

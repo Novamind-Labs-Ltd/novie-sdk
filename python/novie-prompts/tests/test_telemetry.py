@@ -1,32 +1,48 @@
-from novie_prompts import telemetry, registry, client
+from novie_prompts import telemetry
 
 
-def test_noop_when_unset():
+class _Rec:
+    def __init__(self):
+        self.fallbacks = []
+        self.lives = []
+
+    def record_fallback(self, name, reason):
+        self.fallbacks.append((name, reason))
+
+    def record_live(self, name):
+        self.lives.append(name)
+
+
+def setup_function():
     telemetry.set_recorder(None)
-    telemetry.record_fallback("planner", "timeout")  # must not raise
-    telemetry.record_live("planner")
 
 
-def test_emits_composite_keys():
-    seen = []
-    telemetry.set_recorder(seen.append)
+def test_no_recorder_is_noop_and_does_not_raise():
+    assert telemetry.has_recorder() is False
+    telemetry.record_fallback("p", "disabled")  # must not raise
+    telemetry.record_live("p")  # must not raise
+
+
+def test_injected_recorder_receives_calls():
+    rec = _Rec()
+    telemetry.set_recorder(rec)
+    assert telemetry.has_recorder() is True
     telemetry.record_fallback("planner", "timeout")
-    telemetry.record_live("reception/supervisor")
-    assert seen == [
-        "prompt_fallback_total__planner__timeout",
-        "prompt_served_live_total__reception/supervisor",
-    ]
+    telemetry.record_live("supervisor")
+    assert rec.fallbacks == [("planner", "timeout")]
+    assert rec.lives == ["supervisor"]
 
 
-def test_throwing_recorder_does_not_propagate(monkeypatch):
-    """Finding #1: a recorder that raises must NOT surface from get_managed_prompt."""
-    def boom(key):
-        raise RuntimeError("metrics exploded")
+class _RaisingRecorder:
+    def record_fallback(self, name, reason):
+        raise RuntimeError("buggy recorder")
 
-    telemetry.set_recorder(boom)
-    monkeypatch.setattr(client, "get_client", lambda: None)
-    try:
-        result = registry.get_managed_prompt("p", fallback="FB")
-        assert result == "FB"   # fail-soft still returns fallback
-    finally:
-        telemetry.set_recorder(None)
+    def record_live(self, name):
+        raise RuntimeError("buggy recorder")
+
+
+def test_raising_recorder_is_swallowed():
+    # A buggy consumer recorder must never propagate (telemetry is best-effort).
+    telemetry.set_recorder(_RaisingRecorder())
+    telemetry.record_fallback("p", "timeout")  # must not raise
+    telemetry.record_live("p")  # must not raise

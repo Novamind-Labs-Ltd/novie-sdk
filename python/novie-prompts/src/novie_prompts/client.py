@@ -1,43 +1,63 @@
-"""Lazy singleton Langfuse v2 client. Construction is non-network; any init
-failure is swallowed → get_client() returns None → callers fall back instantly
-(ADR-040 fail-soft)."""
+"""Lazy Langfuse v2 client. Construction is non-network; any failure = None = instant fallback."""
 from __future__ import annotations
-import logging
-import threading
-from typing import Any
 
-from langfuse import Langfuse as _Langfuse  # noqa: N814 (aliased for monkeypatch seam)
+from typing import Any, Protocol
+
 from . import config
 
-_log = logging.getLogger(__name__)
-_client: Any | None = None
-_built = False
-_lock = threading.Lock()  # ponytail: global lock; per-client locks if throughput matters
+
+class PromptClient(Protocol):
+    """Structural type of the client seam — both the Langfuse v2 client and the
+    test FakeClient satisfy this. Keeps `registry` type-sound under mypy."""
+
+    def get_prompt(self, name: str, **kwargs: Any) -> Any: ...
+
+
+_UNSET: Any = object()
+
+_cached: PromptClient | None = _UNSET
+_override: PromptClient | None = _UNSET
+
+
+def set_client_for_test(client: PromptClient | None) -> None:
+    global _override
+    _override = client
 
 
 def reset_client() -> None:
-    global _client, _built
-    with _lock:
-        _client, _built = None, False
+    global _cached, _override
+    _cached = _UNSET
+    _override = _UNSET
 
 
-def get_client() -> Any | None:
-    global _client, _built
-    if _built:          # fast path — no lock needed (reads are atomic on CPython)
-        return _client
-    with _lock:
-        if _built:      # re-check inside lock to close the race
-            return _client
-        _built = True
-        if not config.is_enabled() or not config.host():
-            _client = None
-            return None
-        cur = config.current()
-        try:
-            _client = _Langfuse(
-                host=cur.host, public_key=cur.public_key, secret_key=cur.secret_key,
-            )
-        except Exception as e:  # noqa: BLE001 — any init failure = disabled mode
-            _log.warning("novie-prompts: Langfuse client init failed, disabling: %s", e)
-            _client = None
-        return _client
+def invalidate_cache() -> None:
+    """Clear the lazily-built real client (e.g. on re-configure), but NOT the test
+    override — configure() must not stomp a test's installed fake."""
+    global _cached
+    _cached = _UNSET
+
+
+def _build_client(conn: "config.Connection") -> PromptClient:
+    from langfuse import Langfuse  # imported lazily so the package loads without it at rest
+
+    return Langfuse(host=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
+
+
+def get_client() -> PromptClient | None:
+    if _override is not _UNSET:
+        return _override
+    global _cached
+    if _cached is not _UNSET:
+        return _cached
+    # ponytail: a concurrent double-build under a race is harmless — Langfuse
+    # construction is non-network and idempotent; the discarded client is GC'd.
+    # No lock (would be over-engineering for an idempotent build).
+    conn = config.get_connection()
+    if conn is None:
+        _cached = None
+        return None
+    try:
+        _cached = _build_client(conn)
+    except Exception:
+        _cached = None
+    return _cached

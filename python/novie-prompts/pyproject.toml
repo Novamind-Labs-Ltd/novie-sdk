@@ -1,13 +1,18 @@
 [project]
 name = "novie-prompts"
 version = "0.1.0"
-description = "Cross-agent prompt management for Novie (fail-soft Langfuse fetch + in-repo fallback)"
+description = "Fail-soft Langfuse-managed prompt fetch with in-repo fallback (ADR-075)."
+readme = "README.md"
 requires-python = ">=3.13"
-# supports langfuse v2 (coexists with platform consumers pinned <3) and v4 (latest); v3 excluded (untested, and v3 dropped the tracing API platform consumers rely on). A consumer's environment resolves the concrete version.
-dependencies = ["langfuse>=2.50,!=3.*,<5"]
+dependencies = [
+    "langfuse>=2.50,!=3.*,<5",  # v2 (existing consumers) + v4 (latest); v3 excluded (dropped tracing API)
+    "httpx>=0.27",  # registry.py imports httpx directly for timeout classification; declare it (don't rely on langfuse's transitive pin)
+]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = [
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -18,3 +23,6 @@ packages = ["src/novie_prompts"]
 
 [project.scripts]
 novie-prompts = "novie_prompts.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

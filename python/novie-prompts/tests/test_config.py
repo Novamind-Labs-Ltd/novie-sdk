@@ -1,30 +1,49 @@
 from novie_prompts import config
 
 
-def test_defaults():
-    config.set_config()  # reset to defaults
+def setup_function():
+    config.reset()
+
+
+def test_no_connection_by_default():
+    assert config.get_connection() is None
+
+
+def test_configure_sets_connection():
+    config.configure(host="http://lf:3000", public_key="pk", secret_key="sk")
+    conn = config.get_connection()
+    assert conn is not None
+    assert conn.host == "http://lf:3000"
+    assert conn.public_key == "pk"
+    assert conn.secret_key == "sk"
+
+
+def test_connection_repr_redacts_credentials():
+    config.configure(host="https://lf", public_key="pk-lf-abc", secret_key="sk-lf-SECRET")
+    text = repr(config.get_connection())
+    assert "sk-lf-SECRET" not in text
+    assert "pk-lf-abc" not in text
+    assert "<redacted>" in text
+    assert "https://lf" in text  # host is fine to show
+
+
+def test_is_enabled_defaults_false(monkeypatch):
+    monkeypatch.delenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", raising=False)
     assert config.is_enabled() is False
-    assert config.cache_ttl_seconds() == 60
-    assert config.fetch_timeout_seconds() == 2
-    assert config.host() is None
 
 
-def test_ttl_floored_at_1():
-    config.set_config(cache_ttl_seconds=0)
-    assert config.cache_ttl_seconds() == 1  # 0 would disable caching; floor it
-
-
-def test_fetch_timeout_floored_at_1():
-    """Finding #5: fetch_timeout_seconds=0 means 'always fall back' silently; floor it."""
-    config.set_config(fetch_timeout_seconds=0)
-    assert config.fetch_timeout_seconds() == 1
-
-
-def test_overrides_round_trip():
-    config.set_config(enabled=True, host="http://lf:3000",
-                      cache_ttl_seconds=30, fetch_timeout_seconds=1,
-                      public_key="pk", secret_key="sk")
+def test_is_enabled_reads_env_per_call(monkeypatch):
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")
     assert config.is_enabled() is True
-    assert config.host() == "http://lf:3000"
-    cur = config.current()
-    assert cur.public_key == "pk" and cur.secret_key == "sk"
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "false")
+    assert config.is_enabled() is False  # re-read per call = kill switch
+
+
+def test_is_enabled_tolerates_surrounding_whitespace(monkeypatch):
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", " true ")
+    assert config.is_enabled() is True  # a stray space in the env file must not silently disable
+
+
+def test_timeout_constants():
+    assert config.FETCH_TIMEOUT_SECONDS == 2
+    assert config.CACHE_TTL_SECONDS == 60

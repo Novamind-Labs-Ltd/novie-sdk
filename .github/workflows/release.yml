@@ -20,7 +20,6 @@ on:
         options:
           - python
           - rust
-          - novie-prompts
       version:
         description: "Semver version (no leading 'v'), e.g. 0.3.1"
         required: true
@@ -104,47 +103,6 @@ jobs:
           name: python-dist-${{ inputs.version }}
           path: python/novie-agent-sdk/dist/*
 
-      # ── novie-prompts branch ────────────────────────────────────────────────
-      - name: Set up Python (novie-prompts)
-        if: inputs.language == 'novie-prompts'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-
-      - name: Verify novie-prompts version matches pyproject.toml
-        if: inputs.language == 'novie-prompts'
-        working-directory: python/novie-prompts
-        run: |
-          declared=$(python -c "import tomllib,sys; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
-          if [ "$declared" != "${{ inputs.version }}" ]; then
-            echo "::error::pyproject.toml declares version '$declared', but workflow input is '${{ inputs.version }}'. Update the file and re-run."
-            exit 1
-          fi
-
-      - name: Install build + dev deps (novie-prompts)
-        if: inputs.language == 'novie-prompts'
-        working-directory: python/novie-prompts
-        run: |
-          python -m pip install --upgrade pip
-          pip install build -e ".[dev]"
-
-      - name: Run novie-prompts tests
-        if: inputs.language == 'novie-prompts'
-        working-directory: python/novie-prompts
-        run: pytest -q
-
-      - name: Build novie-prompts wheel + sdist (artifact only, not published)
-        if: inputs.language == 'novie-prompts'
-        working-directory: python/novie-prompts
-        run: python -m build
-
-      - name: Upload novie-prompts build artifacts
-        if: inputs.language == 'novie-prompts'
-        uses: actions/upload-artifact@v4
-        with:
-          name: novie-prompts-dist-${{ inputs.version }}
-          path: python/novie-prompts/dist/*
-
       # ── Rust branch ─────────────────────────────────────────────────────────
       - name: Set up Rust toolchain
         if: inputs.language == 'rust'
@@ -203,8 +161,6 @@ jobs:
           "novie-agent-sdk @ git+ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git@{0}#subdirectory=python/novie-agent-sdk"
           ```', steps.tag.outputs.name) || '' }}${{ inputs.language == 'rust' && format('```toml
           novie-agent-sdk = {{ git = "ssh://git@github.com/Novamind-Labs-Ltd/novie-sdk.git", tag = "{0}" }}
-          ```', steps.tag.outputs.name) || '' }}${{ inputs.language == 'novie-prompts' && format('```sh
-          pip install "git+https://github.com/Novamind-Labs-Ltd/novie-sdk@{0}#subdirectory=python/novie-prompts"
           ```', steps.tag.outputs.name) || '' }}
 
           See [examples/](https://github.com/Novamind-Labs-Ltd/novie-sdk/tree/main/examples) for full consumer setup.
