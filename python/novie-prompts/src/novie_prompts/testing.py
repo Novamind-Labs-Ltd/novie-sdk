@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import client, telemetry
+from . import client, config, telemetry
 
 
 class RecordingRecorder:
@@ -49,8 +49,13 @@ def install_fake(
 
 
 def reset() -> None:
+    # The single published reset for consumer suites — clear ALL package state so
+    # a configured connection / fake client / recorder can't leak across tests.
+    # (The NOVIE_OBSERVABILITY_LANGFUSE_ENABLED env var is the consumer's to manage
+    # via monkeypatch.setenv — it's a real environment knob, not package state.)
     client.reset_client()
     telemetry.set_recorder(None)
+    config.reset()
 
 
 # Spec §3/§8 name this seam `fake_registry`; preserve that published name for the 6 consumer repos.

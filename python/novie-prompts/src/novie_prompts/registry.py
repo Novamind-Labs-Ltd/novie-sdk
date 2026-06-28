@@ -36,6 +36,9 @@ def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -
         if not isinstance(text, str):  # chat-type prompt → list, not str
             record_fallback(name, "chat_type")
             return fallback
+        if not text.strip():  # blank body = unusable (almost always a mis-edit) → use the constant
+            record_fallback(name, "empty")
+            return fallback
         record_live(name)
         return text
     except Exception as exc:

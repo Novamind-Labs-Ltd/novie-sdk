@@ -70,6 +70,13 @@ def test_chat_type_classified_as_chat_type(_enabled):
     assert rec.fallbacks == [("planner", "chat_type")]
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_blank_body_falls_back_to_constant(_enabled, blank):
+    _, rec = testing.install_fake(text=blank)
+    assert get_managed_prompt("planner", fallback="CONST") == "CONST"
+    assert rec.fallbacks == [("planner", "empty")]
+
+
 def test_generic_exception_classified_as_exception(_enabled):
     _, rec = testing.install_fake(raises=ValueError("weird"))
     assert get_managed_prompt("planner", fallback="CONST") == "CONST"

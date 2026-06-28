@@ -20,6 +20,13 @@ def reset_client() -> None:
     _override = _UNSET
 
 
+def invalidate_cache() -> None:
+    """Clear the lazily-built real client (e.g. on re-configure), but NOT the test
+    override — configure() must not stomp a test's installed fake."""
+    global _cached
+    _cached = _UNSET
+
+
 def _build_client(conn: "config.Connection") -> object:
     from langfuse import Langfuse  # imported lazily so the package loads without it at rest
 
