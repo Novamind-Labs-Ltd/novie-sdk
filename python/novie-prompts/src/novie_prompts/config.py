@@ -18,7 +18,7 @@ class PromptConfig:
 _config = PromptConfig()
 
 
-def set_config(**overrides) -> None:
+def set_config(**overrides: object) -> None:
     """Replace the process config. No args → defaults. Keyword overrides only."""
     global _config
     _config = replace(PromptConfig(), **overrides)

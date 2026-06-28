@@ -1,6 +1,7 @@
-"""Fail-soft, fail-LOUD telemetry. The recorder is INJECTED by the consumer
-(its rcp_metrics sink) — NEVER Langfuse (circular during an outage, §7). Labels
-are flattened into composite counter keys because rcp_metrics is a flat dict."""
+"""Fail-soft telemetry. The recorder is INJECTED by the consumer (its rcp_metrics
+sink) — NEVER Langfuse (circular during an outage, §7). Recorder exceptions are
+swallowed to ensure telemetry never breaks the caller's fail-soft path. Labels are
+flattened into composite counter keys because rcp_metrics is a flat dict."""
 from __future__ import annotations
 from collections.abc import Callable
 
