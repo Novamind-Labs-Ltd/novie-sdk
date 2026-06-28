@@ -58,3 +58,25 @@ def _classify(exc: BaseException) -> str:
     if isinstance(exc, _NotFoundError):
         return "missing"
     return "exception"
+
+
+def resolve_prompt(
+    name: str,
+    *,
+    fallback: str,
+    tier: str,
+    is_prod: bool,
+    control_plane_fetch_enabled: bool,
+) -> str:
+    """Tier+env dispatch (ADR-075 D4/D7). env/flag INJECTED (no novie_platform import).
+    content → fetch; control_plane+prod → constant (never fetched);
+    control_plane+non-prod+flag → fetch (T2 experiment); unknown tier → constant (fail-safe)."""
+    if tier == "content":
+        return get_managed_prompt(name, fallback=fallback)
+    if tier != "control_plane":
+        return fallback  # fail-safe: unknown/typo'd tier → constant
+    if is_prod:
+        return fallback
+    if control_plane_fetch_enabled:
+        return get_managed_prompt(name, fallback=fallback)
+    return fallback

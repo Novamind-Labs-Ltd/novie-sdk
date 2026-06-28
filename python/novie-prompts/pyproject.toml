@@ -5,7 +5,7 @@ description = "Fail-soft Langfuse-managed prompt fetch with in-repo fallback (AD
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "langfuse>=2.50,<3",
+    "langfuse>=2.50,!=3.*,<5",  # v2 (existing consumers) + v4 (latest); v3 excluded (dropped tracing API)
     "httpx>=0.27",  # registry.py imports httpx directly for timeout classification; declare it (don't rely on langfuse's transitive pin)
 ]
 
@@ -20,6 +20,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/novie_prompts"]
+
+[project.scripts]
+novie-prompts = "novie_prompts.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
