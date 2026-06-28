@@ -56,6 +56,8 @@ def resolve_prompt(
     """
     if tier == "content":
         return get_managed_prompt(name, fallback=fallback)
+    if tier != "control_plane":
+        return fallback                                  # fail-safe (ADR-075 D4): unknown/typo'd tier → constant, never fetched
     # tier == "control_plane"
     if is_prod:
         return fallback                                  # prod: constant only

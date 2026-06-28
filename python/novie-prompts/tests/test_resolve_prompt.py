@@ -40,3 +40,16 @@ def test_content_ignores_env_flags(monkeypatch):
     out = registry.resolve_prompt("p", fallback="C", tier="content",
                                   is_prod=False, control_plane_fetch_enabled=True)
     assert out == "FETCHED"  # proves content never gates on env
+
+
+def test_unknown_tier_fails_safe_to_constant(monkeypatch):
+    """ADR-075 D4: unknown/typo'd tier returns constant, never fetched."""
+    fetch_was_called = []
+    def fake_fetch(name, *, fallback, label="production"):
+        fetch_was_called.append(True)
+        return "FETCHED"
+    monkeypatch.setattr(registry, "get_managed_prompt", fake_fetch)
+    out = registry.resolve_prompt("p", fallback="C", tier="UNKNOWN_TYPO",
+                                  is_prod=False, control_plane_fetch_enabled=True)
+    assert out == "C"  # must use constant
+    assert not fetch_was_called  # must NOT call get_managed_prompt
