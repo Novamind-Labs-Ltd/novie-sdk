@@ -3,7 +3,8 @@ name = "novie-prompts"
 version = "0.1.0"
 description = "Cross-agent prompt management for Novie (fail-soft Langfuse fetch + in-repo fallback)"
 requires-python = ">=3.13"
-dependencies = ["langfuse>=2.50,<3"]
+# supports langfuse v2 (coexists with platform consumers pinned <3) and v4 (latest); v3 excluded (untested, and v3 dropped the tracing API platform consumers rely on). A consumer's environment resolves the concrete version.
+dependencies = ["langfuse>=2.50,!=3.*,<5"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]
