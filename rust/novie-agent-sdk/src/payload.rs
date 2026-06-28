@@ -1,9 +1,8 @@
 //! Invoke / task-request payload parsers — `payload.py` Rust port.
 //!
-//! These types only describe the **callback configuration** fragments
-//! (`platform_callback`, `agent_status_callback`) that the agent SDK needs to
-//! bootstrap its HTTP clients. The full agent invoke payload is left as
-//! `serde_json::Value` because every agent has its own `inputs` schema.
+//! These types only describe the callback configuration fragments that the
+//! agent SDK needs to bootstrap its HTTP clients. General platform callbacks
+//! use signed x-novie-* envelopes; only agent-status keeps a scoped token.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,13 +15,12 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformCallbackConfig {
     pub base_url: String,
-    pub token: String,
     #[serde(default = "default_v1")]
     pub version: String,
 }
 
 /// Push channel for `POST /internal/callbacks/agent-status`. Token is **scoped
-/// to the agent-status endpoint only** — distinct from `platform_callback.token`.
+/// to the agent-status endpoint only**.
 ///
 /// See `PLATFORM_CALLBACK_SPEC §7.1` and `§11.3`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,11 +109,6 @@ fn parse_platform_callback(v: &Value) -> Result<PlatformCallbackConfig> {
     if cfg.base_url.is_empty() {
         return Err(Error::InvalidArgument(
             "platform_callback.base_url must be a non-empty string".into(),
-        ));
-    }
-    if cfg.token.is_empty() {
-        return Err(Error::InvalidArgument(
-            "platform_callback.token must be a non-empty string".into(),
         ));
     }
     if cfg.version != "v1" {

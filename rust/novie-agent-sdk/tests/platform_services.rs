@@ -2,11 +2,12 @@
 
 use std::time::Duration;
 
+use novie_agent_sdk::headers::RequestHeaders;
 use novie_agent_sdk::session::{SessionEvent, SessionEventSource};
 use novie_agent_sdk::transport::TransportConfig;
 use novie_agent_sdk::{Error, PlatformServicesClient};
 use serde_json::json;
-use wiremock::matchers::{bearer_token, body_json, method, path};
+use wiremock::matchers::{body_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn quick_cfg() -> TransportConfig {
@@ -20,7 +21,15 @@ fn quick_cfg() -> TransportConfig {
 fn make_client(server: &MockServer) -> PlatformServicesClient {
     PlatformServicesClient::with_config(
         format!("{}/internal/callbacks", server.uri()),
-        "rpc-token",
+        RequestHeaders {
+            tenant_id: "tenant-1".into(),
+            workspace_id: "workspace-1".into(),
+            project_id: "project-1".into(),
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            request_id: "request-1".into(),
+            ..Default::default()
+        },
         quick_cfg(),
     )
     .unwrap()
@@ -31,7 +40,11 @@ async fn events_publish_wraps_payload_in_kwargs() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/internal/callbacks/events/publish"))
-        .and(bearer_token("rpc-token"))
+        .and(header("x-novie-org-id", "tenant-1"))
+        .and(header("x-novie-workspace-id", "workspace-1"))
+        .and(header("x-novie-project-id", "project-1"))
+        .and(header("x-novie-user-id", "user-1"))
+        .and(header_exists("x-novie-sig"))
         .and(body_json(json!({
             "kwargs": {"topic": "agent.startup", "payload": {"agent": "x"}},
         })))

@@ -31,8 +31,8 @@ pub struct LongTaskCompletion<'a> {
     pub error: Option<&'a str>,
 }
 
-/// Notify the platform that a long-running task finished. Uses the standard
-/// callback bearer token (same as `PlatformServicesClient`).
+/// Notify the platform that a long-running task finished using the transport's
+/// configured auth mode.
 pub async fn notify_long_task_complete(
     transport: &CallbackTransport,
     completion: LongTaskCompletion<'_>,

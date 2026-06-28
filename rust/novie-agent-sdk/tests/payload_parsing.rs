@@ -22,7 +22,6 @@ fn parses_full_invoke_payload() {
         },
         "platform_callback": {
             "base_url": "http://localhost:8000/internal/callbacks",
-            "token": "abc.def.ghi",
         },
         "agent_status_callback": {
             "url": "http://localhost:8000/internal/callbacks/agent-status",
@@ -35,7 +34,6 @@ fn parses_full_invoke_payload() {
     let payload = AgentInvokePayload::from_value(raw).unwrap();
     let pc = payload.platform_callback.as_ref().unwrap();
     assert_eq!(pc.base_url, "http://localhost:8000/internal/callbacks");
-    assert_eq!(pc.token, "abc.def.ghi");
     assert_eq!(pc.version, "v1");
 
     let asc = payload.agent_status_callback.as_ref().unwrap();
@@ -56,7 +54,6 @@ fn rejects_invalid_callback_block() {
     let raw = json!({
         "platform_callback": {
             "base_url": "",
-            "token": "t",
         }
     });
     let err = AgentInvokePayload::from_value(raw).unwrap_err();
@@ -68,7 +65,6 @@ fn rejects_unknown_callback_version() {
     let raw = json!({
         "platform_callback": {
             "base_url": "http://x",
-            "token": "t",
             "version": "v9",
         }
     });

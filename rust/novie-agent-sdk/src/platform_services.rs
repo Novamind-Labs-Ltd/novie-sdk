@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
+use crate::headers::RequestHeaders;
 use crate::memory::CheckpointSnapshot;
 use crate::payload::AgentInvokePayload;
 use crate::session::{Session, SessionEvent, SessionEventsPage};
@@ -34,16 +35,18 @@ pub struct PlatformServicesClient {
 }
 
 impl PlatformServicesClient {
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self> {
-        Self::with_config(base_url, token, TransportConfig::default())
+    pub fn new(base_url: impl Into<String>, headers: RequestHeaders) -> Result<Self> {
+        Self::with_config(base_url, headers, TransportConfig::default())
     }
 
     pub fn with_config(
         base_url: impl Into<String>,
-        token: impl Into<String>,
+        headers: RequestHeaders,
         cfg: TransportConfig,
     ) -> Result<Self> {
-        let transport = Arc::new(CallbackTransport::with_config(base_url, token, cfg)?);
+        let transport = Arc::new(CallbackTransport::with_signed_headers(
+            base_url, headers, cfg,
+        )?);
         Ok(Self::from_transport(transport))
     }
 
@@ -82,16 +85,19 @@ impl PlatformServicesClient {
         }
     }
 
-    /// Pull the RPC `platform_callback` config out of an invoke payload.
-    pub fn from_invoke_payload(payload: &AgentInvokePayload) -> Result<Self> {
+    /// Pull the RPC `platform_callback` base URL out of an invoke payload.
+    pub fn from_invoke_payload(
+        payload: &AgentInvokePayload,
+        headers: RequestHeaders,
+    ) -> Result<Self> {
         let cfg = payload.platform_callback.as_ref().ok_or_else(|| {
             Error::InvalidArgument(
                 "invoke payload missing 'platform_callback' field; \
-                 did DispatchService sign the token?"
+                 did DispatchService include the callback base URL?"
                     .into(),
             )
         })?;
-        Self::new(cfg.base_url.clone(), cfg.token.clone())
+        Self::new(cfg.base_url.clone(), headers)
     }
 
     pub fn transport(&self) -> &Arc<CallbackTransport> {
