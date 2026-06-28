@@ -43,3 +43,22 @@ def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -
     except Exception as e:                                  # noqa: BLE001 — fail-soft
         record_fallback(name, reason=_classify(e))
         return fallback
+
+
+def resolve_prompt(
+    name: str, *, fallback: str, tier: str,
+    is_prod: bool, control_plane_fetch_enabled: bool,
+) -> str:
+    """Single dispatch by tier + INJECTED environment (ADR-075 D4/D7).
+
+    `fallback` IS the in-code constant. env/flag are injected — this package
+    MUST NOT import novie_platform.
+    """
+    if tier == "content":
+        return get_managed_prompt(name, fallback=fallback)
+    # tier == "control_plane"
+    if is_prod:
+        return fallback                                  # prod: constant only
+    if control_plane_fetch_enabled:                      # T2, non-prod only
+        return get_managed_prompt(name, fallback=fallback)
+    return fallback
