@@ -23,10 +23,18 @@ def has_recorder() -> bool:
 
 
 def record_fallback(name: str, reason: str) -> None:
+    # Telemetry is best-effort: a buggy consumer-injected recorder must NEVER
+    # break get_managed_prompt's NEVER-raises contract (ADR-075 D6).
     if _recorder is not None:
-        _recorder.record_fallback(name, reason)
+        try:
+            _recorder.record_fallback(name, reason)
+        except Exception:
+            pass
 
 
 def record_live(name: str) -> None:
     if _recorder is not None:
-        _recorder.record_live(name)
+        try:
+            _recorder.record_live(name)
+        except Exception:
+            pass

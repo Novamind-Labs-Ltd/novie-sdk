@@ -32,6 +32,9 @@ def get_client() -> object | None:
     global _cached
     if _cached is not _UNSET:
         return _cached
+    # ponytail: a concurrent double-build under a race is harmless — Langfuse
+    # construction is non-network and idempotent; the discarded client is GC'd.
+    # No lock (would be over-engineering for an idempotent build).
     conn = config.get_connection()
     if conn is None:
         _cached = None

@@ -44,6 +44,9 @@ def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -
 
 
 def _classify(exc: BaseException) -> str:
+    # ponytail: only httpx.TimeoutException → "timeout". If a future SDK/transport
+    # wraps timeouts differently (e.g. socket.timeout), they fall to "exception";
+    # widen this if the timeout alerting bucket ever needs that transport.
     if isinstance(exc, httpx.TimeoutException):
         return "timeout"
     if isinstance(exc, _NotFoundError):

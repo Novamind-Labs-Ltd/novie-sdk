@@ -31,3 +31,18 @@ def test_injected_recorder_receives_calls():
     telemetry.record_live("supervisor")
     assert rec.fallbacks == [("planner", "timeout")]
     assert rec.lives == ["supervisor"]
+
+
+class _RaisingRecorder:
+    def record_fallback(self, name, reason):
+        raise RuntimeError("buggy recorder")
+
+    def record_live(self, name):
+        raise RuntimeError("buggy recorder")
+
+
+def test_raising_recorder_is_swallowed():
+    # A buggy consumer recorder must never propagate (telemetry is best-effort).
+    telemetry.set_recorder(_RaisingRecorder())
+    telemetry.record_fallback("p", "timeout")  # must not raise
+    telemetry.record_live("p")  # must not raise
