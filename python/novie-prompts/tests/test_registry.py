@@ -41,6 +41,25 @@ def test_enabled_live_returns_langfuse_text_and_records(monkeypatch):
     assert fake.last_call["label"] == "production"
 
 
+def test_default_label_resolves_from_runtime_env(monkeypatch):
+    # No label passed → resolved via config.resolve_label(), not hardcoded "production".
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", "uat")
+    fake, _ = testing.install_fake(text="UAT BODY")
+    out = get_managed_prompt("analyst/system", fallback="CONST")
+    assert out == "UAT BODY"
+    assert fake.last_call["label"] == "uat"
+
+
+def test_explicit_label_overrides_runtime_env(monkeypatch):
+    monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", "uat")
+    fake, _ = testing.install_fake(text="PROD BODY")
+    out = get_managed_prompt("analyst/system", fallback="CONST", label="production")
+    assert out == "PROD BODY"
+    assert fake.last_call["label"] == "production"
+
+
 @pytest.fixture
 def _enabled(monkeypatch):
     monkeypatch.setenv("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "true")

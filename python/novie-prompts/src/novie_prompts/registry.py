@@ -13,10 +13,18 @@ except Exception:  # pragma: no cover - only if langfuse internals move
     _NotFoundError = ()  # isinstance(exc, ()) is always False → never matches
 
 
-def get_managed_prompt(name: str, *, fallback: str, label: str = "production") -> str:
+def get_managed_prompt(name: str, *, fallback: str, label: str | None = None) -> str:
     """Langfuse-managed prompt with in-repo fallback. Returns `fallback` when
     disabled / unconfigured / unreachable / slow / missing / chat-type / blank-body.
-    NEVER raises."""
+    NEVER raises.
+
+    ``label=None`` (the default) resolves the label from the runtime
+    environment via :func:`config.resolve_label` — ``production`` in prod,
+    ``uat`` in uat, ``development`` elsewhere — so dev/uat experimentation
+    can't accidentally read (or leak into) the production-served version.
+    Pass an explicit label to override."""
+    if label is None:
+        label = config.resolve_label()
     if not config.is_enabled():
         record_fallback(name, "disabled")
         return fallback
