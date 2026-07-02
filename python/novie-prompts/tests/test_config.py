@@ -1,3 +1,5 @@
+import pytest
+
 from novie_prompts import config
 
 
@@ -47,3 +49,42 @@ def test_is_enabled_tolerates_surrounding_whitespace(monkeypatch):
 def test_timeout_constants():
     assert config.FETCH_TIMEOUT_SECONDS == 2
     assert config.CACHE_TTL_SECONDS == 60
+
+
+def test_resolve_label_defaults_to_development(monkeypatch):
+    monkeypatch.delenv("NOVIE_RUNTIME_MODE", raising=False)
+    monkeypatch.delenv("NOVIE_ENV", raising=False)
+    assert config.resolve_label() == "development"
+
+
+@pytest.mark.parametrize(
+    "runtime_mode,expected",
+    [("production", "production"), ("uat", "uat"), ("dev", "development"),
+     ("PRODUCTION", "production"), (" uat ", "uat")],
+)
+def test_resolve_label_reads_runtime_mode(monkeypatch, runtime_mode, expected):
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", runtime_mode)
+    monkeypatch.setenv("NOVIE_ENV", "production")  # must not win over an explicit RUNTIME_MODE
+    assert config.resolve_label() == expected
+
+
+def test_resolve_label_dev_never_escalates_via_legacy_env(monkeypatch):
+    # Mirrors is_production_mode()'s escalation guard: explicit dev wins even
+    # when a stray legacy NOVIE_ENV=production is also set.
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", "dev")
+    monkeypatch.setenv("NOVIE_ENV", "production")
+    assert config.resolve_label() == "development"
+
+
+@pytest.mark.parametrize("legacy,expected", [("production", "production"), ("uat", "uat"), ("staging", "development")])
+def test_resolve_label_falls_back_to_legacy_env(monkeypatch, legacy, expected):
+    monkeypatch.delenv("NOVIE_RUNTIME_MODE", raising=False)
+    monkeypatch.setenv("NOVIE_ENV", legacy)
+    assert config.resolve_label() == expected
+
+
+def test_resolve_label_reads_env_per_call(monkeypatch):
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", "production")
+    assert config.resolve_label() == "production"
+    monkeypatch.setenv("NOVIE_RUNTIME_MODE", "dev")
+    assert config.resolve_label() == "development"  # re-read per call, same as is_enabled()

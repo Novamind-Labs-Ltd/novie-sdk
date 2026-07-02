@@ -45,6 +45,33 @@ def is_enabled() -> bool:
     return os.environ.get("NOVIE_OBSERVABILITY_LANGFUSE_ENABLED", "false").strip().lower() in _TRUE
 
 
+def resolve_label() -> str:
+    """Resolve the Langfuse prompt label from the runtime environment, re-read
+    per call (same as :func:`is_enabled`) so a flip + restart takes effect.
+
+    Mirrors ``novie_platform.infra.runtime_mode.is_production_mode``'s env-var
+    precedence without importing it (the SDK must not depend on a consumer
+    repo): ``NOVIE_RUNTIME_MODE`` (preferred) wins over legacy ``NOVIE_ENV``,
+    and an explicit ``NOVIE_RUNTIME_MODE=dev`` never escalates via a stray
+    ``NOVIE_ENV=production``. Unset/unrecognized → ``"development"`` (the safe
+    default — never accidentally serve an unreviewed dev experiment from a
+    ``production``-labelled version by mistake).
+    """
+    runtime_mode = os.environ.get("NOVIE_RUNTIME_MODE", "").strip().lower()
+    if runtime_mode == "production":
+        return "production"
+    if runtime_mode == "uat":
+        return "uat"
+    if runtime_mode == "dev":
+        return "development"  # explicit override — never escalate via legacy NOVIE_ENV
+    legacy = os.environ.get("NOVIE_ENV", "").strip().lower()
+    if legacy == "production":
+        return "production"
+    if legacy == "uat":
+        return "uat"
+    return "development"
+
+
 def reset() -> None:
     """Test seam: clear the configured connection."""
     global _connection
