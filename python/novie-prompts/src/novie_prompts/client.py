@@ -77,7 +77,11 @@ def _patch_slash_encoding_bug(client: Any) -> None:
 def _build_client(conn: "config.Connection") -> PromptClient:
     from langfuse import Langfuse  # imported lazily so the package loads without it at rest
 
-    client = Langfuse(host=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
+    # base_url= (not the deprecated host=) — the SDK resolves base_url as
+    # base_url kwarg > LANGFUSE_BASE_URL env > host kwarg > LANGFUSE_HOST env
+    # > cloud default. A cluster-wide LANGFUSE_BASE_URL set for unrelated
+    # tooling would otherwise silently outrank our intended conn.host.
+    client = Langfuse(base_url=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
     _patch_slash_encoding_bug(client)
     return client
 

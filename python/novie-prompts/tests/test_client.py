@@ -50,6 +50,20 @@ def test_construction_failure_yields_none(monkeypatch):
     assert client.get_client() is None  # construction failure = disabled mode = instant fallback
 
 
+def test_build_client_host_wins_over_a_cluster_wide_langfuse_base_url_env(monkeypatch):
+    # Regression: verified live against a real deployment (2026-07-03) that the
+    # langfuse SDK resolves its base URL as
+    #   base_url kwarg > LANGFUSE_BASE_URL env > host kwarg > LANGFUSE_HOST env > cloud default.
+    # A cluster can set LANGFUSE_BASE_URL for unrelated tooling; if _build_client
+    # only passes host= (deprecated), that env var silently outranks conn.host and
+    # every real client binds to the wrong server. Passing base_url= makes conn.host
+    # win no matter what LANGFUSE_BASE_URL is set to elsewhere.
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://decoy.example.com")
+    conn = config.Connection(host="http://internal-langfuse:3000", public_key="pk", secret_key="sk")
+    built = client._build_client(conn)
+    assert built._base_url == "http://internal-langfuse:3000"
+
+
 def test_patch_result_is_correct_regardless_of_installed_langfuse_version():
     # The CI matrix installs both langfuse 2.x (has the bug — verified against
     # a live deployment, 2.60.10) and 4.x (already fixed upstream, confirmed
