@@ -30,14 +30,11 @@ jobs:
         run: pytest -q
 
   novie-prompts:
-    name: novie-prompts (py${{ matrix.python-version }} / langfuse ${{ matrix.langfuse-spec }})
+    name: novie-prompts (py${{ matrix.python-version }})
     runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.13", "3.14"]
-        langfuse-spec:
-          - "langfuse>=2.50,<3"   # oldest-supported (v2)
-          - "langfuse>=4,<5"      # latest (v4)
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +47,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-
-      - name: Pin langfuse version
-        run: pip install "${{ matrix.langfuse-spec }}"
 
       - name: Run tests
         working-directory: python/novie-prompts
