@@ -1,4 +1,4 @@
-"""Lazy Langfuse v2 client. Construction is non-network; any failure = None = instant fallback."""
+"""Lazy Langfuse client. Construction is non-network; any failure = None = instant fallback."""
 from __future__ import annotations
 
 from typing import Any, Protocol
@@ -7,7 +7,7 @@ from . import config
 
 
 class PromptClient(Protocol):
-    """Structural type of the client seam — both the Langfuse v2 client and the
+    """Structural type of the client seam — both the real Langfuse client and the
     test FakeClient satisfy this. Keeps `registry` type-sound under mypy."""
 
     def get_prompt(self, name: str, **kwargs: Any) -> Any: ...
@@ -77,7 +77,11 @@ def _patch_slash_encoding_bug(client: Any) -> None:
 def _build_client(conn: "config.Connection") -> PromptClient:
     from langfuse import Langfuse  # imported lazily so the package loads without it at rest
 
-    client = Langfuse(host=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
+    # base_url= (not the deprecated host=) — v4 resolves its base URL as
+    # base_url kwarg > LANGFUSE_BASE_URL env > host kwarg > LANGFUSE_HOST env
+    # > cloud default. A cluster-wide LANGFUSE_BASE_URL set for unrelated
+    # tooling would otherwise silently outrank our intended conn.host.
+    client = Langfuse(base_url=conn.host, public_key=conn.public_key, secret_key=conn.secret_key)
     _patch_slash_encoding_bug(client)
     return client
 
