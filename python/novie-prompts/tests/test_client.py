@@ -1,3 +1,5 @@
+from typing import Any
+
 from novie_prompts import client, config
 
 
@@ -50,18 +52,51 @@ def test_construction_failure_yields_none(monkeypatch):
     assert client.get_client() is None  # construction failure = disabled mode = instant fallback
 
 
+def _resolved_base_url(built: Any) -> Any:
+    # v4+ exposes the resolved host as `_base_url`; v2.x exposes it as `base_url`
+    # (no underscore). Both are read here so this assertion holds regardless of
+    # which major version the CI matrix / local env happens to have installed.
+    return getattr(built, "_base_url", None) or getattr(built, "base_url", None)
+
+
 def test_build_client_host_wins_over_a_cluster_wide_langfuse_base_url_env(monkeypatch):
-    # Regression: verified live against a real deployment (2026-07-03) that the
-    # langfuse SDK resolves its base URL as
+    # Regression: verified live against a real deployment (2026-07-03) that
+    # langfuse v4+ resolves its base URL as
     #   base_url kwarg > LANGFUSE_BASE_URL env > host kwarg > LANGFUSE_HOST env > cloud default.
     # A cluster can set LANGFUSE_BASE_URL for unrelated tooling; if _build_client
-    # only passes host= (deprecated), that env var silently outranks conn.host and
-    # every real client binds to the wrong server. Passing base_url= makes conn.host
-    # win no matter what LANGFUSE_BASE_URL is set to elsewhere.
+    # only passes host= (deprecated), that env var silently outranks conn.host on v4
+    # and every real client binds to the wrong server. Passing base_url= makes
+    # conn.host win no matter what LANGFUSE_BASE_URL is set to elsewhere.
+    # (v2.x has no LANGFUSE_BASE_URL env var at all — host= already always wins
+    # there — so this same assertion holds on either installed major version.)
     monkeypatch.setenv("LANGFUSE_BASE_URL", "https://decoy.example.com")
     conn = config.Connection(host="http://internal-langfuse:3000", public_key="pk", secret_key="sk")
     built = client._build_client(conn)
-    assert built._base_url == "http://internal-langfuse:3000"
+    assert _resolved_base_url(built) == "http://internal-langfuse:3000"
+
+
+def test_build_client_falls_back_to_host_kwarg_when_base_url_is_unsupported(monkeypatch):
+    # Simulates langfuse v2.x, which has no base_url kwarg at all — verified
+    # against the real langfuse==2.60.10 API, it raises TypeError on an
+    # unexpected keyword argument. This exercises _build_client's fallback
+    # branch in a single CI run regardless of which langfuse major version
+    # happens to be pip-installed for that run.
+    calls = []
+
+    class FakeV2Langfuse:
+        def __init__(self, **kwargs):
+            if "base_url" in kwargs:
+                raise TypeError("Langfuse.__init__() got an unexpected keyword argument 'base_url'")
+            calls.append(kwargs)
+            self.base_url = kwargs.get("host")
+
+    import langfuse
+
+    monkeypatch.setattr(langfuse, "Langfuse", FakeV2Langfuse)
+    conn = config.Connection(host="http://internal-langfuse:3000", public_key="pk", secret_key="sk")
+    built = client._build_client(conn)
+    assert _resolved_base_url(built) == "http://internal-langfuse:3000"
+    assert calls == [{"host": "http://internal-langfuse:3000", "public_key": "pk", "secret_key": "sk"}]
 
 
 def test_patch_result_is_correct_regardless_of_installed_langfuse_version():
