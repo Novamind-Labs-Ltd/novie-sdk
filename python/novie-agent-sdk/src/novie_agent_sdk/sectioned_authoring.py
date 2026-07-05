@@ -611,6 +611,16 @@ class SectionedLongformAuthor:
             self._context_budget.get("max_section_revision_rounds"),
             self._contract.max_section_revision_rounds,
         )
+        # Output ceiling for content-bearing LLM calls (section drafts and
+        # finalize rewrites). This is the run's budget-contract limit — the
+        # platform sends it per run, sized to the tenant's model — NOT a
+        # per-section length control: content length is governed by prompt
+        # targets and the quality gate, and hitting this ceiling is a loud
+        # truncation event, never a silent cut. None lets the platform apply
+        # its own default.
+        self._output_token_ceiling = (
+            _positive_int(self._context_budget.get("max_output_tokens"), 0) or None
+        )
         self._max_llm_stream_attempts = _positive_int(
             self._context_budget.get("llm_stream_max_attempts")
             or os.getenv(_LLM_STREAM_MAX_ATTEMPTS_ENV),
@@ -1099,7 +1109,7 @@ class SectionedLongformAuthor:
         purpose: str,
         messages: list[dict[str, Any]],
         temperature: float,
-        max_output_tokens: int,
+        max_output_tokens: int | None,
         model: str | None = None,
         section: SectionPlan | None = None,
         section_index: int | None = None,
@@ -1481,7 +1491,7 @@ class SectionedLongformAuthor:
             purpose="revise_section" if revision_feedback is not None else "draft_section",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.25,
-            max_output_tokens=_section_output_token_budget(plan, self._contract),
+            max_output_tokens=self._output_token_ceiling,
             section=plan,
             section_index=section_index,
             extra_metadata={
@@ -1665,7 +1675,7 @@ class SectionedLongformAuthor:
             purpose="final_polish",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_output_tokens=_final_output_token_budget(combined),
+            max_output_tokens=self._output_token_ceiling,
             model=self._contract.finalize_model or None,
             extra_metadata={"section_count": len(drafts)},
         )
@@ -1749,7 +1759,7 @@ class SectionedLongformAuthor:
                 purpose="merge_cluster",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_output_tokens=_final_output_token_budget(cluster_markdown),
+                max_output_tokens=self._output_token_ceiling,
                 model=self._contract.finalize_model or None,
                 extra_metadata={
                     "cluster_index": cluster_index,
@@ -2220,23 +2230,6 @@ def _has_confidence_layer(markdown: str) -> bool:
 
 def _join_markdown(items: Any) -> str:
     return "\n\n".join(str(item or "").strip() for item in items if str(item or "").strip())
-
-
-def _section_output_token_budget(
-    plan: SectionPlan,
-    contract: SectionedAuthoringContract,
-) -> int:
-    target_units = _clamp_int(
-        max(plan.min_words, contract.default_section_words),
-        minimum=contract.min_section_words,
-        maximum=max(contract.max_section_words, contract.min_section_words),
-    )
-    return _clamp_int(target_units * 5, minimum=1200, maximum=4096)
-
-
-def _final_output_token_budget(markdown: str) -> int:
-    units = max(_information_units(markdown), 1)
-    return _clamp_int(units * 3, minimum=2400, maximum=16000)
 
 
 def _llm_stream_event_delta(event: Any) -> str:

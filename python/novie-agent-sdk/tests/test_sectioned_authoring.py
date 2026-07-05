@@ -502,7 +502,7 @@ async def test_run_sectioned_document_finalization_requires_sectioned_contract()
 
 
 @pytest.mark.asyncio
-async def test_sectioned_author_passes_bounded_chat_output_tokens() -> None:
+async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None:
     platform = _FakePlatform()
     llm = _FakeLlm()
     author = SectionedLongformAuthor(
@@ -511,6 +511,7 @@ async def test_sectioned_author_passes_bounded_chat_output_tokens() -> None:
         artifact_type="example_document",
         step_id="s2",
         capability_id="agent.example.write_document",
+        context_budget={"max_output_tokens": 64000},
         authoring_contract={
             "coverage_model": "example_document",
             "min_outline_sections": 2,
@@ -530,10 +531,49 @@ async def test_sectioned_author_passes_bounded_chat_output_tokens() -> None:
         agent_id="writer",
     )
 
+    # Two section drafts + the final polish all get the run's budget-contract
+    # ceiling — content length is governed by prompt targets and the quality
+    # gate, not by per-call heuristics.
     assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        1200,
-        1200,
-        2400,
+        64000,
+        64000,
+        64000,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_defers_output_cap_to_platform_without_budget() -> None:
+    platform = _FakePlatform()
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+        },
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    # No budget contract → None, so the platform applies its own default.
+    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
+        None,
+        None,
+        None,
     ]
 
 
