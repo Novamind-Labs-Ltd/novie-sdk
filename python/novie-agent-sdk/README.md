@@ -84,7 +84,9 @@ name: document-authoring
 runtime:
   strategy: sectioned_longform
   context_policy: evidence_pack_v1
-  finalization: section_ledger_polish
+  # One of: single_polish | boundary_stitch | progressive_section_merge.
+  # Unknown values fail contract construction (ValueError).
+  finalization: boundary_stitch
 task_profile:
   selected_by: llm
   defaults:

@@ -1249,3 +1249,82 @@ async def test_running_context_disabled_uses_refs_only() -> None:
 
     assert all("Document so far" not in prompt for prompt in llm.chat_prompts)
     assert all("Maintain a running summary" not in prompt for prompt in llm.chat_prompts)
+
+
+# --- finalization contract validation ---------------------------------------
+
+
+def test_contract_accepts_known_finalization_modes() -> None:
+    from novie_agent_sdk.sectioned_authoring import (
+        KNOWN_FINALIZATION_MODES,
+        SectionedAuthoringContract,
+    )
+
+    for mode in KNOWN_FINALIZATION_MODES:
+        contract = SectionedAuthoringContract.from_mapping({"finalization": mode})
+        assert contract.finalization == mode
+    # Absent / empty values fall back to the default mode.
+    assert SectionedAuthoringContract.from_mapping({}).finalization == "single_polish"
+    assert SectionedAuthoringContract.from_mapping(None).finalization == "single_polish"
+
+
+def test_contract_rejects_unknown_finalization_mode() -> None:
+    from novie_agent_sdk.sectioned_authoring import SectionedAuthoringContract
+
+    with pytest.raises(ValueError) as excinfo:
+        SectionedAuthoringContract.from_mapping(
+            {"finalization": "section_ledger_polish"}
+        )
+    message = str(excinfo.value)
+    # The offending value and the valid modes are both named so the skill
+    # author can fix SKILL.md without reading SDK source.
+    assert "section_ledger_polish" in message
+    assert "boundary_stitch" in message
+    assert "progressive_section_merge" in message
+    assert "single_polish" in message
+
+
+@pytest.mark.asyncio
+async def test_polish_final_emits_fallback_event_for_unvalidated_contract() -> None:
+    from novie_agent_sdk.sectioned_authoring import SectionedAuthoringContract
+
+    phase_events: list[dict[str, Any]] = []
+    polished = "## Context\n\nalpha beta gamma.\n\n## Findings\n\ndelta epsilon zeta."
+    llm = _BridgeLlm(bridge=polished)
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        # Direct dataclass construction bypasses from_mapping validation.
+        authoring_contract=SectionedAuthoringContract(
+            finalization="section_ledger_polish"
+        ),
+        phase_event_sink=phase_events.append,
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Context"),
+            markdown="## Context\n\nalpha beta gamma.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s2", title="Findings"),
+            markdown="## Findings\n\ndelta epsilon zeta.",
+        ),
+    ]
+
+    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
+
+    fallback_events = [
+        event for event in phase_events
+        if event["event"] == "document.finalize.mode_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["requested_mode"] == "section_ledger_polish"
+    assert fallback_events[0]["effective_mode"] == "single_polish"
+    # The single_polish path actually ran.
+    assert any(
+        "Polish the concatenated sections" in prompt for prompt in llm.chat_prompts
+    )
+    assert result == polished
