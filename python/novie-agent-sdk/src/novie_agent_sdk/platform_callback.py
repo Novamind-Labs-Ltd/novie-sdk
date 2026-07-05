@@ -7,13 +7,11 @@ headers. This module centralizes that mapping for all Python agents.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
-import time
 from collections.abc import Mapping
 from typing import Any
 
+from .platform_security import sign_agent_platform_headers
 from .runtime import RequestHeaders
 
 
@@ -81,37 +79,15 @@ def sign_platform_callback_headers(
 ) -> dict[str, str]:
     """Return headers with ``x-novie-timestamp`` and ``x-novie-sig``.
 
-    The canonical string matches ``novie_platform.gateway.api.deps``.
+    The canonical string matches the Novie agent-platform signed envelope.
     """
-    signing_secret = (
-        secret if secret is not None else os.getenv("NOVIE_TRUSTED_HEADER_SECRET", "")
-    ).strip()
-    out = dict(headers)
-    if not signing_secret:
-        return out
-    ts = timestamp or str(int(time.time()))
-    out["x-novie-timestamp"] = ts
-    canonical = "\n".join(
-        [
-            method.upper(),
-            _normalize_path(path),
-            out.get("x-novie-org-id", ""),
-            out.get("x-novie-project-id", ""),
-            out.get("x-novie-workspace-id", ""),
-            out.get("x-novie-user-id", ""),
-            out.get("x-novie-service-principal", ""),
-            out.get("x-novie-session-id", ""),
-            out.get("x-novie-request-id", ""),
-            ts,
-        ]
+    return sign_agent_platform_headers(
+        headers,
+        method=method,
+        path=path,
+        secret=secret,
+        timestamp=timestamp,
     )
-    signature = hmac.new(
-        signing_secret.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    out["x-novie-sig"] = f"sha256={signature}"
-    return out
 
 
 class PlatformCallbackClient:
@@ -196,14 +172,3 @@ class _IncomingHeaders:
             if value:
                 return value
         return ""
-
-
-def _normalize_path(path: str) -> str:
-    if not path:
-        return "/"
-    if path.startswith("http://") or path.startswith("https://"):
-        from urllib.parse import urlsplit
-
-        parsed = urlsplit(path)
-        return parsed.path or "/"
-    return path if path.startswith("/") else f"/{path}"

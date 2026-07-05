@@ -75,7 +75,7 @@ def test_sign_callback_headers_matches_gateway_canonical_shape() -> None:
 
 @pytest.mark.asyncio
 async def test_platform_callback_client_invokes_capability_with_signed_headers(monkeypatch) -> None:
-    monkeypatch.setenv("NOVIE_TRUSTED_HEADER_SECRET", "secret")
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "secret")
     seen: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:

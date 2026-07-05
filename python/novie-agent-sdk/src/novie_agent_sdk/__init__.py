@@ -75,6 +75,12 @@ from .platform_callback import (
     build_platform_callback_headers,
     sign_platform_callback_headers,
 )
+from .platform_security import (
+    AgentPlatformSignatureError,
+    agent_platform_shared_secret,
+    sign_agent_platform_headers,
+    verify_agent_platform_headers,
+)
 from .github_operations import (
     GitHubOperationError,
     GitHubOperationsClient,
@@ -196,7 +202,6 @@ from .llm_contract import (
     normalise_tool_calls,
     sanitize_additional_kwargs,
 )
-from .platform_chat_model import PlatformChatModel, PlatformStructuredChatModel
 from .artifact_text import (
     ArtifactReadCache,
     ArtifactReader,
@@ -693,8 +698,6 @@ __all__ = [
     "LlmFacade",
     "LlmMode",
     "build_llm_facade",
-    "PlatformChatModel",
-    "PlatformStructuredChatModel",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)
     "CompatibilityMatrix",
     "ConformanceProbe",
@@ -728,6 +731,7 @@ __all__ = [
     "runnable_run_id",
     "UsageReport",
     "build_platform_callback_headers",
+    "AgentPlatformSignatureError",
     "extract_call_scope",
     "extract_project_brief",
     "load_provider_folder",
@@ -771,6 +775,9 @@ __all__ = [
     "build_gateway_client",
     "build_http_platform_services",
     "sign_platform_callback_headers",
+    "agent_platform_shared_secret",
+    "sign_agent_platform_headers",
+    "verify_agent_platform_headers",
     "assert_http_json_agent_card",
     "assert_http_json_healthcheck",
     "assert_http_json_invoke_contract",

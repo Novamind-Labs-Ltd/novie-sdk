@@ -202,6 +202,17 @@ class _CapabilityCaller:
         self._timeout = timeout_seconds
         self._client = client
 
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    def signed_headers(self, *, method: str, path: str) -> dict[str, str]:
+        return sign_platform_callback_headers(
+            self._headers,
+            method=method,
+            path=path,
+        )
+
     async def invoke_with_diagnostics(
         self,
         capability_id: str,
@@ -1922,6 +1933,21 @@ class PlatformNamespace:
     @property
     def is_available(self) -> bool:
         return True
+
+    @property
+    def openai_base_url(self) -> str:
+        return f"{self._llm_caller.base_url}/v1"
+
+    def platform_headers(self, *, method: str, path: str) -> dict[str, str]:
+        return self._caller.signed_headers(method=method, path=path)
+
+    def openai_headers(
+        self,
+        *,
+        method: str = "POST",
+        path: str = "/v1/chat/completions",
+    ) -> dict[str, str]:
+        return self._llm_caller.signed_headers(method=method, path=path)
 
     async def invoke_capability(
         self,
