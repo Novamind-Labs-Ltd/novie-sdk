@@ -53,6 +53,29 @@ _STRUCTURAL_GATE_FAILURES = frozenset({
 _GATE_ENFORCEMENT_STRICT = "strict"
 _GATE_ENFORCEMENT_DEGRADE = "degrade"
 _GATE_ENFORCEMENT_MODES = frozenset({_GATE_ENFORCEMENT_STRICT, _GATE_ENFORCEMENT_DEGRADE})
+
+# Finalization modes implemented by ``SectionedLongformAuthor._polish_final``.
+# Contract construction rejects anything else: an unrecognised mode used to
+# fall through to ``single_polish`` silently, which shipped truncated
+# full-document rewrites while the skill author believed a different
+# finalize path was active.
+KNOWN_FINALIZATION_MODES = frozenset({
+    "single_polish",
+    "boundary_stitch",
+    "progressive_section_merge",
+})
+
+
+def _validated_finalization(value: Any) -> str:
+    mode = str(value or "single_polish").strip()
+    if mode not in KNOWN_FINALIZATION_MODES:
+        raise ValueError(
+            "sectioned_authoring contract: unknown finalization mode "
+            f"{mode!r}. Valid modes: {sorted(KNOWN_FINALIZATION_MODES)}. "
+            "Check the skill runtime contract "
+            "(SKILL.md metadata.novie.runtime_contract runtime/length_profiles)."
+        )
+    return mode
 _TRANSIENT_LLM_ERROR_CODES = frozenset({
     "internal_error",
     "platform_unavailable",
@@ -122,7 +145,7 @@ class SectionedAuthoringContract:
             quality_contract_ref=str(
                 raw.get("quality_contract_ref") or "document.generic_quality"
             ),
-            finalization=str(raw.get("finalization") or "single_polish"),
+            finalization=_validated_finalization(raw.get("finalization")),
             evidence_depth=str(raw.get("evidence_depth") or "standard"),
             min_outline_sections=_positive_int(raw.get("min_outline_sections"), 2),
             max_outline_sections=_positive_int(raw.get("max_outline_sections"), 9),
@@ -1451,6 +1474,16 @@ class SectionedLongformAuthor:
                 brief=brief,
                 drafts=drafts,
                 combined=combined,
+            )
+        if self._contract.finalization != "single_polish":
+            # Contracts built via from_mapping cannot reach here; this guards
+            # direct dataclass construction so an unknown mode is at least
+            # loud before the single_polish fallback runs.
+            await self._emit(
+                "document.finalize.mode_fallback",
+                status="degraded",
+                requested_mode=self._contract.finalization,
+                effective_mode="single_polish",
             )
         return await self._single_polish_final(
             brief=brief,
