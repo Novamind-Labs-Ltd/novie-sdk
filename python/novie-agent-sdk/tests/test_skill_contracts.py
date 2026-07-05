@@ -259,7 +259,7 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
         "name": "report-synthesis",
         "runtime": {
             "strategy": "sectioned_longform",
-            "finalization": "section_ledger_polish",
+            "finalization": "progressive_section_merge",
             "running_context": True,
             "running_context_window_k": 2,
             "running_summary_model": "summary-model",
