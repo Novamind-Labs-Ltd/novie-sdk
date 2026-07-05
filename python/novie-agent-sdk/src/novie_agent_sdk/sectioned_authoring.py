@@ -8,7 +8,7 @@ import re
 import inspect
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from novie_protocol.agents import AgentStreamEvent
 
@@ -64,6 +64,38 @@ KNOWN_FINALIZATION_MODES = frozenset({
     "boundary_stitch",
     "progressive_section_merge",
 })
+
+
+# Provider stop/finish values that mean "output hit max_output_tokens".
+# OpenAI-compatible providers report finish_reason="length"; Anthropic-style
+# metadata reports stop_reason="max_tokens" (OpenRouter forwards either,
+# depending on the routed model).
+_TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
+
+class _StreamedLlmText(NamedTuple):
+    """Text plus completion metadata from one ``_stream_llm_text`` call.
+
+    ``truncated`` means the provider stopped at the output-token limit, so
+    ``text`` ends mid-thought. Callers must decide per call site whether a
+    cut-off result is acceptable (running summary), droppable (seam bridge),
+    replaceable (final polish falls back to the combined sections), or a
+    quality failure (section drafts feed the revision loop).
+    """
+
+    text: str
+    finish_reason: str = ""
+    truncated: bool = False
+
+
+def _finish_reason_of(completed_result: Mapping[str, Any] | None) -> str:
+    if not isinstance(completed_result, Mapping):
+        return ""
+    metadata = completed_result.get("response_metadata")
+    if not isinstance(metadata, Mapping):
+        return ""
+    reason = metadata.get("finish_reason") or metadata.get("stop_reason")
+    return str(reason or "").strip().lower()
 
 
 def _validated_finalization(value: Any) -> str:
@@ -746,7 +778,7 @@ class SectionedLongformAuthor:
                 if self._contract.running_context
                 else ""
             )
-            markdown = await self._draft_section(
+            markdown, output_truncated = await self._draft_section(
                 brief=brief,
                 plan=plan,
                 section_index=index,
@@ -754,12 +786,22 @@ class SectionedLongformAuthor:
                 evidence_pack=evidence_pack_input,
                 running_context=running_context,
             )
+            if output_truncated:
+                await self._emit(
+                    "document.section.truncation_detected",
+                    status="degraded",
+                    section_id=plan.section_id,
+                    section_title=plan.title,
+                    section_index=index,
+                    revision_round=0,
+                )
             quality = _evaluate_section_quality(
                 plan=plan,
                 markdown=markdown,
                 evidence_pack=evidence_pack_input,
                 contract=self._contract,
                 revision_rounds=0,
+                output_truncated=output_truncated,
             )
             await self._emit(
                 "document.section.quality_checked",
@@ -775,7 +817,7 @@ class SectionedLongformAuthor:
                 and revision_rounds < self._max_section_revision_rounds
             ):
                 revision_rounds += 1
-                markdown = await self._draft_section(
+                markdown, output_truncated = await self._draft_section(
                     brief=brief,
                     plan=plan,
                     section_index=index,
@@ -784,12 +826,22 @@ class SectionedLongformAuthor:
                     running_context=running_context,
                     revision_feedback=quality,
                 )
+                if output_truncated:
+                    await self._emit(
+                        "document.section.truncation_detected",
+                        status="degraded",
+                        section_id=plan.section_id,
+                        section_title=plan.title,
+                        section_index=index,
+                        revision_round=revision_rounds,
+                    )
                 quality = _evaluate_section_quality(
                     plan=plan,
                     markdown=markdown,
                     evidence_pack=evidence_pack_input,
                     contract=self._contract,
                     revision_rounds=revision_rounds,
+                    output_truncated=output_truncated,
                 )
                 await self._emit(
                     "document.section.quality_checked",
@@ -1052,7 +1104,7 @@ class SectionedLongformAuthor:
         section: SectionPlan | None = None,
         section_index: int | None = None,
         extra_metadata: Mapping[str, Any] | None = None,
-    ) -> str:
+    ) -> _StreamedLlmText:
         call_id = self._next_llm_call_id(purpose)
         base_metadata = {
             "call_id": call_id,
@@ -1165,21 +1217,25 @@ class SectionedLongformAuthor:
                             chars_in_chunk=len(final_content),
                             chars_total=len(final_content),
                         )
+            finish_reason = _finish_reason_of(completed_result)
+            truncated = finish_reason in _TRUNCATION_FINISH_REASONS
             await self._emit(
                 "agent.llm_call.completed",
                 **attempt_metadata,
                 status="complete",
                 chars_total=len(content),
+                finish_reason=finish_reason,
+                truncated=truncated,
                 usage_metadata=(
                     dict(completed_result.get("usage_metadata") or {})
                     if isinstance(completed_result, Mapping)
                     else {}
                 ),
             )
-            return content
+            return _StreamedLlmText(content, finish_reason, truncated)
         if last_exc is not None:
             raise last_exc
-        return ""
+        return _StreamedLlmText("")
 
     async def _build_outline(
         self,
@@ -1347,7 +1403,9 @@ class SectionedLongformAuthor:
             f"New section to fold in — {dropped.plan.title}:\n"
             f"{dropped.markdown.strip()[:16000]}"
         )
-        summary = await self._stream_llm_text(
+        # A summary cut at its token budget is still a usable lossy summary,
+        # so truncation is accepted here.
+        streamed = await self._stream_llm_text(
             purpose="running_summary",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
@@ -1355,7 +1413,7 @@ class SectionedLongformAuthor:
             model=self._contract.running_summary_model or None,
             extra_metadata={"section_id": dropped.plan.section_id},
         )
-        summary = summary.strip()
+        summary = streamed.text.strip()
         if not summary:
             return prior_summary
         await self._emit(
@@ -1376,7 +1434,8 @@ class SectionedLongformAuthor:
         evidence_pack: Mapping[str, Any],
         running_context: str = "",
         revision_feedback: SectionQualityGateResult | None = None,
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """Draft one section; returns ``(markdown, output_truncated)``."""
         previous_index = [
             {
                 "section_id": draft.plan.section_id,
@@ -1410,7 +1469,15 @@ class SectionedLongformAuthor:
                 "fixing these deterministic failures without dropping evidence:\n"
                 f"{_json_block(revision_feedback.to_metadata(), limit=4000)}"
             )
-        content = await self._stream_llm_text(
+            if "output_truncated" in revision_feedback.failures:
+                prompt += (
+                    "\n\nThe previous draft was cut off at the output length limit "
+                    "before it could finish. Write a tighter version of this "
+                    "section that reaches a proper conclusion: prioritise the most "
+                    "important content, compress or drop secondary detail, and "
+                    "always end with a complete sentence."
+                )
+        streamed = await self._stream_llm_text(
             purpose="revise_section" if revision_feedback is not None else "draft_section",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.25,
@@ -1423,10 +1490,10 @@ class SectionedLongformAuthor:
                 else 0,
             },
         )
-        content = content.strip()
+        content = streamed.text.strip()
         if not content:
-            return ""
-        return _ensure_section_heading(content, plan.title)
+            return "", streamed.truncated
+        return _ensure_section_heading(content, plan.title), streamed.truncated
 
     async def _bounded_for_final_prompt(
         self,
@@ -1532,7 +1599,7 @@ class SectionedLongformAuthor:
                 f"End of preceding section:\n{before[-limit:]}\n\n"
                 f"Start of following section:\n{after[:limit]}"
             )
-            bridge = await self._stream_llm_text(
+            streamed = await self._stream_llm_text(
                 purpose="seam_stitch",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
@@ -1540,12 +1607,17 @@ class SectionedLongformAuthor:
                 model=finalize_model,
                 extra_metadata={"seam_index": seam_index + 1},
             )
-            bridge = bridge.strip()
+            bridge = streamed.text.strip()
+            if streamed.truncated:
+                # A cut-off transition reads worse than a plain join; sections
+                # stand on their own, so drop the bridge entirely.
+                bridge = ""
             await self._emit(
                 "document.final.seam_stitch_completed",
-                status="complete",
+                status="degraded" if streamed.truncated else "complete",
                 seam_index=seam_index + 1,
                 bridged=bool(bridge),
+                truncated=streamed.truncated,
                 length_profile=self._contract.length_profile,
             )
             return bridge
@@ -1589,7 +1661,7 @@ class SectionedLongformAuthor:
             f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
             f"Draft sections:\n{draft_sections}"
         )
-        polished = await self._stream_llm_text(
+        streamed = await self._stream_llm_text(
             purpose="final_polish",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
@@ -1597,7 +1669,22 @@ class SectionedLongformAuthor:
             model=self._contract.finalize_model or None,
             extra_metadata={"section_count": len(drafts)},
         )
-        polished = polished.strip()
+        if streamed.truncated:
+            # A rewrite cut at the output limit ends mid-document. The combined
+            # sections are complete, so they always beat a truncated polish.
+            # (The retention guard below cannot catch this case: a rewrite that
+            # EXPANDED the drafts before being cut still passes the shrinkage
+            # check — that is exactly how a half-written deliverable shipped as
+            # a success in prod.)
+            await self._emit(
+                "document.final.truncation_warning",
+                status="degraded",
+                phase="single_polish_output",
+                finish_reason=streamed.finish_reason,
+                polished_chars=len(streamed.text),
+            )
+            return combined
+        polished = streamed.text.strip()
         if not polished:
             return combined
         combined_units = _information_units(combined)
@@ -1658,7 +1745,7 @@ class SectionedLongformAuthor:
                 f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
                 f"Cluster draft sections:\n{cluster_sections}"
             )
-            merged = await self._stream_llm_text(
+            streamed = await self._stream_llm_text(
                 purpose="merge_cluster",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
@@ -1669,7 +1756,19 @@ class SectionedLongformAuthor:
                     "section_count": len(cluster),
                 },
             )
-            merged = merged.strip() or cluster_markdown
+            if streamed.truncated:
+                # Same rule as single_polish: complete originals beat a
+                # merge that was cut mid-cluster.
+                await self._emit(
+                    "document.final.truncation_warning",
+                    status="degraded",
+                    phase="merge_cluster_output",
+                    cluster_index=cluster_index,
+                    finish_reason=streamed.finish_reason,
+                )
+                merged = cluster_markdown
+            else:
+                merged = streamed.text.strip() or cluster_markdown
             if _information_units(merged) < int(
                 _information_units(cluster_markdown)
                 * self._contract.final_retention_ratio
@@ -1957,6 +2056,7 @@ def _evaluate_section_quality(
     evidence_pack: Mapping[str, Any],
     contract: SectionedAuthoringContract,
     revision_rounds: int,
+    output_truncated: bool = False,
 ) -> SectionQualityGateResult:
     text = str(markdown or "").strip()
     failures: list[str] = []
@@ -1977,6 +2077,12 @@ def _evaluate_section_quality(
 
     if not text:
         failures.append("empty_section")
+    if output_truncated:
+        # The provider stopped at max_output_tokens, so the section ends
+        # mid-thought. Soft failure: the revision loop asks for a rewrite
+        # that fits the budget; if that also truncates, degrade enforcement
+        # records the cut in the gap note instead of shipping it silently.
+        failures.append("output_truncated")
     if _PLACEHOLDER_SECTION_RE.search(text):
         failures.append("placeholder_section")
     if not _section_has_heading(text, plan.title):
