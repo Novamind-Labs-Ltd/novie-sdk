@@ -32,8 +32,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -85,11 +83,17 @@ from novie_protocol.contracts.decision_gate import (
 )
 
 from .observability import AgentObservability, ObservabilitySink, build_default_sinks
+from .platform_security import (
+    AgentPlatformSignatureError,
+    verify_agent_platform_headers,
+)
 from .tenant_scoping import validate_tenant_context
 
 
 def _build_ctx_platform_and_llm(
-    hdrs: "RequestHeaders", agent_id: str
+    hdrs: "RequestHeaders",
+    agent_id: str,
+    observability: AgentObservability | None = None,
 ) -> tuple[Any, Any]:
     """Build (platform_ns, llm_facade) for an incoming request.
 
@@ -101,7 +105,7 @@ def _build_ctx_platform_and_llm(
         from .llm_facade import build_llm_facade
 
         platform_ns = build_platform_namespace(hdrs, agent_id=agent_id)
-        llm = build_llm_facade(platform_ns, agent_id=agent_id)
+        llm = build_llm_facade(platform_ns, agent_id=agent_id, observability=observability)
         return platform_ns, llm
     except Exception as exc:  # noqa: BLE001 — best-effort
         _log.debug("ctx platform/llm build failed: %s", exc)
@@ -153,29 +157,36 @@ class RequestHeaders:
             raw=h,
         )
 
-    def verify_signature(self, secret: str, *, ttl_seconds: int = 300) -> None:
+    def verify_signature(
+        self,
+        secret: str | None = None,
+        *,
+        method: str,
+        path: str,
+        ttl_seconds: int = 300,
+    ) -> None:
         """Verify platform-signed A2A identity headers."""
-        if not self.timestamp or not self.signature:
+        try:
+            verify_agent_platform_headers(
+                self.raw,
+                method=method,
+                path=path,
+                secret=secret,
+                ttl_seconds=ttl_seconds,
+            )
+        except AgentPlatformSignatureError as exc:
+            raise HTTPException(
+                401,
+                detail={"error": exc.code, "reason": exc.reason},
+            ) from exc
+        except RuntimeError as exc:
             raise HTTPException(
                 401,
                 detail={
-                    "error": "a2a_signature_required",
-                    "reason": "x-novie-timestamp and x-novie-sig are required",
+                    "error": "agent_platform_signature_required",
+                    "reason": str(exc),
                 },
-            )
-        try:
-            issued_at = int(self.timestamp)
-        except ValueError as exc:
-            raise HTTPException(
-                401,
-                detail={"error": "invalid_a2a_signature_timestamp"},
             ) from exc
-        if abs(int(time.time()) - issued_at) > max(1, ttl_seconds):
-            raise HTTPException(401, detail={"error": "stale_a2a_signature"})
-        expected = _a2a_header_signature(self, secret)
-        provided = self.signature.removeprefix("sha256=").strip()
-        if not hmac.compare_digest(expected, provided):
-            raise HTTPException(401, detail={"error": "invalid_a2a_signature"})
 
 
 def _requires_signed_agent_headers() -> bool:
@@ -186,41 +197,16 @@ def _requires_signed_agent_headers() -> bool:
     return os.getenv("NOVIE_ENV", "").strip().lower() == "production"
 
 
-def _verify_agent_request_headers(headers: RequestHeaders) -> None:
+def _verify_agent_request_headers(
+    headers: RequestHeaders,
+    *,
+    method: str,
+    path: str,
+) -> None:
     if not _requires_signed_agent_headers():
         return
-    secret = os.getenv("NOVIE_A2A_SHARED_SECRET", "").strip()
-    if not secret:
-        raise HTTPException(
-            401,
-            detail={
-                "error": "a2a_signature_required",
-                "reason": "NOVIE_A2A_SHARED_SECRET is not configured",
-            },
-        )
-    ttl = int(os.getenv("NOVIE_A2A_SIGNATURE_TTL_SECONDS", "300"))
-    headers.verify_signature(secret, ttl_seconds=ttl)
-
-
-def _a2a_header_signature(headers: RequestHeaders, secret: str) -> str:
-    canonical = "\n".join(
-        [
-            headers.tenant_id,
-            headers.workspace_id,
-            headers.project_id,
-            headers.user_id,
-            headers.service_principal,
-            headers.session_id,
-            headers.step_id,
-            headers.idempotency_key,
-            headers.timestamp,
-        ]
-    )
-    return hmac.new(
-        secret.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    ttl = int(os.getenv("NOVIE_AGENT_PLATFORM_SIGNATURE_TTL_SECONDS", "300"))
+    headers.verify_signature(method=method, path=path, ttl_seconds=ttl)
 
 
 class AskTimedOut(TimeoutError):
@@ -2111,7 +2097,9 @@ class Agent:
         @app.get("/invocations/{invocation_id}")
         async def get_invocation(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
-            _verify_agent_request_headers(hdrs)
+            _verify_agent_request_headers(
+                hdrs, method=request.method, path=request.url.path,
+            )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
             if record is None:
@@ -2121,7 +2109,9 @@ class Agent:
         @app.get("/invocations/{invocation_id}/events")
         async def get_invocation_events(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
-            _verify_agent_request_headers(hdrs)
+            _verify_agent_request_headers(
+                hdrs, method=request.method, path=request.url.path,
+            )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
             if record is None:
@@ -2134,7 +2124,9 @@ class Agent:
         @app.get("/invocations/{invocation_id}/result")
         async def get_invocation_result(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
-            _verify_agent_request_headers(hdrs)
+            _verify_agent_request_headers(
+                hdrs, method=request.method, path=request.url.path,
+            )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
             if record is None:
@@ -2166,7 +2158,9 @@ class Agent:
                     raise HTTPException(503, "No invoke handler registered")
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(hdrs)
+                _verify_agent_request_headers(
+                    hdrs, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
@@ -2178,16 +2172,23 @@ class Agent:
                         if invocation.status == "completed" and invocation.response is not None:
                             return invocation.response
                         return _duplicate_one_shot_response(invocation)
+                scoped_observability = self._observability.scoped(
+                    session_id=hdrs.session_id,
+                    step_id=hdrs.step_id,
+                    trace_id=hdrs.trace_id,
+                )
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    scoped_observability,
+                )
                 ctx = InvokeContext(
                     input=_extract_inputs(body),
                     headers=hdrs,
                     agent_manifest=m,
-                    observability=self._observability.scoped(
-                        session_id=hdrs.session_id,
-                        step_id=hdrs.step_id,
-                        trace_id=hdrs.trace_id,
-                    ),
-                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
+                    observability=scoped_observability,
+                    _platform=_platform,
+                    _llm=_llm,
                 )
                 invocation_resolved = False
                 try:
@@ -2244,7 +2245,9 @@ class Agent:
                     raise HTTPException(503, "No stream handler registered")
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(hdrs)
+                _verify_agent_request_headers(
+                    hdrs, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
@@ -2276,17 +2279,24 @@ class Agent:
                 async def _emit_observability_event(event: dict[str, Any]) -> None:
                     await event_queue.put(("obs", event))
 
+                scoped_observability = self._observability.scoped(
+                    session_id=hdrs.session_id,
+                    step_id=hdrs.step_id,
+                    trace_id=hdrs.trace_id,
+                    task_event_emitter=_emit_observability_event,
+                )
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    scoped_observability,
+                )
                 ctx = StreamContext(
                     input=_extract_inputs(body),
                     headers=hdrs,
                     agent_manifest=m,
-                    observability=self._observability.scoped(
-                        session_id=hdrs.session_id,
-                        step_id=hdrs.step_id,
-                        trace_id=hdrs.trace_id,
-                        task_event_emitter=_emit_observability_event,
-                    ),
-                    **dict(zip(("_platform", "_llm"), _build_ctx_platform_and_llm(hdrs, m.agent_id))),
+                    observability=scoped_observability,
+                    _platform=_platform,
+                    _llm=_llm,
                 )
 
                 async def _gen() -> AsyncIterator[bytes]:
@@ -2462,7 +2472,9 @@ class Agent:
                     raise HTTPException(503, "No task handler registered")
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(hdrs)
+                _verify_agent_request_headers(
+                    hdrs, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(hdrs)
                 task_id = f"task-{uuid.uuid4().hex}"
                 record = await self._store.create_task(
@@ -2486,7 +2498,11 @@ class Agent:
                     task_id=record.task_id,
                     task_event_emitter=_emit_usage_event,
                 )
-                _platform, _llm = _build_ctx_platform_and_llm(hdrs, m.agent_id)
+                _platform, _llm = _build_ctx_platform_and_llm(
+                    hdrs,
+                    m.agent_id,
+                    task_observability,
+                )
                 ctx = TaskContext(
                     task_id=task_id,
                     input=record.input,
@@ -2504,7 +2520,9 @@ class Agent:
             @app.get("/tasks/{task_id}")
             async def get_task_status(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(_hdrs_local)
+                _verify_agent_request_headers(
+                    _hdrs_local, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
@@ -2520,7 +2538,9 @@ class Agent:
             @app.get("/tasks/{task_id}/events")
             async def get_task_events(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(_hdrs_local)
+                _verify_agent_request_headers(
+                    _hdrs_local, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
@@ -2531,7 +2551,9 @@ class Agent:
             @app.post("/tasks/{task_id}/asks/{gate_id}/resolve", status_code=202)
             async def resolve_task_ask(task_id: str, gate_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(_hdrs_local)
+                _verify_agent_request_headers(
+                    _hdrs_local, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
@@ -2563,7 +2585,9 @@ class Agent:
             @app.get("/tasks/{task_id}/result")
             async def get_task_result(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
-                _verify_agent_request_headers(_hdrs_local)
+                _verify_agent_request_headers(
+                    _hdrs_local, method=request.method, path=request.url.path,
+                )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
                 if record is None:
@@ -2588,7 +2612,9 @@ class Agent:
                 @app.post("/tasks/{task_id}/cancel", status_code=202)
                 async def cancel_task(task_id: str, request: Request):
                     _hdrs_local = RequestHeaders.from_request(request.headers)
-                    _verify_agent_request_headers(_hdrs_local)
+                    _verify_agent_request_headers(
+                        _hdrs_local, method=request.method, path=request.url.path,
+                    )
                     validate_tenant_context(_hdrs_local)
                     record = await self._store.get_task(task_id)
                     if record is None:

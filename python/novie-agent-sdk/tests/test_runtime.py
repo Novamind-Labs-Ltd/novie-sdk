@@ -36,8 +36,8 @@ from novie_agent_sdk.runtime import (
     SqliteOneShotInvocationStore,
     SqliteTaskStore,
     TaskContext,
-    _a2a_header_signature,
 )
+from novie_agent_sdk.platform_security import sign_agent_platform_headers
 from novie_agent_sdk.testing import (
     assert_http_json_invoke_idempotency_replay,
     assert_http_json_stream_idempotency_replay,
@@ -895,7 +895,7 @@ async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("NOVIE_RUNTIME_MODE", "production")
-    monkeypatch.setenv("NOVIE_A2A_SHARED_SECRET", "a2a-secret")
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "agent-platform-secret")
     agent = Agent(_simple_manifest())
 
     @agent.invoke
@@ -908,7 +908,7 @@ async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     client = TestClient(agent.build_app())
     unsigned = client.post("/invoke", json={"input": {"name": "Alice"}})
     assert unsigned.status_code == 401
-    assert unsigned.json()["detail"]["error"] == "a2a_signature_required"
+    assert unsigned.json()["detail"]["error"] == "agent_platform_signature_required"
 
     headers = {
         "x-novie-tenant-id": "tenant-1",
@@ -920,14 +920,17 @@ async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
         "idempotency-key": "signed-invoke-1",
         "x-novie-timestamp": str(int(time.time())),
     }
-    signature = _a2a_header_signature(
-        RequestHeaders.from_request(headers),
-        "a2a-secret",
+    signed_headers = sign_agent_platform_headers(
+        headers,
+        method="POST",
+        path="/invoke",
+        secret="agent-platform-secret",
+        timestamp=headers["x-novie-timestamp"],
     )
     signed = client.post(
         "/invoke",
         json={"input": {"name": "Alice"}},
-        headers={**headers, "x-novie-sig": signature},
+        headers=signed_headers,
     )
     assert signed.status_code == 200
     assert signed.json()["output"] == {

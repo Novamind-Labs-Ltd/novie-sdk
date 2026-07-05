@@ -11,12 +11,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from novie_agent_sdk.llm_facade import LlmFacade, build_llm_facade
+from novie_agent_sdk.observability import AgentObservability
 from novie_agent_sdk.platform_namespace import (
     QuotaExceededError,
     _UnavailablePlatformNamespace,
@@ -258,3 +260,70 @@ def test_llm_facade_exposes_platform_ns_publicly() -> None:
 
     namespace = SimpleNamespace(is_available=True)
     assert LlmFacade(namespace).platform_ns is namespace
+
+
+def test_report_usage_delegates_to_observability() -> None:
+    events: list[dict[str, Any]] = []
+
+    async def emit(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    observability = AgentObservability(
+        agent_id="sdk-agent",
+        session_id="sess-1",
+        step_id="step-1",
+        task_event_emitter=emit,
+    )
+    facade = LlmFacade(
+        _UnavailablePlatformNamespace(reason="no platform"),
+        observability=observability,
+    )
+
+    report = _run(facade.report_usage(
+        provider="anthropic",
+        model="claude-sonnet",
+        input_tokens=10,
+        output_tokens=5,
+        total_tokens=15,
+        phase="draft",
+    ))
+
+    assert report.total_tokens == 15
+    assert events[0]["payload"]["agent_event_kind"] == "token_usage"
+    assert events[0]["payload"]["phase"] == "draft"
+
+
+def test_usage_callback_reports_langchain_usage() -> None:
+    events: list[dict[str, Any]] = []
+
+    async def emit(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    facade = LlmFacade(
+        _UnavailablePlatformNamespace(reason="no platform"),
+        observability=AgentObservability(
+            agent_id="sdk-agent",
+            session_id="sess-1",
+            step_id="step-1",
+            task_event_emitter=emit,
+        ),
+    )
+    callback = facade.usage_callback(phase="draft")
+    run_id = uuid.uuid4()
+    _run(callback.on_llm_start({}, ["hello"], run_id=run_id))
+
+    class _Response:
+        llm_output = {
+            "model_name": "anthropic/claude-sonnet",
+            "token_usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            },
+        }
+        generations: list[Any] = []
+
+    _run(callback.on_llm_end(_Response(), run_id=run_id))
+
+    assert events[0]["payload"]["agent_event_kind"] == "token_usage"
+    assert events[0]["payload"]["usage"]["total_tokens"] == 15

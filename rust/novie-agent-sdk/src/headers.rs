@@ -7,6 +7,7 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
+pub const DEV_AGENT_PLATFORM_SHARED_SECRET: &str = "novie-dev-agent-platform-shared-secret";
 
 /// A2A identity and tracing headers injected by the Novie Platform.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,13 +47,18 @@ impl RequestHeaders {
         };
 
         let authorization = value("authorization");
+        let org_header = value("x-novie-org-id");
+        let tenant_header = value("x-novie-tenant-id");
+        let workspace_header = value("x-novie-workspace-id");
+        let org_id = first_non_empty(&[org_header.as_str(), tenant_header.as_str()]);
+        let workspace_id = first_non_empty(&[workspace_header.as_str(), org_id.as_str()]);
 
         Self {
-            tenant_id: value("x-novie-tenant-id"),
+            tenant_id: org_id,
             session_id: value("x-novie-session-id"),
             step_id: value("x-novie-step-id"),
             trace_id: value("x-novie-trace-id"),
-            workspace_id: value("x-novie-workspace-id"),
+            workspace_id,
             project_id: value("x-novie-project-id"),
             user_id: value("x-novie-user-id"),
             service_principal: value("x-novie-service-principal"),
@@ -74,6 +80,8 @@ impl RequestHeaders {
     pub fn verify_signature(
         &self,
         secret: &str,
+        method: &str,
+        path: &str,
         ttl_seconds: i64,
     ) -> Result<(), HeaderVerificationError> {
         if self.timestamp.is_empty() || self.signature.is_empty() {
@@ -92,7 +100,7 @@ impl RequestHeaders {
             return Err(HeaderVerificationError::StaleSignature);
         }
 
-        let expected = a2a_header_signature(self, secret);
+        let expected = agent_platform_signature(self, method, path, secret, &self.timestamp);
         let provided = self
             .signature
             .strip_prefix("sha256=")
@@ -118,11 +126,13 @@ pub enum HeaderVerificationError {
 impl HeaderVerificationError {
     pub fn code(self) -> &'static str {
         match self {
-            HeaderVerificationError::SignatureRequired => "a2a_signature_required",
-            HeaderVerificationError::MissingSharedSecret => "a2a_signature_required",
-            HeaderVerificationError::InvalidTimestamp => "invalid_a2a_signature_timestamp",
-            HeaderVerificationError::StaleSignature => "stale_a2a_signature",
-            HeaderVerificationError::InvalidSignature => "invalid_a2a_signature",
+            HeaderVerificationError::SignatureRequired => "agent_platform_signature_required",
+            HeaderVerificationError::MissingSharedSecret => "agent_platform_signature_required",
+            HeaderVerificationError::InvalidTimestamp => {
+                "invalid_agent_platform_signature_timestamp"
+            }
+            HeaderVerificationError::StaleSignature => "stale_agent_platform_signature",
+            HeaderVerificationError::InvalidSignature => "invalid_agent_platform_signature",
         }
     }
 }
@@ -141,38 +151,55 @@ pub fn requires_signed_agent_headers() -> bool {
 /// Verify headers using environment-controlled production policy.
 pub fn verify_agent_request_headers(
     headers: &RequestHeaders,
+    method: &str,
+    path: &str,
 ) -> Result<(), HeaderVerificationError> {
     if !requires_signed_agent_headers() {
         return Ok(());
     }
 
-    let secret = std::env::var("NOVIE_A2A_SHARED_SECRET")
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if secret.is_empty() {
-        return Err(HeaderVerificationError::MissingSharedSecret);
-    }
+    let secret = agent_platform_shared_secret()?;
 
-    let ttl = std::env::var("NOVIE_A2A_SIGNATURE_TTL_SECONDS")
+    let ttl = std::env::var("NOVIE_AGENT_PLATFORM_SIGNATURE_TTL_SECONDS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(300);
-    headers.verify_signature(&secret, ttl)
+    headers.verify_signature(&secret, method, path, ttl)
 }
 
-/// Python-compatible canonical HMAC-SHA256 signature.
-pub fn a2a_header_signature(headers: &RequestHeaders, secret: &str) -> String {
+pub fn agent_platform_shared_secret() -> Result<String, HeaderVerificationError> {
+    let configured = std::env::var("NOVIE_AGENT_PLATFORM_SHARED_SECRET")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if !configured.is_empty() {
+        return Ok(configured);
+    }
+    if env_lower("NOVIE_RUNTIME_MODE") == "production" || env_lower("NOVIE_ENV") == "production" {
+        return Err(HeaderVerificationError::MissingSharedSecret);
+    }
+    Ok(DEV_AGENT_PLATFORM_SHARED_SECRET.to_owned())
+}
+
+/// Python-compatible agent-platform canonical HMAC-SHA256 signature.
+pub fn agent_platform_signature(
+    headers: &RequestHeaders,
+    method: &str,
+    path: &str,
+    secret: &str,
+    timestamp: &str,
+) -> String {
     let canonical = [
-        headers.tenant_id.as_str(),
-        headers.workspace_id.as_str(),
-        headers.project_id.as_str(),
-        headers.user_id.as_str(),
-        headers.service_principal.as_str(),
-        headers.session_id.as_str(),
-        headers.step_id.as_str(),
-        headers.idempotency_key.as_str(),
-        headers.timestamp.as_str(),
+        method.to_uppercase(),
+        normalize_path(path),
+        headers.tenant_id.clone(),
+        headers.project_id.clone(),
+        headers.workspace_id.clone(),
+        headers.user_id.clone(),
+        headers.service_principal.clone(),
+        headers.session_id.clone(),
+        headers.request_id.clone(),
+        timestamp.to_owned(),
     ]
     .join("\n");
 
@@ -186,6 +213,33 @@ fn env_lower(name: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_lowercase()
+}
+
+fn first_non_empty(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn normalize_path(path: &str) -> String {
+    if path.trim().is_empty() {
+        return "/".to_owned();
+    }
+    if let Some(scheme_idx) = path.find("://") {
+        let rest = &path[(scheme_idx + 3)..];
+        return rest
+            .find('/')
+            .map(|slash| rest[slash..].to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+    }
+    if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    }
 }
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
@@ -234,7 +288,7 @@ mod tests {
     #[test]
     fn extracts_headers_case_insensitively() {
         let mut map = HeaderMap::new();
-        map.insert("X-Novie-Tenant-Id", "tenant-1".parse().unwrap());
+        map.insert("X-Novie-Org-Id", "tenant-1".parse().unwrap());
         map.insert("Idempotency-Key", "idem-1".parse().unwrap());
         map.insert("Authorization", "Bearer token-1".parse().unwrap());
 
@@ -248,17 +302,40 @@ mod tests {
     #[test]
     fn verifies_python_compatible_signature() {
         let mut headers = signed_headers();
-        headers.signature = a2a_header_signature(&headers, "shared-secret");
+        headers.signature = agent_platform_signature(
+            &headers,
+            "POST",
+            "/invoke",
+            "shared-secret",
+            &headers.timestamp,
+        );
 
-        assert!(headers.verify_signature("shared-secret", 300).is_ok());
+        assert!(
+            headers
+                .verify_signature("shared-secret", "POST", "/invoke", 300)
+                .is_ok()
+        );
     }
 
     #[test]
     fn accepts_sha256_prefixed_signature() {
         let mut headers = signed_headers();
-        headers.signature = format!("sha256={}", a2a_header_signature(&headers, "shared-secret"));
+        headers.signature = format!(
+            "sha256={}",
+            agent_platform_signature(
+                &headers,
+                "POST",
+                "/invoke",
+                "shared-secret",
+                &headers.timestamp
+            )
+        );
 
-        assert!(headers.verify_signature("shared-secret", 300).is_ok());
+        assert!(
+            headers
+                .verify_signature("shared-secret", "POST", "/invoke", 300)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -267,7 +344,9 @@ mod tests {
         headers.signature = "bad".to_owned();
 
         assert_eq!(
-            headers.verify_signature("shared-secret", 300).unwrap_err(),
+            headers
+                .verify_signature("shared-secret", "POST", "/invoke", 300)
+                .unwrap_err(),
             HeaderVerificationError::InvalidSignature
         );
     }

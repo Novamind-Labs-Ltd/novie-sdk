@@ -25,7 +25,7 @@ categories and only drop lower when they need tighter control.
 | Document agent templates | `DocumentAgentTemplate`, `DocumentCapabilitySpec`, `resolve_document_agent_input`, `document_final_output`, `get_matching_document_checkpoint`, `skipped_quality_result` | You are building a custom document-agent runtime and want shared budget, stream, progress, final output, resume, quality, and capability semantics. |
 | Skill-driven document agents | `compile_skill_scope`, `SkillScope`, `SkillMetadata`, `build_deep_agent_executor` | You need bounded `SKILL.md` navigation and DeepAgents assembly for a capability-selected skill set. |
 | Platform services bridge | `build_http_platform_services`, `build_gateway_client`, `CapabilityClient`, `HttpWikiService`, `HttpExternalAgentCheckpointService` | You need `novie_protocol.services.PlatformServices` backed by platform capability callbacks. |
-| LLM integration | `PlatformChatModel`, `build_llm_facade`, `langchain_runnable_config`, LLM normalization helpers | You need LangChain or direct platform LLM calls with usage/callback propagation. |
+| LLM integration | `ctx.llm`, `build_llm_facade`, `langchain_runnable_config`, `NovieLangChainCallbackHandler` | You need platform-proxied LLM calls or usage reporting for agent-owned provider calls. |
 | Context budget | `default_context_budget`, `context_budget_from_inputs`, `budget_status`, `adaptive_phase_timeout_seconds`, `budget_summary` | You need shared token/wall-clock budget behavior for long document runs. |
 | Artifacts and deliverables | `ArtifactReader`, `format_artifact_read_result`, `markdown_deliverable_output`, `bounded_handoff_output` | You need agent-friendly artifact reads or standardized final/internal outputs. |
 | Sectioned document authoring | `SectionedLongformAuthor`, `sectioned_authoring_contract_from_skill`, `sectioned_authoring_enabled` | You need a skill-driven outline -> section artifacts -> final polish path with workpad refs. |
@@ -45,7 +45,7 @@ The SDK intentionally has two levels for several concepts:
 Current API overlap to watch:
 
 - `markdown_deliverable_output` and `bounded_handoff_output` are related but not duplicates: one is user-visible final output, the other is internal DAG handoff output.
-- `PlatformChatModel`, `build_llm_facade`, and `LlmNamespace` are three access levels over platform LLM. Prefer `PlatformChatModel` for LangChain, `build_llm_facade` for agent runtime abstraction, and `LlmNamespace` for direct platform calls.
+- `ctx.llm` / `build_llm_facade` is the SDK LLM surface for agent code. `LlmNamespace` is the lower-level platform namespace used by SDK/platform plumbing. The SDK does not provide a LangChain chat-model adapter; agents that use LangChain should instantiate LangChain provider clients directly and attach SDK usage reporting.
 - `ArtifactReader` and `ArtifactsNamespace` are not duplicates: `ArtifactReader` is the agent-friendly text/cache layer over lower-level artifact capability calls.
 - `workpad_entry_event` and `workpad_checkpoint_event` are aliases by design; `workpad_checkpoint_event` exists for long-running agent readability.
 - `DocumentAgentTemplate` and `SectionedLongformAuthor` are separate layers:
@@ -611,6 +611,7 @@ Purpose:
 - Creates the SDK `LlmFacade` around a `PlatformNamespace`, with BYOK fallback only when the platform namespace is unavailable.
 - `LlmFacade.chat(...)` supports `max_output_tokens` and forwards it to platform or BYOK clients.
 - Platform LLM chat may first attempt the streaming capability endpoint for long calls; if the platform returns `stream_endpoint_not_found`, the namespace falls back to normal invoke and skips later stream attempts for the same namespace instance.
+- `LlmFacade.report_usage(...)` and `LlmFacade.usage_callback(...)` let agent-owned LangChain/provider calls report token usage without the SDK owning a LangChain model adapter.
 
 ## Document A2A Runtime Adapters
 
@@ -1209,51 +1210,10 @@ await notify_usage_callbacks(config, {"input_tokens": 100, "output_tokens": 20})
 
 Purpose:
 
-- Sends platform LLM usage metadata to LangChain callbacks via `on_llm_end`.
-- Used by platform LLM adapters that receive usage outside normal LangChain
+- Sends externally collected usage metadata to LangChain callbacks via
+  `on_llm_end`.
+- Used by custom agent wrappers that receive usage outside normal LangChain
   provider callbacks.
-
-## Platform LLM
-
-### `PlatformChatModel`
-
-Import:
-
-```python
-from novie_agent_sdk import PlatformChatModel
-```
-
-Use:
-
-```python
-model = PlatformChatModel(platform, model="anthropic/claude-sonnet-4.6")
-message = await model.ainvoke("Summarize this")
-```
-
-Purpose:
-
-- LangChain-compatible chat model backed by `platform.llm`.
-- Supports `ainvoke`, `astream`, `bind_tools`, and `with_structured_output`.
-- Uses `platform.llm.chat` directly for normal chat calls.
-- Uses capability diagnostics when tool binding requires `platform.llm.chat`
-  through the platform capability gateway.
-- Calls `notify_usage_callbacks(...)` after platform LLM responses that include usage metadata.
-- Lets agents use platform-governed model routing without provider keys.
-
-### `PlatformStructuredChatModel`
-
-Import:
-
-```python
-from novie_agent_sdk import PlatformStructuredChatModel
-```
-
-Purpose:
-
-- Public structured-output model returned by `PlatformChatModel.with_structured_output(...)`.
-- Delegates to `platform.llm.structured`.
-- Accepts JSON Schema dicts and Pydantic model classes through `with_structured_output(...)`.
-- Propagates usage metadata through `notify_usage_callbacks(...)`.
 
 ## LLM Facade
 
@@ -1269,7 +1229,10 @@ Purpose:
 
 - Builds an LLM facade that can use platform LLMs when available and BYOK/direct
   configuration when appropriate.
-- Provides `chat`, `structured`, `embed`, `budget_check`, and `usage_summary`.
+- Provides `chat`, `stream_text`, `structured`, `embed`, `report_usage`,
+  `usage_callback`, `budget_check`, and `usage_summary`.
+- Agents that use LangChain should use LangChain provider clients directly and
+  pass `ctx.llm.usage_callback(...)` in the LangChain config callbacks.
 
 ## Deliverables
 

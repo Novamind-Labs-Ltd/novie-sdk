@@ -1532,9 +1532,13 @@ fn env_is_production() -> bool {
             .eq_ignore_ascii_case("production")
 }
 
-fn verified_headers(headers: &HeaderMap) -> Result<RequestHeaders, Box<Response>> {
+fn verified_headers(
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+) -> Result<RequestHeaders, Box<Response>> {
     let request_headers = RequestHeaders::from_header_map(headers);
-    verify_agent_request_headers(&request_headers)
+    verify_agent_request_headers(&request_headers, method, path)
         .map_err(|err| Box::new(error_response(StatusCode::UNAUTHORIZED, err.code(), None)))?;
     Ok(request_headers)
 }
@@ -1576,7 +1580,7 @@ async fn post_invoke(
     headers: HeaderMap,
     Json(req): Json<InvokeRequest>,
 ) -> Response {
-    let hdrs = match verified_headers(&headers) {
+    let hdrs = match verified_headers(&headers, "POST", "/invoke") {
         Ok(headers) => headers,
         Err(response) => return *response,
     };
@@ -1623,7 +1627,7 @@ async fn post_stream(
     headers: HeaderMap,
     Json(req): Json<InvokeRequest>,
 ) -> Response {
-    let hdrs = match verified_headers(&headers) {
+    let hdrs = match verified_headers(&headers, "POST", "/stream") {
         Ok(headers) => headers,
         Err(response) => return *response,
     };
@@ -1666,7 +1670,7 @@ async fn post_tasks(
     headers: HeaderMap,
     Json(req): Json<CreateTaskRequest>,
 ) -> Response {
-    let hdrs = match verified_headers(&headers) {
+    let hdrs = match verified_headers(&headers, "POST", "/tasks") {
         Ok(headers) => headers,
         Err(response) => return *response,
     };
