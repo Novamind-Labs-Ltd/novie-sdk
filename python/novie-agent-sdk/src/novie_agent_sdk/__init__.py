@@ -447,6 +447,25 @@ from .worker_facade import (
     worker_agent,
 )
 
+
+def __getattr__(name: str):
+    if name in {
+        "PlatformStructuredChatModel",
+        "wrap_langchain_model_for_platform_structured_output",
+    }:
+        from .langchain_adapter import (
+            PlatformStructuredChatModel,
+            wrap_langchain_model_for_platform_structured_output,
+        )
+
+        return {
+            "PlatformStructuredChatModel": PlatformStructuredChatModel,
+            "wrap_langchain_model_for_platform_structured_output": (
+                wrap_langchain_model_for_platform_structured_output
+            ),
+        }[name]
+    raise AttributeError(name)
+
 __all__ = [
     # agent.yaml authoring schema (EXPERT_AGENT_SDK W1)
     "AgentType",
@@ -698,6 +717,8 @@ __all__ = [
     "LlmFacade",
     "LlmMode",
     "build_llm_facade",
+    "PlatformStructuredChatModel",
+    "wrap_langchain_model_for_platform_structured_output",
     # Conformance + compatibility matrix (EXPERT_AGENT_SDK W8)
     "CompatibilityMatrix",
     "ConformanceProbe",
