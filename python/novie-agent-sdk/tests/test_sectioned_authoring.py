@@ -310,12 +310,15 @@ class _FakeWorkpads:
         self.entries: list[dict[str, Any]] = []
         self.snapshot_entries: list[dict[str, Any]] = []
         self.final_refs: list[str] = []
+        self.record_error = ""
 
     async def snapshot(self, *, workflow_id: str | None, limit: int) -> dict[str, Any]:
         return {"entries": self.snapshot_entries[:limit]}
 
     async def record_entry(self, **kwargs: Any) -> dict[str, Any]:
         self.entries.append(dict(kwargs))
+        if self.record_error:
+            return {"available": False, "error": self.record_error}
         return {"entry_id": f"entry-{len(self.entries)}"}
 
     async def set_final_deliverable(
@@ -408,6 +411,53 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
     assert "agent.llm_call.completed" in event_names
     assert any(
         event["event"] == "agent.tool_call" and event.get("tool_name") == "evidence.build"
+        for event in phase_events
+    )
+    assert any(
+        event["event"] == "agent.tool_result" and event.get("tool_name") == "artifact.write"
+        for event in phase_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_degrades_workpad_record_failure_after_artifact_write() -> None:
+    platform = _FakePlatform()
+    platform.workpads.record_error = "platform_workpads_record_entry_timeout"
+    phase_events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+            "outline_artifact_type": "example_document.outline",
+            "section_artifact_type": "example_document.section",
+            "final_artifact_type": "example_document",
+        },
+        phase_event_sink=phase_events.append,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert result.ledger["created_count"] == 4
+    assert not any(event["event"] == "agent.tool_error" for event in phase_events)
+    assert any(
+        event["event"] == "artifact.write.workpad_degraded"
+        and event.get("error") == "platform_workpads_record_entry_timeout"
         for event in phase_events
     )
     assert any(
