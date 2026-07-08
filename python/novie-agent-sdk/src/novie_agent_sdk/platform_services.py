@@ -32,7 +32,7 @@ KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 CHECKPOINT_PUT_CAP = "platform.external_agent_checkpoint.put"
 CHECKPOINT_GET_CAP = "platform.external_agent_checkpoint.get"
 CHECKPOINT_LIST_CAP = "platform.external_agent_checkpoint.list"
-DEFAULT_TIMEOUT_SECONDS = 8.0
+DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 class CapabilityClient:

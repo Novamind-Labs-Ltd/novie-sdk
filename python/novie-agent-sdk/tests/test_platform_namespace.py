@@ -40,7 +40,9 @@ from novie_agent_sdk import (
     classify_envelope_error,
 )
 from novie_agent_sdk.platform_namespace import (
+    _DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
     _DEFAULT_LLM_TIMEOUT_SECONDS,
+    _DEFAULT_STATE_TIMEOUT_SECONDS,
     _DEFAULT_TIMEOUT_SECONDS,
     _UnavailablePlatformNamespace,
 )
@@ -466,6 +468,57 @@ async def test_artifacts_read_text_caches_exact_repeated_reads() -> None:
     assert first == second
     assert "Cached artifact summary" in second
     assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_artifact_writes_use_dedicated_long_timeout() -> None:
+    ns = _build_with_responder(
+        lambda request: httpx.Response(200, json=_ok_envelope({"available": True}))
+    )
+    captured: list[tuple[str, float | None]] = []
+
+    async def fake_invoke(capability_id, arguments, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
+        captured.append((capability_id, timeout_seconds))
+        if capability_id == "platform.artifacts.create":
+            return CapabilityCallDiagnostics(
+                ok=True,
+                capability_id=capability_id,
+                result={"artifact_ref": "artifact://art-1"},
+            )
+        return CapabilityCallDiagnostics(
+            ok=True,
+            capability_id=capability_id,
+            result={"available": True},
+        )
+
+    ns.invoke_capability = fake_invoke  # type: ignore[method-assign]
+
+    await ns.artifacts.create(
+        artifact_type="implementation_plan_document",
+        content="# Plan",
+    )
+    await ns.artifacts.read("artifact://art-1")
+    await ns.artifacts.search_index(workflow_id="wf-1")
+    await ns.workpads.snapshot(workflow_id="wf-1")
+    await ns.workpads.record_entry(kind="progress")
+    await ns.workpads.set_final_deliverable("artifact://art-1")
+    await ns.checkpoints.put(
+        owner_agent_id="agent",
+        thread_id="thread-1",
+        payload={"state": "ok"},
+    )
+    await ns.knowledge.search("still short")
+
+    assert captured == [
+        ("platform.artifacts.create", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
+        ("platform.artifacts.read", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
+        ("platform.artifacts.search", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
+        ("platform.workpads.snapshot", _DEFAULT_STATE_TIMEOUT_SECONDS),
+        ("platform.workpads.record_entry", _DEFAULT_STATE_TIMEOUT_SECONDS),
+        ("platform.workpads.set_final_deliverable", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
+        ("platform.external_agent_checkpoint.put", _DEFAULT_STATE_TIMEOUT_SECONDS),
+        ("platform.knowledge.search", None),
+    ]
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,8 @@ _DEFAULT_TIMEOUT_SECONDS = 8.0
 # to second-guess the SDK default.
 _DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
 _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
+_DEFAULT_STATE_TIMEOUT_SECONDS = 30.0
+_DEFAULT_ARTIFACT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _WEB_SEARCH_CAP = "platform.web.search"
@@ -990,7 +992,11 @@ class PlatformNamespaceProtocol(Protocol):
     llm: "LlmNamespace"
 
     async def invoke_capability(
-        self, capability_id: str, arguments: Mapping[str, Any],
+        self,
+        capability_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics: ...
 
     async def invoke_llm_capability(
@@ -1172,7 +1178,9 @@ class ArtifactsNamespace:
             if value:
                 payload[key] = value
         diagnostics = await self._parent.invoke_capability(
-            _ARTIFACT_CREATE_CAP, payload,
+            _ARTIFACT_CREATE_CAP,
+            payload,
+            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return {
@@ -1251,7 +1259,9 @@ class ArtifactsNamespace:
         if query is not None:
             payload["query"] = query
         diagnostics = await self._parent.invoke_capability(
-            _ARTIFACT_READ_CAP, payload,
+            _ARTIFACT_READ_CAP,
+            payload,
+            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return {
@@ -1326,6 +1336,7 @@ class ArtifactsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _ARTIFACT_SEARCH_CAP,
             {key: value for key, value in payload.items() if value not in (None, "")},
+            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return []
@@ -1363,6 +1374,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_SNAPSHOT_CAP,
             {key: value for key, value in payload.items() if value not in (None, "")},
+            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return {
@@ -1405,6 +1417,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_RECORD_ENTRY_CAP,
             payload,
+            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return {
@@ -1433,6 +1446,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_SET_FINAL_DELIVERABLE_CAP,
             payload,
+            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return {
@@ -1493,7 +1507,9 @@ class CheckpointsNamespace:
             if value:
                 args[key] = value
         diagnostics = await self._parent.invoke_capability(
-            _CHECKPOINT_PUT_CAP, args,
+            _CHECKPOINT_PUT_CAP,
+            args,
+            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return None
@@ -1515,7 +1531,9 @@ class CheckpointsNamespace:
         if checkpoint_id:
             args["checkpoint_id"] = checkpoint_id
         diagnostics = await self._parent.invoke_capability(
-            _CHECKPOINT_GET_CAP, args,
+            _CHECKPOINT_GET_CAP,
+            args,
+            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return None
@@ -1536,7 +1554,9 @@ class CheckpointsNamespace:
             "limit": int(limit),
         }
         diagnostics = await self._parent.invoke_capability(
-            _CHECKPOINT_LIST_CAP, args,
+            _CHECKPOINT_LIST_CAP,
+            args,
+            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
             return []
@@ -1953,6 +1973,8 @@ class PlatformNamespace:
         self,
         capability_id: str,
         arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
         if self._mid_run_ask_active and _is_high_risk_inline_capability(capability_id):
             diagnostics = CapabilityCallDiagnostics(
@@ -1968,7 +1990,9 @@ class PlatformNamespace:
             self._diagnostics.append(diagnostics)
             return diagnostics
         diagnostics = await self._caller.invoke_with_diagnostics(
-            capability_id, arguments,
+            capability_id,
+            arguments,
+            timeout_seconds=timeout_seconds,
         )
         if not diagnostics.ok:
             self._diagnostics.append(diagnostics)
@@ -2055,7 +2079,10 @@ class _UnavailablePlatformNamespace:
         self,
         capability_id: str,
         arguments: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
+        del timeout_seconds
         diagnostics = CapabilityCallDiagnostics(
             ok=False,
             capability_id=capability_id,
