@@ -99,7 +99,7 @@ class PlatformCallbackClient:
         incoming_headers: RequestHeaders | Mapping[str, str],
         *,
         agent_id: str,
-        timeout_seconds: float = 8.0,
+        timeout_seconds: float = 30.0,
         client: Any | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
