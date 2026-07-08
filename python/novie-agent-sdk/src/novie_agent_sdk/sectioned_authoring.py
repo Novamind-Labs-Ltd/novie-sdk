@@ -2016,6 +2016,19 @@ class SectionedLongformAuthor:
             if isinstance(artifact, Mapping)
             else ""
         )
+        workpad = result.get("workpad") if isinstance(result, Mapping) else None
+        if isinstance(workpad, Mapping) and workpad.get("available", True) is False:
+            await self._emit(
+                "artifact.write.workpad_degraded",
+                tool_name="artifact.write",
+                tool_call_id=tool_call_id,
+                status="degraded",
+                artifact_type=artifact_type,
+                role=role,
+                artifact_ref=artifact_ref,
+                error=workpad.get("error") or "workpad_record_unavailable",
+                message=workpad.get("message") or "",
+            )
         await self._emit(
             "agent.tool_result",
             tool_name="artifact.write",
@@ -2042,7 +2055,6 @@ async def _create_and_record_strict(ledger: ArtifactLedger, **kwargs: Any) -> di
 
 def _assert_ledger_recorded(result: Mapping[str, Any]) -> None:
     artifact = result.get("artifact")
-    workpad = result.get("workpad")
     if isinstance(artifact, Mapping) and artifact.get("available", True) is False:
         raise RuntimeError(
             "artifact_create_failed:"
@@ -2050,13 +2062,6 @@ def _assert_ledger_recorded(result: Mapping[str, Any]) -> None:
         )
     if not isinstance(artifact, Mapping) or not artifact.get("artifact_ref"):
         raise RuntimeError("artifact_create_failed:artifact_ref_missing")
-    if isinstance(workpad, Mapping) and workpad.get("available", True) is False:
-        raise RuntimeError(
-            "workpad_record_failed:"
-            f"{workpad.get('error') or 'workpad_record_unavailable'}"
-        )
-    if not isinstance(workpad, Mapping):
-        raise RuntimeError("workpad_record_failed:workpad_result_missing")
 
 
 def _evaluate_section_quality(

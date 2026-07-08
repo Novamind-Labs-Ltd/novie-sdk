@@ -217,11 +217,15 @@ class ArtifactLedger:
             content_preview=preview,
             metadata=workpad_metadata,
         )
-        if strict and isinstance(workpad, Mapping) and workpad.get("available", True) is False:
-            raise RuntimeError(
-                "workpad_record_failed:"
-                f"{workpad.get('error') or 'workpad_record_unavailable'}"
-            )
+        if isinstance(workpad, Mapping) and workpad.get("available", True) is False:
+            artifact = {
+                **artifact,
+                "workpad_record": {
+                    "degraded": True,
+                    "error": workpad.get("error") or "workpad_record_unavailable",
+                    "message": workpad.get("message") or "",
+                },
+            }
         return {"artifact": artifact, "workpad": workpad}
 
     async def set_final_deliverable(
