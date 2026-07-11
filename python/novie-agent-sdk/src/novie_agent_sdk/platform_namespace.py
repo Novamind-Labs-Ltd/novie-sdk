@@ -415,7 +415,7 @@ class _CapabilityCaller:
                 timeout=timeout,
             ) as client:
                 return await consume(client)
-        except TimeoutError as exc:
+        except httpx.TimeoutException as exc:
             _log.warning(
                 "platform capability stream timed out capability=%s reason=%r",
                 capability_id,
@@ -484,7 +484,7 @@ class _CapabilityCaller:
             ) as client:
                 async for event in consume(client):
                     yield normalise_stream_event(event, stream_state)
-        except TimeoutError as exc:
+        except httpx.TimeoutException as exc:
             yield {
                 "type": "error",
                 "error_code": "stream_heartbeat_timeout",

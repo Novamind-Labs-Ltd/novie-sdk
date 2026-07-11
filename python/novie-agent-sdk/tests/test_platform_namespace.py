@@ -1137,6 +1137,46 @@ async def test_llm_chat_diagnostics_path_accumulates_tool_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_stream_diagnostics_classifies_read_timeout_as_heartbeat_timeout() -> None:
+    """A real ``httpx.ReadTimeout`` (e.g. the platform stops sending
+    heartbeat bytes for longer than the read timeout) must be classified as
+    ``stream_heartbeat_timeout``, not fall through to the generic
+    transport-error branch (which drops the error_code entirely) -- the
+    handler previously caught the builtin ``TimeoutError``, which
+    ``httpx.ReadTimeout`` never subclasses, so it was silently unreachable.
+    """
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated heartbeat timeout", request=request)
+
+    ns = _build_with_responder(responder)
+
+    diagnostics = await ns._llm_caller.invoke_stream_with_diagnostics(  # noqa: SLF001
+        "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert diagnostics.ok is False
+    assert diagnostics.error_code == "stream_heartbeat_timeout"
+
+
+@pytest.mark.asyncio
+async def test_llm_event_stream_classifies_read_timeout_as_heartbeat_timeout() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated heartbeat timeout", request=request)
+
+    ns = _build_with_responder(responder)
+
+    events = [
+        event
+        async for event in ns._llm_caller.invoke_event_stream(  # noqa: SLF001
+            "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+    ]
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["error_code"] == "stream_heartbeat_timeout"
+
+
+@pytest.mark.asyncio
 async def test_translate_openai_sse_errors_when_stream_closes_without_done() -> None:
     """A clean mid-generation connection close (no ``[DONE]``, no httpx
     exception) must surface as an ``error`` event, not a ``completed`` one
