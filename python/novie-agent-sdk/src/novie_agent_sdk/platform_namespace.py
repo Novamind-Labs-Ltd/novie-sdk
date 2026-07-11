@@ -588,6 +588,7 @@ async def _translate_openai_sse(
     tool_calls = ToolCallAccumulator()
     usage: dict[str, Any] = {}
     finish_reason = ""
+    saw_done = False
 
     async for raw_line in response.aiter_lines():
         line = raw_line.strip()
@@ -595,6 +596,7 @@ async def _translate_openai_sse(
             continue
         data = line[len("data:"):].strip()
         if data == "[DONE]":
+            saw_done = True
             break
         try:
             payload = json.loads(data)
@@ -648,6 +650,18 @@ async def _translate_openai_sse(
 
         if choice.get("finish_reason"):
             finish_reason = str(choice.get("finish_reason"))
+
+    if not saw_done:
+        # The server closed the connection without a terminal ``[DONE]``
+        # sentinel and without raising an httpx transport exception (e.g.
+        # a clean mid-generation close). Falling through to ``completed``
+        # here would silently report success on a truncated response.
+        yield {
+            "type": "error",
+            "error_code": "stream_closed_without_completion",
+            "explanation": "stream closed before a terminal [DONE] event",
+        }
+        return
 
     result: dict[str, Any] = {"content": "".join(content_parts)}
     if finish_reason:

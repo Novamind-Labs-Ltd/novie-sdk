@@ -990,6 +990,13 @@ async def test_llm_chat_streams_over_openai_chat_completions() -> None:
 
     assert result["content"] == "hello"
     assert result["usage_metadata"]["total_tokens"] == 7
+    # ``usage`` renames OpenAI's prompt/completion token fields onto
+    # LangChain's ``usage_metadata`` vocabulary.
+    assert result["usage_metadata"]["input_tokens"] == 3
+    assert result["usage_metadata"]["output_tokens"] == 4
+    # The terminal chunk's ``finish_reason`` carries through to
+    # ``response_metadata`` on the synthesized ``completed`` result.
+    assert result["response_metadata"]["finish_reason"] == "stop"
     assert captured_paths == ["/v1/chat/completions"]
     # Re-signed for the new path (a stale signed path would 401 on the platform).
     assert captured_sig[0]
@@ -1080,6 +1087,82 @@ async def test_llm_stream_chat_normalises_tool_chunks_for_non_langchain_agents()
     assert accumulator.tool_calls() == [
         {"id": "toolu_1", "name": "lookup", "args": {"query": "hello"}}
     ]
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_diagnostics_path_accumulates_tool_calls() -> None:
+    """``llm.chat`` (the diagnostics path, not ``stream_chat``'s raw event
+    stream) must also accumulate tool-call deltas into the synthesized
+    ``completed`` result rather than dropping them."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(
+            200,
+            content=_sse_stream(
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"quer'},
+                    }
+                ]}),
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "type": "function",
+                        "function": {"arguments": 'y":"hello"}'},
+                    }
+                ]}),
+                _openai_chunk(
+                    delta={},
+                    finish_reason="tool_calls",
+                    usage={"total_tokens": 7},
+                ),
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    diagnostics = await ns._llm_caller.invoke_stream_with_diagnostics(  # noqa: SLF001
+        "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert diagnostics.ok is True
+    assert diagnostics.result is not None
+    assert diagnostics.result["tool_calls"] == [
+        {"id": "toolu_1", "name": "lookup", "args": {"query": "hello"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_translate_openai_sse_errors_when_stream_closes_without_done() -> None:
+    """A clean mid-generation connection close (no ``[DONE]``, no httpx
+    exception) must surface as an ``error`` event, not a ``completed`` one
+    — otherwise a truncated response silently looks like success."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_sse_stream(
+                _openai_chunk(delta={"content": "partial"}),
+                done=False,
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    events = [
+        event
+        async for event in ns._llm_caller.invoke_event_stream(  # noqa: SLF001
+            "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+    ]
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["error_code"] == "stream_closed_without_completion"
+    assert not any(event["type"] == "completed" for event in events)
 
 
 @pytest.mark.asyncio
