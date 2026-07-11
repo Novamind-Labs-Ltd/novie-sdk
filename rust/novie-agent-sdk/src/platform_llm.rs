@@ -126,12 +126,11 @@ impl PlatformLlmIdentity {
     }
 }
 
-/// Client for `/capabilities/platform.llm.*/invoke`.
+/// Client for `platform.llm.*` capabilities via `POST /invocations`.
 #[derive(Debug, Clone)]
 pub struct PlatformLlmClient {
     base_url: String,
     token: String,
-    agent_id: String,
     identity: PlatformLlmIdentity,
     http: reqwest::Client,
 }
@@ -187,7 +186,6 @@ impl PlatformLlmClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
             token,
-            agent_id,
             identity,
             http,
         })
@@ -311,20 +309,20 @@ impl PlatformLlmClient {
     }
 
     async fn invoke(&self, capability_id: &str, arguments: Value) -> Result<Map<String, Value>> {
-        let path = format!("/capabilities/{}/invoke", capability_id);
+        let path = "/invocations";
         let url = format!("{}{}", self.base_url, path);
+        let provider_id = provider_id_for(capability_id);
         let body = json!({
-            "arguments": arguments,
-            "caller_type": "agent",
-            "caller_id": format!("agent:{}", self.agent_id),
-            "caller_mode": "execute",
+            "capability_id": capability_id,
+            "provider_id": provider_id,
             "mode": "execute",
+            "inputs": arguments,
         });
         let response = self
             .http
             .post(url)
             .bearer_auth(&self.token)
-            .headers(self.signed_headers("POST", &path)?)
+            .headers(self.signed_headers("POST", path)?)
             .json(&body)
             .send()
             .await?;
@@ -342,8 +340,8 @@ impl PlatformLlmClient {
         if envelope.get("status").and_then(Value::as_str) != Some("ok") {
             return Err(map_capability_error(status, &envelope));
         }
-        let result = envelope.get("result").cloned().unwrap_or(Value::Null);
-        result.as_object().cloned().ok_or_else(|| Error::Protocol {
+        let output = envelope.get("output").cloned().unwrap_or(Value::Null);
+        output.as_object().cloned().ok_or_else(|| Error::Protocol {
             message: format!("{capability_id} returned non-object result"),
             code: Some("schema_violation".into()),
             http_status: Some(status),
@@ -406,6 +404,18 @@ impl PlatformLlmClient {
         // insertions are optimized.
         let _ = HeaderName::from_static("accept");
         Ok(headers)
+    }
+}
+
+/// Derive the `provider_id` from a dot-delimited `capability_id` by dropping
+/// its last segment (e.g. `"platform.llm.chat"` -> `"platform.llm"`).
+///
+/// Mirrors the platform's own single-segment fallback convention when a
+/// capability id has no dot to split on.
+fn provider_id_for(capability_id: &str) -> String {
+    match capability_id.rsplit_once('.') {
+        Some((prefix, _)) => prefix.to_owned(),
+        None => format!("{capability_id}-provider"),
     }
 }
 
@@ -474,8 +484,10 @@ fn map_capability_error(status: u16, envelope: &Value) -> Error {
         .and_then(Value::as_str)
         .map(str::to_owned);
     let message = detail
-        .get("explanation")
+        .get("error_message")
+        .or_else(|| detail.get("explanation"))
         .or_else(|| detail.get("reason"))
+        .or_else(|| envelope.get("error_message"))
         .or_else(|| envelope.get("explanation"))
         .and_then(Value::as_str)
         .unwrap_or("platform capability invocation failed")
