@@ -60,7 +60,11 @@ from .platform_callback import (
     build_platform_callback_headers,
     sign_platform_callback_headers,
 )
-from .llm_contract import normalise_llm_result, normalise_stream_event
+from .llm_contract import (
+    ToolCallAccumulator,
+    normalise_llm_result,
+    normalise_stream_event,
+)
 from .runtime import RequestHeaders
 
 
@@ -357,132 +361,39 @@ class _CapabilityCaller:
         *,
         heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
     ) -> CapabilityCallDiagnostics:
-        path = f"/capabilities/{capability_id}/invoke-stream"
+        path = _CHAT_COMPLETIONS_PATH
         headers = sign_platform_callback_headers(
             self._headers, method="POST", path=path,
         )
-        body: dict[str, Any] = {
-            "arguments": dict(arguments),
-            "caller_type": "agent",
-            "caller_id": f"agent:{self._agent_id}",
-            "caller_mode": "execute",
-            "mode": "execute",
-        }
+        body = _openai_chat_body(arguments)
 
         async def consume(client: httpx.AsyncClient) -> CapabilityCallDiagnostics:
             async with client.stream("POST", path, json=body, headers=headers) as response:
-                if response.status_code == 404:
-                    await response.aread()
-                    return CapabilityCallDiagnostics(
-                        ok=False,
-                        capability_id=capability_id,
-                        kind="platform_unavailable",
-                        error_code="stream_endpoint_not_found",
-                        detail=_safe_text(response),
-                    )
-                if response.status_code >= 400:
-                    await response.aread()
-                    envelope_code = _extract_envelope_code(response)
-                    return CapabilityCallDiagnostics(
-                        ok=False,
-                        capability_id=capability_id,
-                        kind=classify_envelope_error(envelope_code, response.status_code),
-                        error_code=envelope_code or "",
-                        detail=_safe_text(response),
-                    )
-
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        return CapabilityCallDiagnostics(
-                            ok=False,
-                            capability_id=capability_id,
-                            kind="schema_violation",
-                            error_code="non_json_stream_event",
-                            detail=line[:200],
-                        )
-                    if not isinstance(event, dict):
-                        return CapabilityCallDiagnostics(
-                            ok=False,
-                            capability_id=capability_id,
-                            kind="schema_violation",
-                            error_code="non_object_stream_event",
-                        )
-
+                # ``llm.chat`` consumes the SSE stream internally but only wants
+                # the final ChatResult; intermediate ``chunk`` events (token
+                # deltas) belong to ``llm.stream_chat`` callers and are skipped.
+                async for event in _translate_openai_sse(response):
                     event_type = str(event.get("type") or "")
-                    if not event_type and "status" in event:
-                        if str(event.get("status")) == "ok":
-                            result = event.get("result")
-                            if result is not None and not isinstance(result, dict):
-                                return CapabilityCallDiagnostics(
-                                    ok=False,
-                                    capability_id=capability_id,
-                                    kind="schema_violation",
-                                    error_code="non_object_result",
-                                )
-                            return CapabilityCallDiagnostics(
-                                ok=True,
-                                capability_id=capability_id,
-                                result=result if isinstance(result, dict) else None,
-                            )
-                        envelope_code = str(event.get("error_code") or "") or None
-                        return CapabilityCallDiagnostics(
-                            ok=False,
-                            capability_id=capability_id,
-                            kind=classify_envelope_error(envelope_code, http_status=None),
-                            error_code=envelope_code or "",
-                            detail=str(event.get("explanation") or ""),
-                        )
-
-                    if event_type in {"accepted", "heartbeat", "progress"}:
-                        continue
                     if event_type == "chunk":
-                        # ``llm.chat`` uses the streaming endpoint for long-running
-                        # calls but still returns one final ChatResult. Intermediate
-                        # token/tool deltas belong to ``llm.stream_chat`` callers;
-                        # wait for the terminal ``completed`` event here.
                         continue
                     if event_type == "completed":
                         result = event.get("result")
-                        if result is not None and not isinstance(result, dict):
-                            return CapabilityCallDiagnostics(
-                                ok=False,
-                                capability_id=capability_id,
-                                kind="schema_violation",
-                                error_code="non_object_stream_result",
-                            )
                         return CapabilityCallDiagnostics(
                             ok=True,
                             capability_id=capability_id,
                             result=result if isinstance(result, dict) else None,
                         )
-                    if event_type in {"error", "cancelled"}:
-                        envelope = event.get("envelope")
+                    if event_type == "error":
                         envelope_code = str(event.get("error_code") or "") or None
-                        if isinstance(envelope, dict) and not envelope_code:
-                            envelope_code = str(envelope.get("error_code") or "") or None
                         return CapabilityCallDiagnostics(
                             ok=False,
                             capability_id=capability_id,
-                            kind=classify_envelope_error(envelope_code, http_status=None),
-                            error_code=envelope_code or "",
-                            detail=str(
-                                event.get("explanation")
-                                or event.get("reason")
-                                or ""
+                            kind=classify_envelope_error(
+                                envelope_code, http_status=None
                             ),
+                            error_code=envelope_code or "",
+                            detail=str(event.get("explanation") or ""),
                         )
-                    return CapabilityCallDiagnostics(
-                        ok=False,
-                        capability_id=capability_id,
-                        kind="schema_violation",
-                        error_code="unknown_stream_event",
-                        detail=event_type,
-                    )
 
                 return CapabilityCallDiagnostics(
                     ok=False,
@@ -537,55 +448,23 @@ class _CapabilityCaller:
         *,
         heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield raw NDJSON capability stream events.
+        """Yield platform LLM chat stream events.
 
-        This is used by platform LLM chat streaming where intermediate
-        ``chunk`` events are meaningful to LangChain's ``astream`` contract.
+        Streams ``platform.llm.chat`` over the OpenAI-compatible
+        ``/v1/chat/completions`` SSE endpoint and translates each chunk back
+        into the platform event vocabulary (``chunk`` deltas, terminal
+        ``completed``/``error``) so intermediate deltas stay meaningful to
+        LangChain's ``astream`` contract.
         """
-        path = f"/capabilities/{capability_id}/invoke-stream"
+        path = _CHAT_COMPLETIONS_PATH
         headers = sign_platform_callback_headers(
             self._headers, method="POST", path=path,
         )
-        body: dict[str, Any] = {
-            "arguments": dict(arguments),
-            "caller_type": "agent",
-            "caller_id": f"agent:{self._agent_id}",
-            "caller_mode": "execute",
-            "mode": "execute",
-        }
+        body = _openai_chat_body(arguments)
 
         async def consume(client: httpx.AsyncClient) -> AsyncIterator[dict[str, Any]]:
             async with client.stream("POST", path, json=body, headers=headers) as response:
-                if response.status_code >= 400:
-                    await response.aread()
-                    envelope_code = _extract_envelope_code(response)
-                    if response.status_code == 404 and not envelope_code:
-                        envelope_code = "stream_endpoint_not_found"
-                    yield {
-                        "type": "error",
-                        "error_code": envelope_code or "",
-                        "explanation": _safe_text(response),
-                    }
-                    return
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        yield {
-                            "type": "error",
-                            "error_code": "non_json_stream_event",
-                            "explanation": line[:200],
-                        }
-                        return
-                    if not isinstance(event, dict):
-                        yield {
-                            "type": "error",
-                            "error_code": "non_object_stream_event",
-                        }
-                        return
+                async for event in _translate_openai_sse(response):
                     yield event
 
         try:
@@ -635,6 +514,150 @@ def _extract_envelope_code(response: httpx.Response) -> str | None:
         if isinstance(nested, str) and nested:
             return nested
     return None
+
+
+_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+
+
+def _openai_chat_body(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Map ``platform.llm.chat`` arguments onto an OpenAI chat body.
+
+    The platform's ``/v1/chat/completions`` endpoint is OpenAI-compatible, so
+    only the SDK's ``max_output_tokens`` alias needs renaming to ``max_tokens``.
+    ``stream_options.include_usage`` asks the endpoint for a token-usage block
+    on the terminal chunk so the synthesized ``completed`` result can carry
+    ``usage_metadata``.
+    """
+    args = dict(arguments)
+    body: dict[str, Any] = {
+        "messages": list(args.get("messages") or []),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if args.get("model"):
+        body["model"] = args["model"]
+    if args.get("temperature") is not None:
+        body["temperature"] = args["temperature"]
+    if args.get("max_output_tokens") is not None:
+        body["max_tokens"] = int(args["max_output_tokens"])
+    if args.get("tools"):
+        body["tools"] = args["tools"]
+    if args.get("tool_choice") is not None:
+        body["tool_choice"] = args["tool_choice"]
+    if args.get("parallel_tool_calls") is not None:
+        body["parallel_tool_calls"] = args["parallel_tool_calls"]
+    return body
+
+
+def _usage_to_metadata(usage: Mapping[str, Any]) -> dict[str, Any]:
+    """Map an OpenAI ``usage`` block onto LangChain ``usage_metadata`` keys."""
+    metadata: dict[str, Any] = {}
+    if usage.get("prompt_tokens") is not None:
+        metadata["input_tokens"] = usage["prompt_tokens"]
+    if usage.get("completion_tokens") is not None:
+        metadata["output_tokens"] = usage["completion_tokens"]
+    if usage.get("total_tokens") is not None:
+        metadata["total_tokens"] = usage["total_tokens"]
+    return metadata
+
+
+async def _translate_openai_sse(
+    response: httpx.Response,
+) -> AsyncIterator[dict[str, Any]]:
+    """Translate an OpenAI-compatible SSE chat stream into platform events.
+
+    Yields the same NDJSON event vocabulary the legacy ``invoke-stream`` route
+    produced — ``chunk`` events with a ``delta`` (``content`` and/or
+    ``tool_call_chunks``), a terminal ``completed`` event whose ``result`` is a
+    LangChain-AIMessage-shaped dict, or a single ``error`` event. Callers keep
+    using ``normalise_stream_event`` / ``normalise_llm_result`` unchanged.
+    """
+    if response.status_code >= 400:
+        await response.aread()
+        envelope_code = _extract_envelope_code(response)
+        if response.status_code == 404 and not envelope_code:
+            envelope_code = "stream_endpoint_not_found"
+        yield {
+            "type": "error",
+            "error_code": envelope_code or "",
+            "explanation": _safe_text(response),
+        }
+        return
+
+    content_parts: list[str] = []
+    tool_calls = ToolCallAccumulator()
+    usage: dict[str, Any] = {}
+    finish_reason = ""
+
+    async for raw_line in response.aiter_lines():
+        line = raw_line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            break
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            yield {
+                "type": "error",
+                "error_code": "non_json_stream_event",
+                "explanation": data[:200],
+            }
+            return
+        if not isinstance(payload, dict):
+            yield {"type": "error", "error_code": "non_object_stream_event"}
+            return
+
+        error = payload.get("error")
+        if isinstance(error, dict):
+            yield {
+                "type": "error",
+                "error_code": str(error.get("code") or ""),
+                "explanation": str(error.get("message") or ""),
+            }
+            return
+
+        payload_usage = payload.get("usage")
+        if isinstance(payload_usage, dict):
+            usage = payload_usage
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        delta = delta if isinstance(delta, dict) else {}
+
+        event_delta: dict[str, Any] = {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            content_parts.append(content)
+            event_delta["content"] = content
+        raw_tool_calls = delta.get("tool_calls")
+        if isinstance(raw_tool_calls, list) and raw_tool_calls:
+            # OpenAI streamed tool-call deltas are ``function``-wrapped and
+            # index-keyed — exactly what ``normalise_tool_call_chunks`` already
+            # understands, so they pass straight through as ``tool_call_chunks``.
+            event_delta["tool_call_chunks"] = raw_tool_calls
+            tool_calls.add_chunks(raw_tool_calls)
+        if event_delta:
+            yield {"type": "chunk", "delta": event_delta}
+
+        if choice.get("finish_reason"):
+            finish_reason = str(choice.get("finish_reason"))
+
+    result: dict[str, Any] = {"content": "".join(content_parts)}
+    if finish_reason:
+        result["response_metadata"] = {"finish_reason": finish_reason}
+    aggregated = tool_calls.tool_calls()
+    if aggregated:
+        result["tool_calls"] = aggregated
+    if usage:
+        result["usage_metadata"] = _usage_to_metadata(usage)
+    yield {"type": "completed", "result": result}
 
 
 def _is_high_risk_inline_capability(capability_id: str) -> bool:
