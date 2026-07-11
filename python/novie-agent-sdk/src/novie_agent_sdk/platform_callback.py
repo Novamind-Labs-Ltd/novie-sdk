@@ -91,7 +91,14 @@ def sign_platform_callback_headers(
 
 
 class PlatformCallbackClient:
-    """Small async client for ``POST /capabilities/{id}/invoke`` callbacks."""
+    """Small async client for ``POST /invocations`` callbacks.
+
+    Returns the raw platform envelope dict (not a
+    ``CapabilityCallDiagnostics``). The envelope's success payload key is
+    ``output`` (was ``result`` on the legacy ``/capabilities/{id}/invoke``
+    route) — any consumer reading the return value must use
+    ``envelope["output"]``, not ``envelope["result"]``.
+    """
 
     def __init__(
         self,
@@ -120,18 +127,21 @@ class PlatformCallbackClient:
     ) -> dict[str, Any]:
         import httpx
 
-        path = f"/capabilities/{capability_id}/invoke"
+        # `caller_mode` is kept for signature stability only: legacy values
+        # (interactive/preview/delegated) don't map onto /invocations' mode
+        # vocabulary, and nothing calls this with a non-default value.
+        del caller_mode
+        path = "/invocations"
         headers = sign_platform_callback_headers(
             self._headers,
             method="POST",
             path=path,
         )
         body = {
-            "arguments": arguments,
-            "caller_type": "agent",
-            "caller_id": f"agent:{self._agent_id}",
-            "caller_mode": caller_mode,
-            "mode": caller_mode,
+            "capability_id": capability_id,
+            "provider_id": capability_id.rsplit(".", 1)[0],
+            "mode": "execute",
+            "inputs": arguments,
         }
         if self._client is not None:
             response = await self._client.post(path, json=body, headers=headers)
@@ -143,7 +153,7 @@ class PlatformCallbackClient:
                 response = await client.post(path, json=body, headers=headers)
         response.raise_for_status()
         parsed = response.json()
-        return parsed if isinstance(parsed, dict) else {"result": parsed}
+        return parsed if isinstance(parsed, dict) else {"output": parsed}
 
 
 class _IncomingHeaders:

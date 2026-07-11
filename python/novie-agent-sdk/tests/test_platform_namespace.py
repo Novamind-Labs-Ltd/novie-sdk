@@ -91,7 +91,7 @@ def test_platform_namespace_exposes_openai_proxy_headers(monkeypatch) -> None:
 
 
 def _ok_envelope(result: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "ok", "result": result}
+    return {"status": "ok", "output": result}
 
 
 # ── classify_envelope_error ─────────────────────────────────────────────────
@@ -192,11 +192,14 @@ async def test_knowledge_search_returns_hits_on_ok() -> None:
     hits = await ns.knowledge.search("widgets", top_k=3)
 
     assert hits == [{"id": "doc-1"}, {"id": "doc-2"}]
-    assert "/capabilities/platform.knowledge.search/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["query"] == "widgets"
-    assert captured["body"]["arguments"]["top_k"] == 3
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.knowledge.search"
+    assert captured["body"]["provider_id"] == "platform.knowledge"
+    assert captured["body"]["mode"] == "execute"
+    assert captured["body"]["inputs"]["query"] == "widgets"
+    assert captured["body"]["inputs"]["top_k"] == 3
     # default_project_id from forward headers populated automatically.
-    assert captured["body"]["arguments"]["project_id"] == "project-1"
+    assert captured["body"]["inputs"]["project_id"] == "project-1"
     assert ns.last_diagnostics() == ()
 
 
@@ -257,7 +260,7 @@ async def test_knowledge_search_overrides_project_id_argument() -> None:
 
     ns = _build_with_responder(responder)
     await ns.knowledge.search("x", project_id="custom-project")
-    assert captured["body"]["arguments"]["project_id"] == "custom-project"
+    assert captured["body"]["inputs"]["project_id"] == "custom-project"
 
 
 # ── Live namespace: web.search ─────────────────────────────────────────────
@@ -288,10 +291,11 @@ async def test_web_search_returns_platform_result_on_ok() -> None:
 
     assert out["provider"] == "tavily"
     assert out["results"] == [{"title": "Result", "url": "https://example.test"}]
-    assert "/capabilities/platform.web.search/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["query"] == "widgets"
-    assert captured["body"]["arguments"]["max_results"] == 3
-    assert captured["body"]["arguments"]["search_depth"] == "basic"
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.web.search"
+    assert captured["body"]["inputs"]["query"] == "widgets"
+    assert captured["body"]["inputs"]["max_results"] == 3
+    assert captured["body"]["inputs"]["search_depth"] == "basic"
     assert ns.last_diagnostics() == ()
 
 
@@ -352,8 +356,9 @@ async def test_artifacts_read_uses_budgeted_platform_capability() -> None:
     )
 
     assert out["content"] == "1. offset=12\nbounded excerpt"
-    assert "/capabilities/platform.artifacts.read/invoke" in captured["url"]
-    assert captured["body"]["arguments"] == {
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.artifacts.read"
+    assert captured["body"]["inputs"] == {
         "artifact_id": "artifact-1",
         "mode": "search",
         "purpose": "compare pricing evidence",
@@ -386,7 +391,7 @@ async def test_artifacts_read_does_not_expose_full_read_allow_flag() -> None:
     out = await ns.artifacts.read("artifact-1", mode="full", max_bytes=4096)
 
     assert out["available"] is False
-    assert captured["body"]["arguments"]["allow_full"] is False
+    assert captured["body"]["inputs"]["allow_full"] is False
     assert any(
         d.capability_id == "platform.artifacts.read" and d.kind == "no_results"
         for d in ns.last_diagnostics()
@@ -438,8 +443,8 @@ async def test_artifacts_read_text_formats_platform_artifact_payload() -> None:
     assert "bounded excerpt" in out
     assert "Next offset: 4096" in out
     assert encoded not in out
-    assert calls[0]["arguments"]["artifact_id"] == "artifact-1"
-    assert calls[0]["arguments"]["purpose"] == "agent evidence retrieval"
+    assert calls[0]["inputs"]["artifact_id"] == "artifact-1"
+    assert calls[0]["inputs"]["purpose"] == "agent evidence retrieval"
 
 
 @pytest.mark.asyncio
@@ -591,14 +596,15 @@ async def test_invoke_capability_returns_platform_unavailable_on_500() -> None:
 async def test_invoke_capability_classifies_non_ok_envelope() -> None:
     """An HTTP 200 with ``status=error`` is still a degradation —
     surface the envelope's ``error_code`` through the same kind
-    classification used for HTTP status codes."""
+    classification used for HTTP status codes. Uses the canonical
+    ``/invocations`` failure-detail key, ``error_message``."""
     def responder(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "status": "error",
                 "error_code": "denied_by_binding",
-                "explanation": "no grant",
+                "error_message": "no grant",
             },
         )
 
@@ -608,6 +614,29 @@ async def test_invoke_capability_classifies_non_ok_envelope() -> None:
     )
     assert diagnostics.ok is False
     assert diagnostics.kind == "binding_denied"
+    assert diagnostics.detail == "no grant"
+
+
+@pytest.mark.asyncio
+async def test_invoke_capability_tolerates_legacy_explanation_key() -> None:
+    """Some platform builds haven't fully cut over to ``error_message``
+    yet — ``explanation`` must still populate ``.detail`` as a fallback."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "error",
+                "error_code": "denied_by_binding",
+                "explanation": "no grant (legacy)",
+            },
+        )
+
+    ns = _build_with_responder(responder)
+    diagnostics = await ns.invoke_capability(
+        "platform.knowledge.search", {"query": "x"},
+    )
+    assert diagnostics.ok is False
+    assert diagnostics.detail == "no grant (legacy)"
 
 
 @pytest.mark.asyncio
@@ -655,10 +684,11 @@ async def test_checkpoints_put_returns_dict_on_success() -> None:
         summary="phase complete",
     )
     assert record == {"checkpoint_id": "ck-1"}
-    assert "/capabilities/platform.external_agent_checkpoint.put/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["thread_id"] == "thread-1"
-    assert captured["body"]["arguments"]["summary"] == "phase complete"
-    assert captured["body"]["arguments"]["payload"] == {"phase": "synthesis"}
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.external_agent_checkpoint.put"
+    assert captured["body"]["inputs"]["thread_id"] == "thread-1"
+    assert captured["body"]["inputs"]["summary"] == "phase complete"
+    assert captured["body"]["inputs"]["payload"] == {"phase": "synthesis"}
 
 
 @pytest.mark.asyncio
@@ -866,7 +896,7 @@ async def test_llm_structured_forwards_per_call_timeout() -> None:
 
     def responder(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        captured.update(body["arguments"])
+        captured.update(body["inputs"])
         return httpx.Response(200, json=_ok_envelope({"structured": {"ok": True}}))
 
     ns = _build_with_responder(responder)
@@ -1069,11 +1099,12 @@ async def test_llm_namespace_uses_dedicated_long_timeout_caller() -> None:
     captured_caps: list[str] = []
 
     def responder(request: httpx.Request) -> httpx.Response:
-        # Path is ``/capabilities/{id}/invoke``; pull the id back out so
-        # we can confirm both callers route through the same endpoint
-        # shape — only the timeout differs.
-        path = request.url.path
-        captured_caps.append(path.split("/")[-2])
+        # Path is ``/invocations`` for both callers; the capability id
+        # rides in the body now, so pull it back out from there to
+        # confirm both callers route through the same endpoint shape —
+        # only the timeout differs.
+        body = json.loads(request.content.decode("utf-8"))
+        captured_caps.append(body["capability_id"])
         return httpx.Response(200, json=_ok_envelope({"structured": {"k": 1}}))
 
     transport = httpx.MockTransport(responder)

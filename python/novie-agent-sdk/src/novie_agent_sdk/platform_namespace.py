@@ -181,7 +181,7 @@ def classify_envelope_error(
 
 
 class _CapabilityCaller:
-    """SDK-owned async caller for ``POST /capabilities/{id}/invoke``.
+    """SDK-owned async caller for ``POST /invocations``.
 
     Returns ``CapabilityCallDiagnostics`` instead of raising so the
     namespace layer can degrade predictably. Uses ``httpx`` (already a
@@ -222,16 +222,15 @@ class _CapabilityCaller:
         *,
         timeout_seconds: float | None = None,
     ) -> CapabilityCallDiagnostics:
-        path = f"/capabilities/{capability_id}/invoke"
+        path = "/invocations"
         headers = sign_platform_callback_headers(
             self._headers, method="POST", path=path,
         )
         body: dict[str, Any] = {
-            "arguments": dict(arguments),
-            "caller_type": "agent",
-            "caller_id": f"agent:{self._agent_id}",
-            "caller_mode": "execute",
+            "capability_id": capability_id,
+            "provider_id": capability_id.rsplit(".", 1)[0],
             "mode": "execute",
+            "inputs": dict(arguments),
         }
         call_timeout = _effective_timeout(timeout_seconds, self._timeout)
         try:
@@ -327,14 +326,17 @@ class _CapabilityCaller:
             error_envelope = _extract_error_envelope_from_mapping(envelope)
             envelope_code = _error_envelope_reason_code(error_envelope) or str(envelope.get("error_code") or "") or None
             kind = _error_envelope_kind(error_envelope) or classify_envelope_error(envelope_code, http_status=None)
+            detail = str(
+                envelope.get("error_message") or envelope.get("explanation") or ""
+            )
             return _diagnostics_from_error_envelope(
                 capability_id=capability_id,
                 envelope=error_envelope,
                 default_kind=kind,
                 default_error_code=envelope_code or "",
-                detail=str(envelope.get("explanation") or ""),
+                detail=detail,
             )
-        result = envelope.get("result")
+        result = envelope.get("output")
         if result is not None and not isinstance(result, dict):
             return CapabilityCallDiagnostics(
                 ok=False,
