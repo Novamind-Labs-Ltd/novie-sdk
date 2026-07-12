@@ -25,9 +25,9 @@ metadata") — **except ``checkpoints.put``** (and the equivalent
 ``platform_services.HttpExternalAgentCheckpointService.put``), which
 raises ``ExternalAgentCheckpointPutError`` on failure instead. A failed
 checkpoint write is load-bearing resume state, not a degradable result
-(see ADR-041) — treating it like the diagnostics-only surfaces used to
-mean callers couldn't tell a real write from a silent no-op. Five
-symbolic ``kind`` values:
+— treating it like the diagnostics-only surfaces used to mean callers
+couldn't tell a real write from a silent no-op. Five symbolic ``kind``
+values:
 
 - ``binding_denied`` — HTTP 403 / envelope ``error_code=denied_by_binding``
 - ``transport_error`` — couldn't reach the platform (timeout / connect)
@@ -888,8 +888,8 @@ class ExternalAgentCheckpointPutError(RuntimeError):
     ``CheckpointsNamespace.put``) used to swallow ``put`` failures —
     one fabricated a synthetic record from the caller's own context,
     the other returned ``None`` — making a real write indistinguishable
-    from a silent no-op. Checkpoints are load-bearing resume state
-    (see ADR-041), so a failed write must be loud, not absorbed.
+    from a silent no-op. Checkpoints are load-bearing resume state, so
+    a failed write must be loud, not absorbed.
 
     Attributes:
         capability_id: Always ``"platform.external_agent_checkpoint.put"``.
