@@ -21,7 +21,13 @@ Surface (locked by ``test_platform_namespace.py``):
 Failure modes are surfaced as ``CapabilityCallDiagnostics`` rather than
 exceptions so handlers can degrade predictably (acceptance bullet
 "Callback failures degrade predictably and can be reported in final
-metadata"). Five symbolic ``kind`` values:
+metadata") — **except ``checkpoints.put``** (and the equivalent
+``platform_services.HttpExternalAgentCheckpointService.put``), which
+raises ``ExternalAgentCheckpointPutError`` on failure instead. A failed
+checkpoint write is load-bearing resume state, not a degradable result
+(see ADR-041) — treating it like the diagnostics-only surfaces used to
+mean callers couldn't tell a real write from a silent no-op. Five
+symbolic ``kind`` values:
 
 - ``binding_denied`` — HTTP 403 / envelope ``error_code=denied_by_binding``
 - ``transport_error`` — couldn't reach the platform (timeout / connect)
