@@ -9,7 +9,9 @@ using ``httpx.MockTransport``.
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from typing import Any
+from urllib import error
 
 import pytest
 
@@ -134,6 +136,71 @@ async def test_invoke_with_diagnostics_posts_invocations_envelope(monkeypatch) -
         "mode": "execute",
         "inputs": {"query": "widgets"},
     }
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_diagnostics_classifies_http_403_binding_denial(monkeypatch) -> None:
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001, ARG001
+        raise error.HTTPError(
+            req.full_url,
+            403,
+            "Forbidden",
+            hdrs=None,
+            fp=BytesIO(
+                json.dumps({"error_code": "denied_by_binding"}).encode("utf-8")
+            ),
+        )
+
+    monkeypatch.setattr("novie_agent_sdk.platform_services.request.urlopen", fake_urlopen)
+
+    diagnostics = await _client().invoke_with_diagnostics("platform.knowledge.search", {})
+
+    assert diagnostics.ok is False
+    assert diagnostics.kind == "binding_denied"
+    assert diagnostics.error_code == "denied_by_binding"
+    assert "denied_by_binding" in diagnostics.detail
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_diagnostics_puts_signed_headers_on_request(monkeypatch) -> None:
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "secret")
+    captured: dict[str, str] = {}
+
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001, ARG001
+        captured.update({key.lower(): value for key, value in req.header_items()})
+        return _FakeUrlopenResponse(
+            json.dumps({"status": "ok", "output": {}}).encode("utf-8")
+        )
+
+    monkeypatch.setattr("novie_agent_sdk.platform_services.request.urlopen", fake_urlopen)
+
+    diagnostics = await _client(
+        headers={"x-novie-service-principal": "agent:analyst"}
+    ).invoke_with_diagnostics("platform.knowledge.search", {})
+
+    assert diagnostics.ok is True
+    assert captured["x-novie-service-principal"] == "agent:analyst"
+    assert captured["x-novie-sig"]
+    assert captured["x-novie-timestamp"]
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_diagnostics_passes_configured_timeout_to_urlopen(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+        seen["timeout"] = timeout
+        return _FakeUrlopenResponse(
+            json.dumps({"status": "ok", "output": {}}).encode("utf-8")
+        )
+
+    monkeypatch.setattr("novie_agent_sdk.platform_services.request.urlopen", fake_urlopen)
+
+    client = _client(timeout_seconds=12.5)
+    diagnostics = await client.invoke_with_diagnostics("platform.knowledge.search", {})
+
+    assert diagnostics.ok is True
+    assert seen["timeout"] == 12.5
 
 
 @pytest.mark.asyncio
