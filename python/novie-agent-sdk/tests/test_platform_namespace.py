@@ -30,6 +30,7 @@ import pytest
 
 from novie_agent_sdk import (
     CapabilityCallDiagnostics,
+    ExternalAgentCheckpointPutError,
     PlatformLlmCallError,
     PlatformLlmTimeoutError,
     PlatformLlmTransportError,
@@ -691,6 +692,21 @@ async def test_invoke_capability_returns_schema_violation_on_non_json() -> None:
 # ── Checkpoints namespace ───────────────────────────────────────────────────
 
 
+def test_external_agent_checkpoint_put_error_carries_diagnostics_fields() -> None:
+    exc = ExternalAgentCheckpointPutError(
+        capability_id="platform.external_agent_checkpoint.put",
+        kind="binding_denied",
+        error_code="denied_by_binding",
+        detail="no grant",
+    )
+    assert isinstance(exc, RuntimeError)
+    assert exc.capability_id == "platform.external_agent_checkpoint.put"
+    assert exc.kind == "binding_denied"
+    assert exc.error_code == "denied_by_binding"
+    assert exc.detail == "no grant"
+    assert "binding_denied" in str(exc)
+
+
 @pytest.mark.asyncio
 async def test_checkpoints_put_returns_dict_on_success() -> None:
     captured: dict[str, Any] = {}
@@ -719,20 +735,20 @@ async def test_checkpoints_put_returns_dict_on_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_checkpoints_put_returns_none_on_binding_denied() -> None:
+async def test_checkpoints_put_raises_on_binding_denied() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"error_code": "denied_by_binding"})
 
     ns = _build_with_responder(responder)
-    record = await ns.checkpoints.put(
-        owner_agent_id="demo",
-        thread_id="thread-1",
-        payload={"phase": "x"},
-    )
-    assert record is None
-    assert any(
-        d.kind == "binding_denied" for d in ns.last_diagnostics()
-    )
+
+    with pytest.raises(ExternalAgentCheckpointPutError) as excinfo:
+        await ns.checkpoints.put(
+            owner_agent_id="demo",
+            thread_id="thread-1",
+            payload={"phase": "x"},
+        )
+
+    assert excinfo.value.kind == "binding_denied"
 
 
 @pytest.mark.asyncio

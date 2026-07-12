@@ -13,7 +13,9 @@ from typing import Any
 
 import pytest
 
-from novie_agent_sdk.platform_services import CapabilityClient
+from novie_agent_sdk.platform_services import CapabilityClient, HttpExternalAgentCheckpointService
+from novie_agent_sdk import ExternalAgentCheckpointPutError
+from novie_protocol.contracts import ExecutionContext, IdentityContext, TenantScope
 
 
 class _FakeUrlopenResponse:
@@ -39,6 +41,67 @@ def _client(**overrides: Any) -> CapabilityClient:
         agent_id=overrides.pop("agent_id", "analyst"),
         **overrides,
     )
+
+
+def _checkpoint_ctx() -> ExecutionContext:
+    return ExecutionContext(
+        request_id="req-1",
+        session_id="sess-1",
+        thread_id="thread-1",
+        tenant=TenantScope(tenant_id="tenant-1", workspace_id="workspace-1"),
+        identity=IdentityContext(principal_id="agent:demo", principal_type="service"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_service_put_raises_on_binding_denied(monkeypatch) -> None:
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001, ARG001
+        return _FakeUrlopenResponse(
+            json.dumps(
+                {"status": "denied", "error_code": "denied_by_binding", "error_message": "no grant"}
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr("novie_agent_sdk.platform_services.request.urlopen", fake_urlopen)
+
+    service = HttpExternalAgentCheckpointService(_client())
+
+    with pytest.raises(ExternalAgentCheckpointPutError) as excinfo:
+        await service.put(
+            _checkpoint_ctx(),
+            owner_agent_id="demo",
+            thread_id="thread-1",
+            payload={"phase": "x"},
+        )
+
+    assert excinfo.value.kind == "binding_denied"
+    assert excinfo.value.error_code == "denied_by_binding"
+    assert excinfo.value.detail == "no grant"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_service_put_returns_record_on_success(monkeypatch) -> None:
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001, ARG001
+        return _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "output": {"checkpoint": {"checkpoint_id": "ck-1", "thread_id": "thread-1"}},
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr("novie_agent_sdk.platform_services.request.urlopen", fake_urlopen)
+
+    service = HttpExternalAgentCheckpointService(_client())
+    record = await service.put(
+        _checkpoint_ctx(),
+        owner_agent_id="demo",
+        thread_id="thread-1",
+        payload={"phase": "x"},
+    )
+
+    assert record.checkpoint_id == "ck-1"
 
 
 @pytest.mark.asyncio

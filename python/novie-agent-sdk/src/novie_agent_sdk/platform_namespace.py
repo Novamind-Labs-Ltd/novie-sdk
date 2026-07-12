@@ -21,7 +21,13 @@ Surface (locked by ``test_platform_namespace.py``):
 Failure modes are surfaced as ``CapabilityCallDiagnostics`` rather than
 exceptions so handlers can degrade predictably (acceptance bullet
 "Callback failures degrade predictably and can be reported in final
-metadata"). Five symbolic ``kind`` values:
+metadata") — **except ``checkpoints.put``** (and the equivalent
+``platform_services.HttpExternalAgentCheckpointService.put``), which
+raises ``ExternalAgentCheckpointPutError`` on failure instead. A failed
+checkpoint write is load-bearing resume state, not a degradable result
+— treating it like the diagnostics-only surfaces used to mean callers
+couldn't tell a real write from a silent no-op. Five symbolic ``kind``
+values:
 
 - ``binding_denied`` — HTTP 403 / envelope ``error_code=denied_by_binding``
 - ``transport_error`` — couldn't reach the platform (timeout / connect)
@@ -873,6 +879,47 @@ class QuotaExceededError(RuntimeError):
         self.reason = reason
 
 
+class ExternalAgentCheckpointPutError(RuntimeError):
+    """Raised when ``platform.external_agent_checkpoint.put`` cannot
+    confirm a successful write.
+
+    Both checkpoint-write surfaces (``platform_services.
+    HttpExternalAgentCheckpointService.put`` and this module's
+    ``CheckpointsNamespace.put``) used to swallow ``put`` failures —
+    one fabricated a synthetic record from the caller's own context,
+    the other returned ``None`` — making a real write indistinguishable
+    from a silent no-op. Checkpoints are load-bearing resume state, so
+    a failed write must be loud, not absorbed.
+
+    Attributes:
+        capability_id: Always ``"platform.external_agent_checkpoint.put"``.
+        kind: One of the ``DegradationKind`` values, mirroring
+            ``CapabilityCallDiagnostics.kind``.
+        error_code: Platform envelope ``error_code`` when the failure
+            arrived as a non-OK envelope. Empty string for transport-layer
+            failures.
+        detail: Human-readable explanation suitable for logs / metadata.
+    """
+
+    def __init__(
+        self,
+        *,
+        capability_id: str,
+        kind: DegradationKind | None,
+        error_code: str = "",
+        detail: str = "",
+    ) -> None:
+        message = (
+            f"external agent checkpoint put failed: "
+            f"kind={kind} error_code={error_code or '<none>'} detail={detail or '<none>'}"
+        )
+        super().__init__(message)
+        self.capability_id = capability_id
+        self.kind = kind
+        self.error_code = error_code
+        self.detail = detail
+
+
 class PlatformLlmCallError(RuntimeError):
     """Raised when a ``platform.llm.*`` capability call cannot return a
     usable result (transport error, platform 5xx, schema violation,
@@ -1526,7 +1573,7 @@ class CheckpointsNamespace:
         summary: str | None = None,
         parent_checkpoint_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         args: dict[str, Any] = {
             "owner_agent_id": owner_agent_id,
             "thread_id": thread_id,
@@ -1551,10 +1598,15 @@ class CheckpointsNamespace:
             timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
-            return None
+            raise ExternalAgentCheckpointPutError(
+                capability_id=_CHECKPOINT_PUT_CAP,
+                kind=diagnostics.kind,
+                error_code=diagnostics.error_code,
+                detail=diagnostics.detail,
+            )
         result = diagnostics.result or {}
         block = result.get("checkpoint")
-        return dict(block) if isinstance(block, dict) else None
+        return dict(block) if isinstance(block, dict) else {}
 
     async def get(
         self,
