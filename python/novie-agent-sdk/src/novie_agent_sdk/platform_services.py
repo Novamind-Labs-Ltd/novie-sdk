@@ -25,6 +25,7 @@ from .degradation import (
     classify_envelope_error,
 )
 from .platform_callback import build_platform_callback_headers, sign_platform_callback_headers
+from .platform_namespace import ExternalAgentCheckpointPutError
 
 _log = logging.getLogger(__name__)
 
@@ -289,10 +290,17 @@ class HttpExternalAgentCheckpointService:
             if value:
                 args[key] = value
         diagnostics = await self._client.invoke_with_diagnostics(CHECKPOINT_PUT_CAP, args)
-        if not diagnostics.ok and self._tracker is not None:
-            self._tracker.mark_diagnostics("platform_external_agent_checkpoint", diagnostics)
+        if not diagnostics.ok:
+            if self._tracker is not None:
+                self._tracker.mark_diagnostics("platform_external_agent_checkpoint", diagnostics)
+            raise ExternalAgentCheckpointPutError(
+                capability_id=CHECKPOINT_PUT_CAP,
+                kind=diagnostics.kind,
+                error_code=diagnostics.error_code,
+                detail=diagnostics.detail,
+            )
         record_data: dict[str, Any] = {}
-        if diagnostics.ok and isinstance(diagnostics.result, dict):
+        if isinstance(diagnostics.result, dict):
             checkpoint_block = diagnostics.result.get("checkpoint")
             if isinstance(checkpoint_block, dict):
                 record_data = checkpoint_block
