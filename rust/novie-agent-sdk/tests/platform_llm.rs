@@ -28,26 +28,25 @@ fn make_client(server: &MockServer) -> PlatformLlmClient {
 async fn chat_invokes_platform_llm_capability() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.chat/invoke"))
+        .and(path("/invocations"))
         .and(bearer_token("platform-token"))
         .and(header("x-novie-org-id", "org-1"))
         .and(header("x-novie-project-id", "project-1"))
         .and(header("x-novie-workspace-id", "workspace-1"))
         .and(header("x-novie-user-id", "user-1"))
         .and(body_json(json!({
-            "arguments": {
+            "capability_id": "platform.llm.chat",
+            "provider_id": "platform.llm",
+            "mode": "execute",
+            "inputs": {
                 "messages": [{"role": "user", "content": "hello"}],
                 "model": "test-model",
                 "temperature": 0.2
-            },
-            "caller_type": "agent",
-            "caller_id": "agent:rust-agent",
-            "caller_mode": "execute",
-            "mode": "execute"
+            }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "content": "hi",
                 "usage_metadata": {"total_tokens": 3}
             }
@@ -73,12 +72,12 @@ async fn chat_invokes_platform_llm_capability() {
 async fn quota_exceeded_maps_to_typed_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.chat/invoke"))
+        .and(path("/invocations"))
         .respond_with(ResponseTemplate::new(403).set_body_json(json!({
             "detail": {
                 "status": "denied",
                 "error_code": "quota_exceeded",
-                "explanation": "org token pool exhausted",
+                "error_message": "org token pool exhausted",
                 "metadata": {
                     "quota": {
                         "org_id": "org-1",
@@ -109,13 +108,68 @@ async fn quota_exceeded_maps_to_typed_error() {
 }
 
 #[tokio::test]
+async fn error_message_field_preferred_over_explanation_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/invocations"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "detail": {
+                "error_message": "preferred message",
+                "explanation": "legacy fallback message"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = make_client(&server);
+    let err = client
+        .chat(vec![ChatMessage::user("hello")], ChatOptions::default())
+        .await
+        .unwrap_err();
+    match err {
+        Error::Protocol { message, .. } => assert_eq!(message, "preferred message"),
+        other => panic!("expected protocol error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn explanation_field_used_when_error_message_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/invocations"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "detail": {
+                "explanation": "legacy fallback message"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = make_client(&server);
+    let err = client
+        .chat(vec![ChatMessage::user("hello")], ChatOptions::default())
+        .await
+        .unwrap_err();
+    match err {
+        Error::Protocol { message, .. } => assert_eq!(message, "legacy fallback message"),
+        other => panic!("expected protocol error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn budget_check_returns_result_map() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .and(path("/invocations"))
+        .and(body_json(json!({
+            "capability_id": "platform.llm.budget_check",
+            "provider_id": "platform.llm",
+            "mode": "execute",
+            "inputs": {}
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "allow": true,
                 "org_pool": {"remaining_tokens": 500}
             }
@@ -143,10 +197,10 @@ fn make_budget_guard(server: &MockServer) -> LlmBudgetGuard {
 async fn budget_guard_preflight_allows_when_budget_ok() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .and(path("/invocations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "allow": true,
                 "exhausted": false,
                 "remaining_tokens": 5000,
@@ -168,10 +222,10 @@ async fn budget_guard_preflight_allows_when_budget_ok() {
 async fn budget_guard_preflight_denies_when_exhausted() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .and(path("/invocations"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "allow": false,
                 "exhausted": true,
                 "remaining_tokens": 0,
@@ -199,7 +253,7 @@ async fn budget_guard_preflight_denies_when_exhausted() {
 async fn budget_guard_preflight_returns_governance_unavailable_on_503() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.budget_check/invoke"))
+        .and(path("/invocations"))
         .respond_with(ResponseTemplate::new(503).set_body_json(json!({
             "detail": "service unavailable"
         })))
@@ -220,10 +274,22 @@ async fn budget_guard_preflight_returns_governance_unavailable_on_503() {
 async fn budget_guard_report_usage_sets_exceeded_on_exhausted_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.report_usage/invoke"))
+        .and(path("/invocations"))
+        .and(body_json(json!({
+            "capability_id": "platform.llm.report_usage",
+            "provider_id": "platform.llm",
+            "mode": "execute",
+            "inputs": {
+                "provider": "anthropic",
+                "model": "claude-opus",
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "total_tokens": 1500
+            }
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "recorded": true,
                 "exhausted": true
             }
@@ -257,20 +323,19 @@ async fn budget_guard_report_usage_sets_exceeded_on_exhausted_response() {
 async fn structured_uses_output_schema_field_not_schema() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/capabilities/platform.llm.structured/invoke"))
+        .and(path("/invocations"))
         .and(body_json(json!({
-            "arguments": {
+            "capability_id": "platform.llm.structured",
+            "provider_id": "platform.llm",
+            "mode": "execute",
+            "inputs": {
                 "messages": [{"role": "user", "content": "extract"}],
                 "output_schema": {"type": "object"},
-            },
-            "caller_type": "agent",
-            "caller_id": "agent:rust-agent",
-            "caller_mode": "execute",
-            "mode": "execute"
+            }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": "ok",
-            "result": {
+            "output": {
                 "structured": {"answer": 42}
             }
         })))

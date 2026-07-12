@@ -100,15 +100,14 @@ class CapabilityClient:
         capability_id: str,
         arguments: dict[str, Any],
     ) -> CapabilityCallDiagnostics:
-        path = f"/capabilities/{capability_id}/invoke"
+        path = "/invocations"
         url = f"{self._base_url}{path}"
         body = json.dumps(
             {
-                "arguments": dict(arguments),
-                "caller_type": "agent",
-                "caller_id": f"agent:{self._agent_id}",
-                "caller_mode": "execute",
+                "capability_id": capability_id,
+                "provider_id": capability_id.rsplit(".", 1)[0],
                 "mode": "execute",
+                "inputs": dict(arguments),
             }
         ).encode("utf-8")
         req = request.Request(url, data=body, method="POST")
@@ -182,15 +181,18 @@ class CapabilityClient:
             if str(envelope.get("status")) != "ok":
                 envelope_code = str(envelope.get("error_code") or "") or None
                 kind = classify_envelope_error(envelope_code, http_status=None)
+                detail = str(
+                    envelope.get("error_message") or envelope.get("explanation") or ""
+                )
                 return CapabilityCallDiagnostics(
                     ok=False,
                     result=None,
                     kind=kind,
                     error_code=envelope_code or "",
-                    detail=str(envelope.get("explanation") or ""),
+                    detail=detail,
                     capability_id=capability_id,
                 )
-            result = envelope.get("result")
+            result = envelope.get("output")
             return CapabilityCallDiagnostics(
                 ok=True,
                 result=result if isinstance(result, dict) else None,

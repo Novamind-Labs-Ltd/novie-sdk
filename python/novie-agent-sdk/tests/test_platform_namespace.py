@@ -61,6 +61,33 @@ def _incoming_headers(**overrides: str) -> dict[str, str]:
     return base
 
 
+def _sse_stream(*payloads: Any, done: bool = True) -> bytes:
+    """Encode objects as an OpenAI-compatible ``data:`` SSE stream."""
+    lines = [f"data: {json.dumps(payload)}\n\n" for payload in payloads]
+    if done:
+        lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode("utf-8")
+
+
+def _openai_chunk(
+    *,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "model": "novie/default",
+        "choices": [
+            {"index": 0, "delta": delta or {}, "finish_reason": finish_reason}
+        ],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
 def _build_with_responder(
     responder: Callable[[httpx.Request], httpx.Response],
     *,
@@ -91,7 +118,7 @@ def test_platform_namespace_exposes_openai_proxy_headers(monkeypatch) -> None:
 
 
 def _ok_envelope(result: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "ok", "result": result}
+    return {"status": "ok", "output": result}
 
 
 # ── classify_envelope_error ─────────────────────────────────────────────────
@@ -192,11 +219,14 @@ async def test_knowledge_search_returns_hits_on_ok() -> None:
     hits = await ns.knowledge.search("widgets", top_k=3)
 
     assert hits == [{"id": "doc-1"}, {"id": "doc-2"}]
-    assert "/capabilities/platform.knowledge.search/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["query"] == "widgets"
-    assert captured["body"]["arguments"]["top_k"] == 3
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.knowledge.search"
+    assert captured["body"]["provider_id"] == "platform.knowledge"
+    assert captured["body"]["mode"] == "execute"
+    assert captured["body"]["inputs"]["query"] == "widgets"
+    assert captured["body"]["inputs"]["top_k"] == 3
     # default_project_id from forward headers populated automatically.
-    assert captured["body"]["arguments"]["project_id"] == "project-1"
+    assert captured["body"]["inputs"]["project_id"] == "project-1"
     assert ns.last_diagnostics() == ()
 
 
@@ -257,7 +287,7 @@ async def test_knowledge_search_overrides_project_id_argument() -> None:
 
     ns = _build_with_responder(responder)
     await ns.knowledge.search("x", project_id="custom-project")
-    assert captured["body"]["arguments"]["project_id"] == "custom-project"
+    assert captured["body"]["inputs"]["project_id"] == "custom-project"
 
 
 # ── Live namespace: web.search ─────────────────────────────────────────────
@@ -288,10 +318,11 @@ async def test_web_search_returns_platform_result_on_ok() -> None:
 
     assert out["provider"] == "tavily"
     assert out["results"] == [{"title": "Result", "url": "https://example.test"}]
-    assert "/capabilities/platform.web.search/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["query"] == "widgets"
-    assert captured["body"]["arguments"]["max_results"] == 3
-    assert captured["body"]["arguments"]["search_depth"] == "basic"
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.web.search"
+    assert captured["body"]["inputs"]["query"] == "widgets"
+    assert captured["body"]["inputs"]["max_results"] == 3
+    assert captured["body"]["inputs"]["search_depth"] == "basic"
     assert ns.last_diagnostics() == ()
 
 
@@ -352,8 +383,9 @@ async def test_artifacts_read_uses_budgeted_platform_capability() -> None:
     )
 
     assert out["content"] == "1. offset=12\nbounded excerpt"
-    assert "/capabilities/platform.artifacts.read/invoke" in captured["url"]
-    assert captured["body"]["arguments"] == {
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.artifacts.read"
+    assert captured["body"]["inputs"] == {
         "artifact_id": "artifact-1",
         "mode": "search",
         "purpose": "compare pricing evidence",
@@ -386,7 +418,7 @@ async def test_artifacts_read_does_not_expose_full_read_allow_flag() -> None:
     out = await ns.artifacts.read("artifact-1", mode="full", max_bytes=4096)
 
     assert out["available"] is False
-    assert captured["body"]["arguments"]["allow_full"] is False
+    assert captured["body"]["inputs"]["allow_full"] is False
     assert any(
         d.capability_id == "platform.artifacts.read" and d.kind == "no_results"
         for d in ns.last_diagnostics()
@@ -438,8 +470,8 @@ async def test_artifacts_read_text_formats_platform_artifact_payload() -> None:
     assert "bounded excerpt" in out
     assert "Next offset: 4096" in out
     assert encoded not in out
-    assert calls[0]["arguments"]["artifact_id"] == "artifact-1"
-    assert calls[0]["arguments"]["purpose"] == "agent evidence retrieval"
+    assert calls[0]["inputs"]["artifact_id"] == "artifact-1"
+    assert calls[0]["inputs"]["purpose"] == "agent evidence retrieval"
 
 
 @pytest.mark.asyncio
@@ -591,14 +623,15 @@ async def test_invoke_capability_returns_platform_unavailable_on_500() -> None:
 async def test_invoke_capability_classifies_non_ok_envelope() -> None:
     """An HTTP 200 with ``status=error`` is still a degradation —
     surface the envelope's ``error_code`` through the same kind
-    classification used for HTTP status codes."""
+    classification used for HTTP status codes. Uses the canonical
+    ``/invocations`` failure-detail key, ``error_message``."""
     def responder(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "status": "error",
                 "error_code": "denied_by_binding",
-                "explanation": "no grant",
+                "error_message": "no grant",
             },
         )
 
@@ -608,6 +641,29 @@ async def test_invoke_capability_classifies_non_ok_envelope() -> None:
     )
     assert diagnostics.ok is False
     assert diagnostics.kind == "binding_denied"
+    assert diagnostics.detail == "no grant"
+
+
+@pytest.mark.asyncio
+async def test_invoke_capability_tolerates_legacy_explanation_key() -> None:
+    """Some platform builds haven't fully cut over to ``error_message``
+    yet — ``explanation`` must still populate ``.detail`` as a fallback."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "error",
+                "error_code": "denied_by_binding",
+                "explanation": "no grant (legacy)",
+            },
+        )
+
+    ns = _build_with_responder(responder)
+    diagnostics = await ns.invoke_capability(
+        "platform.knowledge.search", {"query": "x"},
+    )
+    assert diagnostics.ok is False
+    assert diagnostics.detail == "no grant (legacy)"
 
 
 @pytest.mark.asyncio
@@ -655,10 +711,11 @@ async def test_checkpoints_put_returns_dict_on_success() -> None:
         summary="phase complete",
     )
     assert record == {"checkpoint_id": "ck-1"}
-    assert "/capabilities/platform.external_agent_checkpoint.put/invoke" in captured["url"]
-    assert captured["body"]["arguments"]["thread_id"] == "thread-1"
-    assert captured["body"]["arguments"]["summary"] == "phase complete"
-    assert captured["body"]["arguments"]["payload"] == {"phase": "synthesis"}
+    assert captured["url"].endswith("/invocations")
+    assert captured["body"]["capability_id"] == "platform.external_agent_checkpoint.put"
+    assert captured["body"]["inputs"]["thread_id"] == "thread-1"
+    assert captured["body"]["inputs"]["summary"] == "phase complete"
+    assert captured["body"]["inputs"]["payload"] == {"phase": "synthesis"}
 
 
 @pytest.mark.asyncio
@@ -866,7 +923,7 @@ async def test_llm_structured_forwards_per_call_timeout() -> None:
 
     def responder(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        captured.update(body["arguments"])
+        captured.update(body["inputs"])
         return httpx.Response(200, json=_ok_envelope({"structured": {"ok": True}}))
 
     ns = _build_with_responder(responder)
@@ -894,55 +951,90 @@ async def test_llm_chat_raises_call_error_on_envelope_5xx() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_chat_uses_streaming_capability_endpoint() -> None:
+async def test_llm_chat_streams_over_openai_chat_completions() -> None:
     captured_paths: list[str] = []
+    captured_bodies: list[dict[str, Any]] = []
+    captured_sig: list[str | None] = []
 
     def responder(request: httpx.Request) -> httpx.Response:
         captured_paths.append(request.url.path)
-        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        captured_bodies.append(json.loads(request.content.decode("utf-8")))
+        captured_sig.append(request.headers.get("x-novie-sig"))
+        assert request.url.path == "/v1/chat/completions"
         return httpx.Response(
             200,
-            content=(
-                b'{"type":"accepted","invocation_id":"i1"}\n'
-                b'{"type":"heartbeat","invocation_id":"i1","seq":1}\n'
-                b'{"type":"completed","invocation_id":"i1",'
-                b'"result":{"content":"hello","usage_metadata":{"total_tokens":7}}}\n'
+            content=_sse_stream(
+                _openai_chunk(delta={"role": "assistant"}),
+                _openai_chunk(delta={"content": "hello"}),
+                _openai_chunk(
+                    delta={},
+                    finish_reason="stop",
+                    usage={
+                        "prompt_tokens": 3,
+                        "completion_tokens": 4,
+                        "total_tokens": 7,
+                    },
+                ),
             ),
-            headers={"content-type": "application/x-ndjson"},
+            headers={"content-type": "text/event-stream"},
         )
 
     ns = _build_with_responder(responder)
 
-    result = await ns.llm.chat([{"role": "user", "content": "hi"}])
+    result = await ns.llm.chat(
+        [{"role": "user", "content": "hi"}],
+        model="anthropic/claude-opus-4.6",
+        temperature=0.2,
+        max_output_tokens=256,
+    )
 
     assert result["content"] == "hello"
     assert result["usage_metadata"]["total_tokens"] == 7
-    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
+    # ``usage`` renames OpenAI's prompt/completion token fields onto
+    # LangChain's ``usage_metadata`` vocabulary.
+    assert result["usage_metadata"]["input_tokens"] == 3
+    assert result["usage_metadata"]["output_tokens"] == 4
+    # The terminal chunk's ``finish_reason`` carries through to
+    # ``response_metadata`` on the synthesized ``completed`` result.
+    assert result["response_metadata"]["finish_reason"] == "stop"
+    assert captured_paths == ["/v1/chat/completions"]
+    # Re-signed for the new path (a stale signed path would 401 on the platform).
+    assert captured_sig[0]
+    # ``arguments`` mapped onto the OpenAI body: ``stream`` on,
+    # ``max_output_tokens`` renamed to ``max_tokens``.
+    body = captured_bodies[0]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert body["model"] == "anthropic/claude-opus-4.6"
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 256
+    assert "arguments" not in body
+    assert "caller_type" not in body
 
 
 @pytest.mark.asyncio
-async def test_llm_chat_ignores_intermediate_stream_chunks() -> None:
-    """``llm.chat`` consumes the stream endpoint but returns the final result.
+async def test_llm_chat_accumulates_streamed_content_deltas() -> None:
+    """``llm.chat`` consumes the SSE stream but returns one final result.
 
-    The platform emits ``chunk`` events before ``completed`` for live token
-    streaming. Those chunks are for ``llm.stream_chat`` callers and must not
-    make non-streaming ``llm.chat`` fail with ``unknown_stream_event``.
+    The endpoint emits token-delta chunks before the terminal chunk; the SDK
+    accumulates them into the synthesized ``completed`` result rather than
+    surfacing them to the non-streaming ``llm.chat`` caller.
     """
-    captured_paths: list[str] = []
-
     def responder(request: httpx.Request) -> httpx.Response:
-        captured_paths.append(request.url.path)
-        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        assert request.url.path == "/v1/chat/completions"
         return httpx.Response(
             200,
-            content=(
-                b'{"type":"accepted","invocation_id":"i1"}\n'
-                b'{"type":"chunk","invocation_id":"i1","delta":{"content":"hel"}}\n'
-                b'{"type":"chunk","invocation_id":"i1","delta":{"content":"lo"}}\n'
-                b'{"type":"completed","invocation_id":"i1",'
-                b'"result":{"content":"hello","usage_metadata":{"total_tokens":7}}}\n'
+            content=_sse_stream(
+                _openai_chunk(delta={"content": "hel"}),
+                _openai_chunk(delta={"content": "lo"}),
+                _openai_chunk(
+                    delta={},
+                    finish_reason="stop",
+                    usage={"total_tokens": 7},
+                ),
             ),
-            headers={"content-type": "application/x-ndjson"},
+            headers={"content-type": "text/event-stream"},
         )
 
     ns = _build_with_responder(responder)
@@ -951,25 +1043,37 @@ async def test_llm_chat_ignores_intermediate_stream_chunks() -> None:
 
     assert result["content"] == "hello"
     assert result["usage_metadata"]["total_tokens"] == 7
-    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
 
 
 @pytest.mark.asyncio
 async def test_llm_stream_chat_normalises_tool_chunks_for_non_langchain_agents() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        assert request.url.path == "/v1/chat/completions"
         return httpx.Response(
             200,
-            content=(
-                b'{"type":"chunk","delta":{"content":"","tool_call_chunks":['
-                b'{"type":"function","id":"toolu_1","function":'
-                b'{"name":"lookup","arguments":"{\\"quer"}}]}}\n'
-                b'{"type":"chunk","delta":{"content":"","tool_call_chunks":['
-                b'{"type":"function","id":null,"function":'
-                b'{"name":null,"arguments":"y\\":\\"hello\\"}"}}]}}\n'
-                b'{"type":"completed","result":{"content":"","usage_metadata":{"total_tokens":7}}}\n'
+            content=_sse_stream(
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"quer'},
+                    }
+                ]}),
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "type": "function",
+                        "function": {"arguments": 'y":"hello"}'},
+                    }
+                ]}),
+                _openai_chunk(
+                    delta={},
+                    finish_reason="tool_calls",
+                    usage={"total_tokens": 7},
+                ),
             ),
-            headers={"content-type": "application/x-ndjson"},
+            headers={"content-type": "text/event-stream"},
         )
 
     ns = _build_with_responder(responder)
@@ -986,16 +1090,137 @@ async def test_llm_stream_chat_normalises_tool_chunks_for_non_langchain_agents()
 
 
 @pytest.mark.asyncio
-async def test_llm_stream_chat_raises_on_stream_error_event() -> None:
+async def test_llm_chat_diagnostics_path_accumulates_tool_calls() -> None:
+    """``llm.chat`` (the diagnostics path, not ``stream_chat``'s raw event
+    stream) must also accumulate tool-call deltas into the synthesized
+    ``completed`` result rather than dropping them."""
     def responder(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/capabilities/platform.llm.chat/invoke-stream"
+        assert request.url.path == "/v1/chat/completions"
         return httpx.Response(
             200,
-            content=(
-                b'{"type":"error","error_code":"internal_error",'
-                b'"explanation":"provider failed"}\n'
+            content=_sse_stream(
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"quer'},
+                    }
+                ]}),
+                _openai_chunk(delta={"tool_calls": [
+                    {
+                        "index": 0,
+                        "type": "function",
+                        "function": {"arguments": 'y":"hello"}'},
+                    }
+                ]}),
+                _openai_chunk(
+                    delta={},
+                    finish_reason="tool_calls",
+                    usage={"total_tokens": 7},
+                ),
             ),
-            headers={"content-type": "application/x-ndjson"},
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    diagnostics = await ns._llm_caller.invoke_stream_with_diagnostics(  # noqa: SLF001
+        "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert diagnostics.ok is True
+    assert diagnostics.result is not None
+    assert diagnostics.result["tool_calls"] == [
+        {"id": "toolu_1", "name": "lookup", "args": {"query": "hello"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_diagnostics_classifies_read_timeout_as_heartbeat_timeout() -> None:
+    """A real ``httpx.ReadTimeout`` (e.g. the platform stops sending
+    heartbeat bytes for longer than the read timeout) must be classified as
+    ``stream_heartbeat_timeout``, not fall through to the generic
+    transport-error branch (which drops the error_code entirely) -- the
+    handler previously caught the builtin ``TimeoutError``, which
+    ``httpx.ReadTimeout`` never subclasses, so it was silently unreachable.
+    """
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated heartbeat timeout", request=request)
+
+    ns = _build_with_responder(responder)
+
+    diagnostics = await ns._llm_caller.invoke_stream_with_diagnostics(  # noqa: SLF001
+        "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    assert diagnostics.ok is False
+    assert diagnostics.error_code == "stream_heartbeat_timeout"
+
+
+@pytest.mark.asyncio
+async def test_llm_event_stream_classifies_read_timeout_as_heartbeat_timeout() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated heartbeat timeout", request=request)
+
+    ns = _build_with_responder(responder)
+
+    events = [
+        event
+        async for event in ns._llm_caller.invoke_event_stream(  # noqa: SLF001
+            "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+    ]
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["error_code"] == "stream_heartbeat_timeout"
+
+
+@pytest.mark.asyncio
+async def test_translate_openai_sse_errors_when_stream_closes_without_done() -> None:
+    """A clean mid-generation connection close (no ``[DONE]``, no httpx
+    exception) must surface as an ``error`` event, not a ``completed`` one
+    — otherwise a truncated response silently looks like success."""
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_sse_stream(
+                _openai_chunk(delta={"content": "partial"}),
+                done=False,
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns = _build_with_responder(responder)
+
+    events = [
+        event
+        async for event in ns._llm_caller.invoke_event_stream(  # noqa: SLF001
+            "platform.llm.chat", {"messages": [{"role": "user", "content": "hi"}]}
+        )
+    ]
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["error_code"] == "stream_closed_without_completion"
+    assert not any(event["type"] == "completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_chat_raises_on_stream_error_event() -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        # Mid-stream failures arrive as an OpenAI-shaped ``error`` payload.
+        return httpx.Response(
+            200,
+            content=_sse_stream({
+                "error": {
+                    "message": "provider failed",
+                    "type": "server_error",
+                    "code": "internal_error",
+                    "param": None,
+                }
+            }),
+            headers={"content-type": "text/event-stream"},
         )
 
     ns = _build_with_responder(responder)
@@ -1010,14 +1235,12 @@ async def test_llm_stream_chat_raises_on_stream_error_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_chat_raises_when_stream_endpoint_missing() -> None:
+async def test_llm_chat_raises_when_chat_completions_endpoint_missing() -> None:
     captured_paths: list[str] = []
 
     def responder(request: httpx.Request) -> httpx.Response:
         captured_paths.append(request.url.path)
-        if request.url.path.endswith("/invoke-stream"):
-            return httpx.Response(404, json={"error_code": "not_found"})
-        return httpx.Response(200, json=_ok_envelope({"content": "legacy"}))
+        return httpx.Response(404, json={"error_code": "not_found"})
 
     ns = _build_with_responder(responder)
 
@@ -1025,8 +1248,8 @@ async def test_llm_chat_raises_when_stream_endpoint_missing() -> None:
         await ns.llm.chat([{"role": "user", "content": "hi"}])
 
     assert excinfo.value.capability_id == "platform.llm.chat"
-    assert excinfo.value.error_code == "stream_endpoint_not_found"
-    assert captured_paths == ["/capabilities/platform.llm.chat/invoke-stream"]
+    assert excinfo.value.error_code == "not_found"
+    assert captured_paths == ["/v1/chat/completions"]
 
 
 @pytest.mark.asyncio
@@ -1069,11 +1292,12 @@ async def test_llm_namespace_uses_dedicated_long_timeout_caller() -> None:
     captured_caps: list[str] = []
 
     def responder(request: httpx.Request) -> httpx.Response:
-        # Path is ``/capabilities/{id}/invoke``; pull the id back out so
-        # we can confirm both callers route through the same endpoint
-        # shape — only the timeout differs.
-        path = request.url.path
-        captured_caps.append(path.split("/")[-2])
+        # Path is ``/invocations`` for both callers; the capability id
+        # rides in the body now, so pull it back out from there to
+        # confirm both callers route through the same endpoint shape —
+        # only the timeout differs.
+        body = json.loads(request.content.decode("utf-8"))
+        captured_caps.append(body["capability_id"])
         return httpx.Response(200, json=_ok_envelope({"structured": {"k": 1}}))
 
     transport = httpx.MockTransport(responder)

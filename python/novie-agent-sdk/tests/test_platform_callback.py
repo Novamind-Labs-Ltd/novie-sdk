@@ -82,7 +82,7 @@ async def test_platform_callback_client_invokes_capability_with_signed_headers(m
         seen["path"] = request.url.path
         seen["headers"] = dict(request.headers)
         seen["body"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(200, json={"ok": True, "result": {"count": 1}})
+        return httpx.Response(200, json={"status": "ok", "output": {"count": 1}})
 
     client = httpx.AsyncClient(
         base_url="http://platform.test",
@@ -109,12 +109,53 @@ async def test_platform_callback_client_invokes_capability_with_signed_headers(m
     finally:
         await client.aclose()
 
-    assert result["result"] == {"count": 1}
-    assert seen["path"] == "/capabilities/platform.knowledge.search/invoke"
+    assert result["output"] == {"count": 1}
+    assert seen["path"] == "/invocations"
     headers = seen["headers"]
     assert isinstance(headers, dict)
     assert headers["x-novie-user-id"] == "user-1"
     assert headers["x-novie-sig"].startswith("sha256=")
     body = seen["body"]
     assert isinstance(body, dict)
-    assert body["caller_id"] == "agent:analyst"
+    assert body["capability_id"] == "platform.knowledge.search"
+    assert body["provider_id"] == "platform.knowledge"
+    assert body["mode"] == "execute"
+    assert body["inputs"] == {"query": "architecture"}
+
+
+@pytest.mark.asyncio
+async def test_platform_callback_client_always_sends_execute_mode(monkeypatch) -> None:
+    """``caller_mode`` is kept for signature stability but legacy values
+    (``interactive``/``preview``/``delegated``) don't map onto
+    ``/invocations``' ``mode`` vocabulary — the body always sends
+    ``mode="execute"`` regardless of what's passed."""
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "secret")
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"status": "ok", "output": {}})
+
+    client = httpx.AsyncClient(
+        base_url="http://platform.test",
+        transport=httpx.MockTransport(handler),
+    )
+    callback = PlatformCallbackClient(
+        "http://platform.test",
+        RequestHeaders(tenant_id="tenant-1", project_id="project-1"),
+        agent_id="analyst",
+        client=client,
+    )
+
+    try:
+        await callback.invoke_capability(
+            "platform.knowledge.search",
+            {},
+            caller_mode="interactive",
+        )
+    finally:
+        await client.aclose()
+
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["mode"] == "execute"

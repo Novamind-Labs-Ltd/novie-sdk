@@ -856,7 +856,7 @@ Purpose:
 
 Purpose:
 
-- Calls `/capabilities/{capability_id}/invoke`.
+- Calls `POST /invocations`.
 - Provides `invoke(...)` for result-only calls and `invoke_with_diagnostics(...)` for degradation-aware calls.
 - Also provides `get_json(...)` for signed gateway GET requests.
 
