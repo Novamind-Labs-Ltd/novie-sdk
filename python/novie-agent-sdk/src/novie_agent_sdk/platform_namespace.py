@@ -873,6 +873,47 @@ class QuotaExceededError(RuntimeError):
         self.reason = reason
 
 
+class ExternalAgentCheckpointPutError(RuntimeError):
+    """Raised when ``platform.external_agent_checkpoint.put`` cannot
+    confirm a successful write.
+
+    Both checkpoint-write surfaces (``platform_services.
+    HttpExternalAgentCheckpointService.put`` and this module's
+    ``CheckpointsNamespace.put``) used to swallow ``put`` failures —
+    one fabricated a synthetic record from the caller's own context,
+    the other returned ``None`` — making a real write indistinguishable
+    from a silent no-op. Checkpoints are load-bearing resume state
+    (see ADR-041), so a failed write must be loud, not absorbed.
+
+    Attributes:
+        capability_id: Always ``"platform.external_agent_checkpoint.put"``.
+        kind: One of the ``DegradationKind`` values, mirroring
+            ``CapabilityCallDiagnostics.kind``.
+        error_code: Platform envelope ``error_code`` when the failure
+            arrived as a non-OK envelope. Empty string for transport-layer
+            failures.
+        detail: Human-readable explanation suitable for logs / metadata.
+    """
+
+    def __init__(
+        self,
+        *,
+        capability_id: str,
+        kind: DegradationKind | None,
+        error_code: str = "",
+        detail: str = "",
+    ) -> None:
+        message = (
+            f"external agent checkpoint put failed: "
+            f"kind={kind} error_code={error_code or '<none>'} detail={detail or '<none>'}"
+        )
+        super().__init__(message)
+        self.capability_id = capability_id
+        self.kind = kind
+        self.error_code = error_code
+        self.detail = detail
+
+
 class PlatformLlmCallError(RuntimeError):
     """Raised when a ``platform.llm.*`` capability call cannot return a
     usable result (transport error, platform 5xx, schema violation,

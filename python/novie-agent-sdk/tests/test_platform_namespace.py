@@ -30,6 +30,7 @@ import pytest
 
 from novie_agent_sdk import (
     CapabilityCallDiagnostics,
+    ExternalAgentCheckpointPutError,
     PlatformLlmCallError,
     PlatformLlmTimeoutError,
     PlatformLlmTransportError,
@@ -689,6 +690,21 @@ async def test_invoke_capability_returns_schema_violation_on_non_json() -> None:
 
 
 # ── Checkpoints namespace ───────────────────────────────────────────────────
+
+
+def test_external_agent_checkpoint_put_error_carries_diagnostics_fields() -> None:
+    exc = ExternalAgentCheckpointPutError(
+        capability_id="platform.external_agent_checkpoint.put",
+        kind="binding_denied",
+        error_code="denied_by_binding",
+        detail="no grant",
+    )
+    assert isinstance(exc, RuntimeError)
+    assert exc.capability_id == "platform.external_agent_checkpoint.put"
+    assert exc.kind == "binding_denied"
+    assert exc.error_code == "denied_by_binding"
+    assert exc.detail == "no grant"
+    assert "binding_denied" in str(exc)
 
 
 @pytest.mark.asyncio
