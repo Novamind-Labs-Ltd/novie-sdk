@@ -66,7 +66,7 @@
 ///
 /// See module-level docs for the mirror policy. Bump this in lockstep with
 /// `novie-protocol` releases.
-pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.4";
+pub const MIRRORED_PROTOCOL_VERSION: &str = "0.1.5";
 
 // ── A2A Runtime (v2 primary path) ────────────────────────────────────────────
 #[cfg(feature = "http")]
