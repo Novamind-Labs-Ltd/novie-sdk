@@ -735,20 +735,20 @@ async def test_checkpoints_put_returns_dict_on_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_checkpoints_put_returns_none_on_binding_denied() -> None:
+async def test_checkpoints_put_raises_on_binding_denied() -> None:
     def responder(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"error_code": "denied_by_binding"})
 
     ns = _build_with_responder(responder)
-    record = await ns.checkpoints.put(
-        owner_agent_id="demo",
-        thread_id="thread-1",
-        payload={"phase": "x"},
-    )
-    assert record is None
-    assert any(
-        d.kind == "binding_denied" for d in ns.last_diagnostics()
-    )
+
+    with pytest.raises(ExternalAgentCheckpointPutError) as excinfo:
+        await ns.checkpoints.put(
+            owner_agent_id="demo",
+            thread_id="thread-1",
+            payload={"phase": "x"},
+        )
+
+    assert excinfo.value.kind == "binding_denied"
 
 
 @pytest.mark.asyncio

@@ -1567,7 +1567,7 @@ class CheckpointsNamespace:
         summary: str | None = None,
         parent_checkpoint_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         args: dict[str, Any] = {
             "owner_agent_id": owner_agent_id,
             "thread_id": thread_id,
@@ -1592,10 +1592,15 @@ class CheckpointsNamespace:
             timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
         )
         if not diagnostics.ok:
-            return None
+            raise ExternalAgentCheckpointPutError(
+                capability_id=_CHECKPOINT_PUT_CAP,
+                kind=diagnostics.kind,
+                error_code=diagnostics.error_code,
+                detail=diagnostics.detail,
+            )
         result = diagnostics.result or {}
         block = result.get("checkpoint")
-        return dict(block) if isinstance(block, dict) else None
+        return dict(block) if isinstance(block, dict) else {}
 
     async def get(
         self,
