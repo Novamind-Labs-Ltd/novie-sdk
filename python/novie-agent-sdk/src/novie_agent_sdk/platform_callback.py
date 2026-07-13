@@ -58,6 +58,9 @@ def build_platform_callback_headers(
         headers["x-novie-user-id"] = user_id
     else:
         headers["x-novie-service-principal"] = service_principal
+    on_behalf_of_user_id = source.pick("x-novie-on-behalf-of-user-id")
+    if on_behalf_of_user_id:
+        headers["x-novie-on-behalf-of-user-id"] = on_behalf_of_user_id
     for incoming_name, outgoing_name in (
         ("x-novie-workflow-id", "x-novie-workflow-id"),
         ("x-novie-thread-id", "x-novie-thread-id"),

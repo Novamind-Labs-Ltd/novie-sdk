@@ -115,7 +115,29 @@ def test_platform_namespace_exposes_openai_proxy_headers(monkeypatch) -> None:
     assert ns.openai_base_url == "http://platform.test/v1"
     headers = ns.openai_headers(path="/v1/chat/completions")
     assert headers["x-novie-org-id"] == "tenant-1"
+    assert headers["x-novie-service-principal"] == "agent:demo"
+    assert headers["x-novie-on-behalf-of-user-id"] == "user-1"
+    assert "x-novie-user-id" not in headers
     assert headers["x-novie-sig"].startswith("sha256=")
+
+    platform_headers = ns.platform_headers(method="POST", path="/invocations")
+    assert platform_headers["x-novie-user-id"] == "user-1"
+    assert "x-novie-service-principal" not in platform_headers
+
+
+def test_openai_proxy_preserves_explicit_billing_user(monkeypatch) -> None:
+    monkeypatch.setenv("NOVIE_AGENT_PLATFORM_SHARED_SECRET", "secret")
+    ns = _build_with_responder(
+        lambda request: httpx.Response(200, json={"ok": True}),
+        incoming=_incoming_headers(
+            **{"x-novie-on-behalf-of-user-id": "billing-user"}
+        ),
+        agent_id="analyst",
+    )
+
+    headers = ns.openai_headers(path="/v1/chat/completions")
+    assert headers["x-novie-service-principal"] == "agent:analyst"
+    assert headers["x-novie-on-behalf-of-user-id"] == "billing-user"
 
 
 def _ok_envelope(result: dict[str, Any]) -> dict[str, Any]:

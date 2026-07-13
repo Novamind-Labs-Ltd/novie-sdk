@@ -2256,9 +2256,14 @@ def build_platform_namespace(
         timeout_seconds=timeout_seconds,
         client=client,
     )
+    llm_headers = dict(forward_headers)
+    user_id = llm_headers.pop("x-novie-user-id", "")
+    llm_headers["x-novie-service-principal"] = f"agent:{agent_id}"
+    if user_id:
+        llm_headers.setdefault("x-novie-on-behalf-of-user-id", user_id)
     llm_caller = _CapabilityCaller(
         base,
-        forward_headers,
+        llm_headers,
         agent_id=agent_id,
         timeout_seconds=llm_timeout_seconds,
         client=client,
