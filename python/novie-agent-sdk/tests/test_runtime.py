@@ -1391,6 +1391,86 @@ def test_stream_endpoint_rejects_top_level_failed_done_without_output_mapping():
     assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
 
 
+def test_stream_endpoint_rejects_nested_failed_status_event():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-status-failure"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {
+            "kind": "status_changed",
+            "payload": {
+                "status": "FAILED",
+                "error": "RAW_SECRET_USER_PROMPT",
+                "draft": "RAW_SECRET_USER_PROMPT",
+            },
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as response:
+        events = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in events] == ["terminal_error"]
+    assert events[0]["error"] == "Agent execution failed."
+    assert events[0]["error_code"] == "agent_internal_error"
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
+
+
+def test_stream_endpoint_rejects_failed_metadata_and_ignores_empty_error():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-metadata-failure"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "safe", "error": None}
+        yield {
+            "kind": "trace",
+            "metadata": {
+                "status": "FAILED",
+                "error": "RAW_SECRET_USER_PROMPT",
+            },
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as response:
+        events = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in events] == ["content", "terminal_error"]
+    assert events[-1]["error"] == "Agent execution failed."
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
+
+
+def test_invoke_endpoint_rejects_nested_failed_output():
+    from fastapi.testclient import TestClient
+
+    agent = Agent(_simple_manifest("invoke-nested-failure"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext) -> dict[str, Any]:
+        return {
+            "output": {
+                "status": "FAILED",
+                "error": "RAW_SECRET_USER_PROMPT",
+                "draft": "RAW_SECRET_USER_PROMPT",
+            }
+        }
+
+    response = TestClient(agent.build_app()).post(
+        "/invoke", json={"input": {"q": "x"}}
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Agent execution failed.",
+        "error_code": "agent_internal_error",
+        "output": {},
+    }
+
+
 def test_invoke_handler_failure_stores_only_safe_error():
     from fastapi.testclient import TestClient
 
