@@ -467,6 +467,101 @@ async def test_sectioned_author_degrades_workpad_record_failure_after_artifact_w
 
 
 @pytest.mark.asyncio
+async def test_fail_closed_artifact_error_event_does_not_echo_provider_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from novie_agent_sdk import sectioned_authoring as module
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    phase_events: list[dict[str, Any]] = []
+
+    async def fail_create(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(module, "_create_and_record_strict", fail_create)
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.architect.create_architecture",
+        phase_event_sink=phase_events.append,
+    )
+
+    with pytest.raises(RuntimeError, match=marker):
+        await author._record_artifact_with_events(
+            artifact_type="example_document",
+            role="final",
+            content="final body",
+            kind="final_report",
+            title="Final report",
+            content_type="text/markdown",
+            summary="summary",
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="architect",
+            metadata={},
+            workpad_metadata={},
+        )
+
+    error_events = [event for event in phase_events if event["event"] == "agent.tool_error"]
+    assert error_events
+    assert error_events[0]["message"] == "operation failed"
+    assert marker not in str(error_events)
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_workpad_degradation_does_not_echo_provider_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from novie_agent_sdk import sectioned_authoring as module
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    phase_events: list[dict[str, Any]] = []
+
+    async def create_with_raw_workpad(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "artifact": {"artifact_ref": "artifact://final-1"},
+            "workpad": {"available": False, "error": marker, "message": marker},
+        }
+
+    monkeypatch.setattr(module, "_create_and_record_strict", create_with_raw_workpad)
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.pm.prd_create",
+        phase_event_sink=phase_events.append,
+    )
+
+    await author._record_artifact_with_events(
+        artifact_type="example_document",
+        role="final",
+        content="final body",
+        kind="final_report",
+        title="Final report",
+        content_type="text/markdown",
+        summary="summary",
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="pm",
+        metadata={},
+        workpad_metadata={},
+    )
+
+    degraded = [
+        event
+        for event in phase_events
+        if event["event"] == "artifact.write.workpad_degraded"
+    ]
+    assert degraded
+    assert degraded[0]["error"] == "workpad_record_unavailable"
+    assert degraded[0]["message"] == "workpad unavailable"
+    assert marker not in str(degraded)
+
+
+@pytest.mark.asyncio
 async def test_run_sectioned_document_finalization_returns_trace_and_quality(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]

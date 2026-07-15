@@ -113,7 +113,10 @@ def _build_ctx_platform_and_llm(
         llm = build_llm_facade(platform_ns, agent_id=agent_id, observability=observability)
         return platform_ns, llm
     except Exception as exc:  # noqa: BLE001 — best-effort
-        _log.debug("ctx platform/llm build failed: %s", exc)
+        _log.debug(
+            "ctx platform/llm build failed exception_type=%s",
+            type(exc).__name__,
+        )
         return None, None
 
 
@@ -700,18 +703,32 @@ class OneShotInvocationStore(Protocol):
         idempotency_key: str,
         mode: str,
         *,
+        invocation_id: str | None = None,
         response: dict[str, Any] | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None: ...
 
-    async def fail(self, idempotency_key: str, mode: str, error: str) -> None: ...
+    async def fail(
+        self,
+        idempotency_key: str,
+        mode: str,
+        error: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None: ...
 
     async def get_by_invocation_id(
         self,
         invocation_id: str,
     ) -> OneShotInvocationRecord | None: ...
 
-    async def touch(self, idempotency_key: str, mode: str) -> None:
+    async def touch(
+        self,
+        idempotency_key: str,
+        mode: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None:
         """Renew the lease on an ``in_progress`` record. No-op if record is
         absent or already in a terminal state. Adopters can implement this as
         a no-op if they don't need lease-based recovery."""
@@ -764,6 +781,7 @@ class InMemoryOneShotInvocationStore:
         idempotency_key: str,
         mode: str,
         *,
+        invocation_id: str | None = None,
         response: dict[str, Any] | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -771,16 +789,32 @@ class InMemoryOneShotInvocationStore:
             record = self._records.get((mode, idempotency_key))
             if record is None:
                 return
+            if invocation_id is not None:
+                if record.invocation_id != invocation_id:
+                    return
+                if record.status not in {"in_progress", "completed"}:
+                    return
+            elif record.status != "in_progress":
+                return
             record.status = "completed"
             record.updated_at = _now_iso()
             record.response = response
             record.events = list(events or [])
             record.error = None
 
-    async def fail(self, idempotency_key: str, mode: str, error: str) -> None:
+    async def fail(
+        self,
+        idempotency_key: str,
+        mode: str,
+        error: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None:
         async with self._lock:
             record = self._records.get((mode, idempotency_key))
-            if record is None:
+            if record is None or record.status != "in_progress":
+                return
+            if invocation_id is not None and record.invocation_id != invocation_id:
                 return
             record.status = "failed"
             record.updated_at = _now_iso()
@@ -796,12 +830,20 @@ class InMemoryOneShotInvocationStore:
                     return record
         return None
 
-    async def touch(self, idempotency_key: str, mode: str) -> None:
+    async def touch(
+        self,
+        idempotency_key: str,
+        mode: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None:
         """Renew the lease on an ``in_progress`` record. Silent no-op for
         absent records or those already in a terminal state."""
         async with self._lock:
             record = self._records.get((mode, idempotency_key))
             if record is None or record.status != "in_progress":
+                return
+            if invocation_id is not None and record.invocation_id != invocation_id:
                 return
             record.updated_at = _now_iso()
 
@@ -860,6 +902,7 @@ class SqliteOneShotInvocationStore:
                             invocation_id = ?,
                             created_at = ?,
                             updated_at = ?,
+                            state_version = 1,
                             response_json = NULL,
                             events_json = NULL,
                             error = NULL
@@ -887,8 +930,8 @@ class SqliteOneShotInvocationStore:
                 """
                 INSERT INTO sdk_one_shot_invocations (
                     mode, idempotency_key, invocation_id, status, created_at, updated_at,
-                    response_json, events_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    response_json, events_json, error, state_version
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1)
                 """,
                 (
                     mode,
@@ -907,6 +950,7 @@ class SqliteOneShotInvocationStore:
         idempotency_key: str,
         mode: str,
         *,
+        invocation_id: str | None = None,
         response: dict[str, Any] | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -914,6 +958,7 @@ class SqliteOneShotInvocationStore:
             self._complete_sync,
             idempotency_key,
             mode,
+            invocation_id,
             response,
             list(events or []),
         )
@@ -922,10 +967,20 @@ class SqliteOneShotInvocationStore:
         self,
         idempotency_key: str,
         mode: str,
+        invocation_id: str | None,
         response: dict[str, Any] | None,
         events: list[dict[str, Any]],
     ) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            where = "mode = ? AND idempotency_key = ? AND status = 'in_progress'"
+            params: list[Any] = [mode, idempotency_key]
+            if invocation_id is not None:
+                where = (
+                    "mode = ? AND idempotency_key = ? "
+                    "AND status IN ('in_progress', 'completed') "
+                    "AND invocation_id = ?"
+                )
+                params.append(invocation_id)
             conn.execute(
                 """
                 UPDATE sdk_one_shot_invocations
@@ -933,31 +988,51 @@ class SqliteOneShotInvocationStore:
                     updated_at = ?,
                     response_json = ?,
                     events_json = ?,
+                    state_version = 1,
                     error = NULL
-                WHERE mode = ? AND idempotency_key = ?
-                """,
+                WHERE """
+                + where,
                 (
                     _now_iso(),
                     json.dumps(response) if response is not None else None,
                     json.dumps(events),
-                    mode,
-                    idempotency_key,
+                    *params,
                 ),
             )
             conn.commit()
 
-    async def fail(self, idempotency_key: str, mode: str, error: str) -> None:
-        await asyncio.to_thread(self._fail_sync, idempotency_key, mode, error)
+    async def fail(
+        self,
+        idempotency_key: str,
+        mode: str,
+        error: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._fail_sync, idempotency_key, mode, error, invocation_id,
+        )
 
-    def _fail_sync(self, idempotency_key: str, mode: str, error: str) -> None:
+    def _fail_sync(
+        self,
+        idempotency_key: str,
+        mode: str,
+        error: str,
+        invocation_id: str | None,
+    ) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            where = "mode = ? AND idempotency_key = ? AND status = 'in_progress'"
+            params: list[Any] = [mode, idempotency_key]
+            if invocation_id is not None:
+                where += " AND invocation_id = ?"
+                params.append(invocation_id)
             conn.execute(
                 """
                 UPDATE sdk_one_shot_invocations
-                SET status = 'failed', updated_at = ?, error = ?
-                WHERE mode = ? AND idempotency_key = ?
-                """,
-                (_now_iso(), error, mode, idempotency_key),
+                SET status = 'failed', updated_at = ?, error = ?, state_version = 1
+                WHERE """
+                + where,
+                (_now_iso(), error, *params),
             )
             conn.commit()
 
@@ -982,19 +1057,36 @@ class SqliteOneShotInvocationStore:
             ).fetchone()
             return self._row_to_record(row) if row is not None else None
 
-    async def touch(self, idempotency_key: str, mode: str) -> None:
-        await asyncio.to_thread(self._touch_sync, idempotency_key, mode)
+    async def touch(
+        self,
+        idempotency_key: str,
+        mode: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._touch_sync, idempotency_key, mode, invocation_id,
+        )
 
-    def _touch_sync(self, idempotency_key: str, mode: str) -> None:
+    def _touch_sync(
+        self,
+        idempotency_key: str,
+        mode: str,
+        invocation_id: str | None,
+    ) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            where = "mode = ? AND idempotency_key = ? AND status = 'in_progress'"
+            params: list[Any] = [mode, idempotency_key]
+            if invocation_id is not None:
+                where += " AND invocation_id = ?"
+                params.append(invocation_id)
             conn.execute(
                 """
                 UPDATE sdk_one_shot_invocations
                 SET updated_at = ?
-                WHERE mode = ? AND idempotency_key = ?
-                  AND status = 'in_progress'
-                """,
-                (_now_iso(), mode, idempotency_key),
+                WHERE """
+                + where,
+                (_now_iso(), *params),
             )
             conn.commit()
 
@@ -1008,9 +1100,21 @@ class SqliteOneShotInvocationStore:
             status=str(row["status"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
-            response=json.loads(str(response_raw)) if response_raw else None,
-            events=json.loads(str(events_raw)) if events_raw else None,
-            error=str(row["error"]) if row["error"] is not None else None,
+            response=(
+                json.loads(str(response_raw))
+                if response_raw and int(row["state_version"] or 0) >= 1
+                else None
+            ),
+            events=(
+                json.loads(str(events_raw))
+                if events_raw and int(row["state_version"] or 0) >= 1
+                else None
+            ),
+            error=(
+                str(row["error"])
+                if row["error"] is not None and int(row["state_version"] or 0) >= 1
+                else None
+            ),
         )
 
     def _ensure_schema(self) -> None:
@@ -1027,6 +1131,7 @@ class SqliteOneShotInvocationStore:
                     response_json TEXT,
                     events_json TEXT,
                     error TEXT,
+                    state_version INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (mode, idempotency_key)
                 )
                 """,
@@ -1035,6 +1140,11 @@ class SqliteOneShotInvocationStore:
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(sdk_one_shot_invocations)")
             }
+            if "state_version" not in columns:
+                conn.execute(
+                    "ALTER TABLE sdk_one_shot_invocations "
+                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+                )
             if "invocation_id" not in columns:
                 conn.execute(
                     "ALTER TABLE sdk_one_shot_invocations "
@@ -1108,9 +1218,18 @@ def _has_nonempty_error(value: Any) -> bool:
     return True
 
 
-def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
+def _failure_envelope(
+    envelope: Any,
+    *,
+    _seen: set[int] | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(envelope, dict):
         return None
+    seen = _seen if _seen is not None else set()
+    envelope_id = id(envelope)
+    if envelope_id in seen:
+        return None
+    seen.add(envelope_id)
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
     terminal_kind = kind in {
@@ -1122,14 +1241,17 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
         or _has_nonempty_error(envelope.get("error"))
     ):
         return envelope
-    for key in ("output", "payload", "metadata"):
-        nested = _failure_envelope(envelope.get(key))
-        if nested is not None:
-            return nested
-    for item in envelope.values():
-        if isinstance(item, list):
-            for nested_item in item:
-                nested = _failure_envelope(nested_item)
+    # Providers have historically wrapped terminal envelopes under arbitrary
+    # keys (for example ``result`` or ``data``). Walk every JSON container so
+    # a failed payload cannot bypass the public error boundary.
+    for nested_value in envelope.values():
+        if isinstance(nested_value, dict):
+            nested = _failure_envelope(nested_value, _seen=seen)
+            if nested is not None:
+                return nested
+        elif isinstance(nested_value, (list, tuple)):
+            for nested_item in nested_value:
+                nested = _failure_envelope(nested_item, _seen=seen)
                 if nested is not None:
                     return nested
     return None
@@ -1151,8 +1273,17 @@ def _safe_failure_response(envelope: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sanitized_replay_events(events: list[Any]) -> list[dict[str, Any]]:
+def _sanitized_replay_events(
+    events: list[Any],
+    *,
+    stop_at_terminal: bool = False,
+    terminal_kinds: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
     safe_events: list[dict[str, Any]] = []
+    terminal_seen = False
+    terminal_kinds = terminal_kinds or frozenset({
+        "final", "artifact", "needs_confirmation", "task_completed",
+    })
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -1168,7 +1299,17 @@ def _sanitized_replay_events(events: list[Any]) -> list[dict[str, Any]]:
                     "metadata": {"terminal_source": "sdk_replay_guard"},
                 }
             ]
+        event_kind = str(event.get("kind") or event.get("type") or "").strip().lower()
+        if stop_at_terminal and terminal_seen and event_kind != "done":
+            break
         safe_events.append(event)
+        # Mixed-version durable rows may contain draft/prompt-bearing frames
+        # after a terminal event. Replay only the public terminal prefix; new
+        # live streams already stop at the same boundary.
+        if stop_at_terminal and event_kind in terminal_kinds:
+            terminal_seen = True
+        elif stop_at_terminal and event_kind == "done":
+            break
     return safe_events
 
 
@@ -1186,7 +1327,9 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
             text = str(event.get("content") or event.get("text") or "")
             if text:
                 chunks.append(text)
-        if kind in {"done", "final", "task_completed"}:
+        if kind in {"artifact", "needs_confirmation"}:
+            final_output = dict(event)
+        elif kind in {"done", "final", "task_completed"}:
             output = event.get("output")
             if isinstance(output, dict) and output:
                 final_output = dict(output)
@@ -1455,34 +1598,46 @@ class InMemoryTaskStore:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            if task.status in TERMINAL_STATUSES:
+                return
             task.result = result
             task.status = status
             task.updated_at = _now_iso()
+            if status != "completed":
+                # A failed/cancelled task must not retain pre-terminal draft
+                # events in the durable task history.
+                self._events[task_id] = []
+            self._events[task_id].append(
+                _make_event(
+                    task_id,
+                    "task_completed" if status == "completed" else "task_failed",
+                    {},
+                    "",
+                )
+            )
             cond = self._status_waiters.get(task_id)
         if cond:
             async with cond:
                 cond.notify_all()
-        await self.append_event(
-            task_id,
-            _make_event(task_id, "task_completed" if status == "completed" else "task_failed", {}, ""),
-        )
 
     async def set_task_error(self, task_id: str, error: str) -> None:
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 return
+            if task.status in TERMINAL_STATUSES:
+                return
             task.error = error
             task.status = "failed"
             task.updated_at = _now_iso()
+            self._events[task_id] = []
+            self._events[task_id].append(
+                _make_event(task_id, "task_failed", {"error": error}, error[:200])
+            )
             cond = self._status_waiters.get(task_id)
         if cond:
             async with cond:
                 cond.notify_all()
-        await self.append_event(
-            task_id,
-            _make_event(task_id, "task_failed", {"error": error}, error[:200]),
-        )
 
     async def cancel_task(self, task_id: str) -> bool:
         """取消 task。返回 True 如果成功取消。"""
@@ -1494,6 +1649,7 @@ class InMemoryTaskStore:
                 return False
             task.status = "cancelled"
             task.updated_at = _now_iso()
+            self._events[task_id] = []
             cond = self._status_waiters.get(task_id)
         if cond:
             async with cond:
@@ -1502,7 +1658,8 @@ class InMemoryTaskStore:
 
     async def append_event(self, task_id: str, event: dict[str, Any]) -> None:
         async with self._lock:
-            if task_id in self._events:
+            task = self._tasks.get(task_id)
+            if task is not None and task.status not in TERMINAL_STATUSES:
                 self._events[task_id].append(event)
 
     async def get_events(self, task_id: str) -> list[dict[str, Any]]:
@@ -1614,8 +1771,9 @@ class SqliteTaskStore:
             conn.execute(
                 """
                 INSERT INTO sdk_tasks (
-                    task_id, status, created_at, updated_at, input_json, idempotency_key, result_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                    task_id, status, created_at, updated_at, input_json, idempotency_key,
+                    result_json, error, state_version
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 1)
                 """,
                 (
                     record.task_id,
@@ -1667,31 +1825,67 @@ class SqliteTaskStore:
         status: str = "completed",
     ) -> None:
         await asyncio.to_thread(self._set_task_result_sync, task_id, result, status)
-        await self.append_event(
-            task_id,
-            _make_event(task_id, "task_completed" if status == "completed" else "task_failed", {}, ""),
-        )
 
     def _set_task_result_sync(self, task_id: str, result: dict[str, Any], status: str) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            now = _now_iso()
+            terminal_statuses = tuple(sorted(TERMINAL_STATUSES))
+            placeholders = ",".join("?" for _ in terminal_statuses)
+            updated = conn.execute(
+                "UPDATE sdk_tasks SET status = ?, result_json = ?, state_version = 1, updated_at = ? "
+                f"WHERE task_id = ? AND status NOT IN ({placeholders})",
+                (status, json.dumps(result), now, task_id, *terminal_statuses),
+            )
+            if updated.rowcount == 0:
+                conn.rollback()
+                return
+            if status != "completed":
+                conn.execute("DELETE FROM sdk_task_events WHERE task_id = ?", (task_id,))
             conn.execute(
-                "UPDATE sdk_tasks SET status = ?, result_json = ?, updated_at = ? WHERE task_id = ?",
-                (status, json.dumps(result), _now_iso(), task_id),
+                "INSERT INTO sdk_task_events (task_id, event_json, created_at, state_version) VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    json.dumps(
+                        _make_event(
+                            task_id,
+                            "task_completed" if status == "completed" else "task_failed",
+                            {},
+                            "",
+                        )
+                    ),
+                    now,
+                    1,
+                ),
             )
             conn.commit()
 
     async def set_task_error(self, task_id: str, error: str) -> None:
         await asyncio.to_thread(self._set_task_error_sync, task_id, error)
-        await self.append_event(
-            task_id,
-            _make_event(task_id, "task_failed", {"error": error}, error[:200]),
-        )
 
     def _set_task_error_sync(self, task_id: str, error: str) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            now = _now_iso()
+            terminal_statuses = tuple(sorted(TERMINAL_STATUSES))
+            placeholders = ",".join("?" for _ in terminal_statuses)
+            updated = conn.execute(
+                "UPDATE sdk_tasks SET status = 'failed', error = ?, state_version = 1, updated_at = ? "
+                f"WHERE task_id = ? AND status NOT IN ({placeholders})",
+                (error, now, task_id, *terminal_statuses),
+            )
+            if updated.rowcount == 0:
+                conn.rollback()
+                return
+            conn.execute("DELETE FROM sdk_task_events WHERE task_id = ?", (task_id,))
             conn.execute(
-                "UPDATE sdk_tasks SET status = 'failed', error = ?, updated_at = ? WHERE task_id = ?",
-                (error, _now_iso(), task_id),
+                "INSERT INTO sdk_task_events (task_id, event_json, created_at, state_version) VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    json.dumps(
+                        _make_event(task_id, "task_failed", {"error": error}, error[:200])
+                    ),
+                    now,
+                    1,
+                ),
             )
             conn.commit()
 
@@ -1711,6 +1905,7 @@ class SqliteTaskStore:
                 "UPDATE sdk_tasks SET status = 'cancelled', updated_at = ? WHERE task_id = ?",
                 (_now_iso(), task_id),
             )
+            conn.execute("DELETE FROM sdk_task_events WHERE task_id = ?", (task_id,))
             conn.commit()
             return True
 
@@ -1719,9 +1914,14 @@ class SqliteTaskStore:
 
     def _append_event_sync(self, task_id: str, event: dict[str, Any]) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM sdk_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None or str(row[0]) in TERMINAL_STATUSES:
+                return
             conn.execute(
-                "INSERT INTO sdk_task_events (task_id, event_json, created_at) VALUES (?, ?, ?)",
-                (task_id, json.dumps(event), _now_iso()),
+                "INSERT INTO sdk_task_events (task_id, event_json, created_at, state_version) VALUES (?, ?, ?, ?)",
+                (task_id, json.dumps(event), _now_iso(), 1),
             )
             conn.commit()
 
@@ -1732,7 +1932,8 @@ class SqliteTaskStore:
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT event_json FROM sdk_task_events WHERE task_id = ? ORDER BY id ASC",
+                "SELECT event_json FROM sdk_task_events "
+                "WHERE task_id = ? AND state_version >= 1 ORDER BY id ASC",
                 (task_id,),
             ).fetchall()
         out: list[dict[str, Any]] = []
@@ -1746,8 +1947,15 @@ class SqliteTaskStore:
     def _get_result_sync(self, task_id: str) -> dict[str, Any] | None:
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT result_json FROM sdk_tasks WHERE task_id = ?", (task_id,)).fetchone()
-            if row is None or row["result_json"] is None:
+            row = conn.execute(
+                "SELECT result_json, state_version FROM sdk_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["result_json"] is None
+                or int(row["state_version"] or 0) < 1
+            ):
                 return None
             return json.loads(str(row["result_json"]))
 
@@ -1853,6 +2061,7 @@ class SqliteTaskStore:
         return json.loads(str(row["resolution_json"]))
 
     def _row_to_task_record(self, row: sqlite3.Row) -> TaskRecord:
+        state_version = int(row["state_version"] or 0)
         return TaskRecord(
             task_id=str(row["task_id"]),
             status=str(row["status"]),
@@ -1860,8 +2069,16 @@ class SqliteTaskStore:
             updated_at=str(row["updated_at"]),
             input=json.loads(str(row["input_json"] or "{}")),
             idempotency_key=str(row["idempotency_key"] or ""),
-            result=json.loads(str(row["result_json"])) if row["result_json"] else None,
-            error=str(row["error"]) if row["error"] is not None else None,
+            result=(
+                json.loads(str(row["result_json"]))
+                if row["result_json"] and state_version >= 1
+                else None
+            ),
+            error=(
+                str(row["error"])
+                if row["error"] is not None and state_version >= 1
+                else None
+            ),
         )
 
     def _ensure_schema(self) -> None:
@@ -1876,7 +2093,8 @@ class SqliteTaskStore:
                     input_json TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL DEFAULT '',
                     result_json TEXT,
-                    error TEXT
+                    error TEXT,
+                    state_version INTEGER NOT NULL DEFAULT 1
                 )
                 """,
             )
@@ -1889,10 +2107,28 @@ class SqliteTaskStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
                     event_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1
                 )
                 """,
             )
+            task_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(sdk_tasks)")
+            }
+            if "state_version" not in task_columns:
+                conn.execute(
+                    "ALTER TABLE sdk_tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+                )
+            event_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(sdk_task_events)")
+            }
+            if "state_version" not in event_columns:
+                conn.execute(
+                    "ALTER TABLE sdk_task_events "
+                    "ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sdk_task_ask_resolutions (
@@ -2211,7 +2447,10 @@ class Agent:
                 raise HTTPException(404, f"Invocation {invocation_id!r} not found")
             return {
                 **_one_shot_invocation_view(record),
-                "events": _sanitized_replay_events(list(record.events or [])),
+                "events": _sanitized_replay_events(
+                    list(record.events or []),
+                    stop_at_terminal=record.mode == "stream",
+                ),
             }
 
         @app.get("/invocations/{invocation_id}/result")
@@ -2233,11 +2472,19 @@ class Agent:
                         "status": record.status,
                     },
                 )
-            response = (
-                _coerce_invoke_response(record.response)
-                if record.response is not None
-                else _stream_response_from_events(list(record.events or []))
-            )
+            if record.mode == "stream":
+                response = _stream_response_from_events(
+                    _sanitized_replay_events(
+                        list(record.events or []),
+                        stop_at_terminal=True,
+                    )
+                )
+            else:
+                response = (
+                    _coerce_invoke_response(record.response)
+                    if record.response is not None
+                    else _stream_response_from_events(list(record.events or []))
+                )
             return {
                 **_one_shot_invocation_view(record),
                 **response,
@@ -2256,11 +2503,14 @@ class Agent:
                 )
                 validate_tenant_context(hdrs)
                 started_invocation = False
+                invocation_id: str | None = None
                 if hdrs.idempotency_key:
                     started_invocation, invocation = await self._invocation_store.start_or_get(
                         hdrs.idempotency_key,
                         "invoke",
                     )
+                    if started_invocation:
+                        invocation_id = invocation.invocation_id
                     if not started_invocation:
                         if invocation.status == "completed" and invocation.response is not None:
                             return _coerce_invoke_response(invocation.response)
@@ -2294,6 +2544,7 @@ class Agent:
                                 hdrs.idempotency_key,
                                 "invoke",
                                 public_error.public_message,
+                                invocation_id=invocation_id,
                             )
                             invocation_resolved = True
                         if isinstance(exc, PublicAgentError):
@@ -2314,11 +2565,13 @@ class Agent:
                                 hdrs.idempotency_key,
                                 "invoke",
                                 str(response.get("error") or "Agent execution failed."),
+                                invocation_id=invocation_id,
                             )
                         else:
                             await self._invocation_store.complete(
                                 hdrs.idempotency_key,
                                 "invoke",
+                                invocation_id=invocation_id,
                                 response=response,
                             )
                         invocation_resolved = True
@@ -2339,6 +2592,7 @@ class Agent:
                                 hdrs.idempotency_key,
                                 "invoke",
                                 "invoke_aborted_before_terminal",
+                                invocation_id=invocation_id,
                             )
                         except Exception:  # noqa: BLE001
                             _log.exception(
@@ -2361,15 +2615,21 @@ class Agent:
                 )
                 validate_tenant_context(hdrs)
                 started_invocation = False
+                invocation_id: str | None = None
                 if hdrs.idempotency_key:
                     started_invocation, invocation = await self._invocation_store.start_or_get(
                         hdrs.idempotency_key,
                         "stream",
                     )
+                    if started_invocation:
+                        invocation_id = invocation.invocation_id
                     if not started_invocation:
                         if invocation.status == "completed" and invocation.events is not None:
                             async def _replay() -> AsyncIterator[bytes]:
-                                for event in _sanitized_replay_events(list(invocation.events or [])):
+                                for event in _sanitized_replay_events(
+                                    list(invocation.events or []),
+                                    stop_at_terminal=True,
+                                ):
                                     yield (json.dumps(event) + "\n").encode()
 
                             return StreamingResponse(
@@ -2413,6 +2673,7 @@ class Agent:
                 async def _gen() -> AsyncIterator[bytes]:
                     emitted_events: list[dict[str, Any]] = []
                     terminal_error_emitted = False
+                    terminal_event_emitted = False
                     invocation_resolved = False
                     events_since_touch = 0
                     last_event_at = time.monotonic()
@@ -2431,6 +2692,7 @@ class Agent:
                         try:
                             await self._invocation_store.touch(
                                 hdrs.idempotency_key, "stream",
+                                invocation_id=invocation_id,
                             )
                         except Exception:  # noqa: BLE001
                             # Heartbeat failure is non-fatal; the lease will
@@ -2508,6 +2770,7 @@ class Agent:
                                         hdrs.idempotency_key,
                                         "stream",
                                         public_error.public_message,
+                                        invocation_id=invocation_id,
                                     )
                                     invocation_resolved = True
                                 yield (json.dumps(error_event) + "\n").encode()
@@ -2537,6 +2800,7 @@ class Agent:
                                             hdrs.idempotency_key,
                                             "stream",
                                             public_error.public_message,
+                                            invocation_id=invocation_id,
                                         )
                                         invocation_resolved = True
                                     yield (json.dumps(safe_event) + "\n").encode()
@@ -2581,13 +2845,45 @@ class Agent:
                                         hdrs.idempotency_key,
                                         "stream",
                                         public_error.public_message,
+                                        invocation_id=invocation_id,
                                     )
                                     invocation_resolved = True
                                 yield (json.dumps(safe_event) + "\n").encode()
                                 break
                             emitted_events.append(event)
+                            if event_kind in {
+                                "final",
+                                "task_completed",
+                                "done",
+                                "artifact",
+                                "needs_confirmation",
+                            }:
+                                terminal_event_emitted = True
+                            if (
+                                terminal_event_emitted
+                                and started_invocation
+                                and hdrs.idempotency_key
+                            ):
+                                # ``final`` is terminal from the caller's
+                                # perspective. Persist completion before the
+                                # yield so a client that closes immediately
+                                # cannot strand the invocation as failed in
+                                # the generator's disconnect cleanup.
+                                await self._invocation_store.complete(
+                                    hdrs.idempotency_key,
+                                    "stream",
+                                    invocation_id=invocation_id,
+                                    response=_stream_response_from_events(emitted_events),
+                                    events=emitted_events,
+                                )
+                                invocation_resolved = True
                             last_event_at = time.monotonic()
                             yield (json.dumps(event) + "\n").encode()
+                            if terminal_event_emitted:
+                                # A terminal event closes the handler stream.
+                                # Do not forward queued post-final content, which
+                                # could contain a raw draft or prompt.
+                                break
                             await _maybe_heartbeat()
                         if not terminal_error_emitted:
                             done_event = {
@@ -2600,6 +2896,7 @@ class Agent:
                                 await self._invocation_store.complete(
                                     hdrs.idempotency_key,
                                     "stream",
+                                    invocation_id=invocation_id,
                                     response=_stream_response_from_events(emitted_events),
                                     events=emitted_events,
                                 )
@@ -2627,6 +2924,7 @@ class Agent:
                                     hdrs.idempotency_key,
                                     "stream",
                                     "stream_aborted_before_terminal",
+                                    invocation_id=invocation_id,
                                 )
                             except Exception:  # noqa: BLE001
                                 _log.exception(
@@ -2722,7 +3020,11 @@ class Agent:
                 events = await self._store.get_events(task_id)
                 return {
                     "task_id": task_id,
-                    "events": _sanitized_replay_events(events),
+                    "events": _sanitized_replay_events(
+                        events,
+                        stop_at_terminal=True,
+                        terminal_kinds=frozenset({"final", "task_completed", "done"}),
+                    ),
                 }
 
             @app.post("/tasks/{task_id}/asks/{gate_id}/resolve", status_code=202)
@@ -2838,10 +3140,16 @@ class Agent:
         except asyncio.CancelledError:
             await self._store.cancel_task(task_id)
         except Exception as exc:
-            _log.exception("Task handler raised exception task_id=%s", task_id)
+            public_error = public_error_fields(exc)
+            _log.error(
+                "Task handler raised exception task_id=%s exception_type=%s error_code=%s",
+                task_id,
+                type(exc).__name__,
+                public_error.error_code,
+            )
             await self._store.set_task_error(
                 task_id,
-                public_error_fields(exc).public_message,
+                public_error.public_message,
             )
         finally:
             self._cancel_events.pop(task_id, None)

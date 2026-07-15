@@ -73,6 +73,17 @@ KNOWN_FINALIZATION_MODES = frozenset({
 _TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 
 
+def _is_fail_closed_document_capability_id(capability_id: Any) -> bool:
+    value = str(capability_id or "").strip().lower()
+    return value.startswith(("agent.architect.", "agent.pm."))
+
+
+def _safe_exception_message(capability_id: Any, exc: BaseException) -> str:
+    if _is_fail_closed_document_capability_id(capability_id):
+        return "operation failed"
+    return str(exc)
+
+
 class _StreamedLlmText(NamedTuple):
     """Text plus completion metadata from one ``_stream_llm_text`` call.
 
@@ -1172,14 +1183,15 @@ class SectionedLongformAuthor:
                     if content:
                         saw_delta = True
                         chunks.append(content)
-                        await self._emit(
-                            "agent.llm_call.delta",
-                            **attempt_metadata,
-                            text_delta=content,
-                            preview=_preview(content, limit=240),
-                            chars_in_chunk=len(content),
-                            chars_total=len(content),
-                        )
+                        if not _is_fail_closed_document_capability_id(self._capability_id):
+                            await self._emit(
+                                "agent.llm_call.delta",
+                                **attempt_metadata,
+                                text_delta=content,
+                                preview=_preview(content, limit=240),
+                                chars_in_chunk=len(content),
+                                chars_total=len(content),
+                            )
                     completed_result = result if isinstance(result, Mapping) else {}
                 else:
                     async for event in stream_text(
@@ -1192,14 +1204,15 @@ class SectionedLongformAuthor:
                         if delta:
                             saw_delta = True
                             chunks.append(delta)
-                            await self._emit(
-                                "agent.llm_call.delta",
-                                **attempt_metadata,
-                                text_delta=delta,
-                                preview=_preview(delta, limit=240),
-                                chars_in_chunk=len(delta),
-                                chars_total=sum(len(chunk) for chunk in chunks),
-                            )
+                            if not _is_fail_closed_document_capability_id(self._capability_id):
+                                await self._emit(
+                                    "agent.llm_call.delta",
+                                    **attempt_metadata,
+                                    text_delta=delta,
+                                    preview=_preview(delta, limit=240),
+                                    chars_in_chunk=len(delta),
+                                    chars_total=sum(len(chunk) for chunk in chunks),
+                                )
                         result = _llm_stream_event_result(event)
                         if result is not None:
                             completed_result = result
@@ -1212,7 +1225,7 @@ class SectionedLongformAuthor:
                         **attempt_metadata,
                         status="retrying",
                         error=type(exc).__name__,
-                        message=str(exc),
+                        message=_safe_exception_message(self._capability_id, exc),
                         chars_total=chars_total,
                         next_attempt=attempt + 1,
                     )
@@ -1225,7 +1238,7 @@ class SectionedLongformAuthor:
                     **attempt_metadata,
                     status="failed",
                     error=type(exc).__name__,
-                    message=str(exc),
+                    message=_safe_exception_message(self._capability_id, exc),
                     chars_total=chars_total,
                 )
                 raise
@@ -1236,14 +1249,15 @@ class SectionedLongformAuthor:
                 if final_content:
                     content = final_content
                     if not saw_delta:
-                        await self._emit(
-                            "agent.llm_call.delta",
-                            **attempt_metadata,
-                            text_delta=final_content,
-                            preview=_preview(final_content, limit=240),
-                            chars_in_chunk=len(final_content),
-                            chars_total=len(final_content),
-                        )
+                        if not _is_fail_closed_document_capability_id(self._capability_id):
+                            await self._emit(
+                                "agent.llm_call.delta",
+                                **attempt_metadata,
+                                text_delta=final_content,
+                                preview=_preview(final_content, limit=240),
+                                chars_in_chunk=len(final_content),
+                                chars_total=len(final_content),
+                            )
             finish_reason = _finish_reason_of(completed_result)
             truncated = finish_reason in _TRUNCATION_FINISH_REASONS
             await self._emit(
@@ -1306,7 +1320,7 @@ class SectionedLongformAuthor:
                 llm_purpose="build_outline",
                 status="failed",
                 error=type(exc).__name__,
-                message=str(exc),
+                message=_safe_exception_message(self._capability_id, exc),
             )
             raise
         structured = result.get("structured") if isinstance(result, Mapping) else None
@@ -1999,6 +2013,11 @@ class SectionedLongformAuthor:
             title=title,
         )
         try:
+            safe_summary = (
+                "document artifact"
+                if _is_fail_closed_document_capability_id(self._capability_id)
+                else summary
+            )
             result = await _create_and_record_strict(
                 self._ledger,
                 artifact_type=artifact_type,
@@ -2006,7 +2025,7 @@ class SectionedLongformAuthor:
                 kind=kind,
                 title=title,
                 content_type=content_type,
-                summary=summary,
+                summary=safe_summary,
                 workflow_id=workflow_id,
                 thread_id=thread_id,
                 step_id=self._step_id,
@@ -2024,7 +2043,7 @@ class SectionedLongformAuthor:
                 artifact_type=artifact_type,
                 role=role,
                 error=type(exc).__name__,
-                message=str(exc),
+                message=_safe_exception_message(self._capability_id, exc),
             )
             raise
         artifact = result.get("artifact") if isinstance(result, Mapping) else None
@@ -2043,8 +2062,16 @@ class SectionedLongformAuthor:
                 artifact_type=artifact_type,
                 role=role,
                 artifact_ref=artifact_ref,
-                error=workpad.get("error") or "workpad_record_unavailable",
-                message=workpad.get("message") or "",
+                error=(
+                    "workpad_record_unavailable"
+                    if _is_fail_closed_document_capability_id(self._capability_id)
+                    else workpad.get("error") or "workpad_record_unavailable"
+                ),
+                message=(
+                    "workpad unavailable"
+                    if _is_fail_closed_document_capability_id(self._capability_id)
+                    else workpad.get("message") or ""
+                ),
             )
         await self._emit(
             "agent.tool_result",
@@ -2054,7 +2081,11 @@ class SectionedLongformAuthor:
             artifact_type=artifact_type,
             role=role,
             artifact_ref=artifact_ref,
-            result_preview=summary,
+            result_preview=(
+                ""
+                if _is_fail_closed_document_capability_id(self._capability_id)
+                else summary
+            ),
         )
         return result
 

@@ -71,6 +71,24 @@ async def get_matching_document_checkpoint(
         return None
     if not narrative:
         return None
+    phase_outputs = getattr(payload, "phase_outputs", None)
+    finalize_output = (
+        phase_outputs.get(required_phase)
+        if isinstance(phase_outputs, dict)
+        else None
+    )
+    if not isinstance(finalize_output, dict):
+        # Legacy rows could label a draft as ``finalize`` while only carrying
+        # draft phase output. Treat those rows as stale and rerun from scratch.
+        return None
+    narrative_chars = finalize_output.get("narrative_chars")
+    if not isinstance(narrative_chars, int) or narrative_chars <= 0:
+        return None
+    if finalize_output.get("checkpoint_version") != 2:
+        # Only checkpoints written by the post-finalization writer are
+        # resumable. This invalidates pre-fix final rows whose narrative may
+        # already contain a leaked prompt.
+        return None
     if not checkpoint_matches_invocation(
         record,
         payload_metadata=metadata if isinstance(metadata, dict) else None,
