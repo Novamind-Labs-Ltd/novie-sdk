@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -228,7 +229,8 @@ def test_document_resume_and_quality_helpers() -> None:
     class _Payload(BaseModel):
         current_phase: str
         narrative: str
-        metadata: dict[str, str] = Field(default_factory=dict)
+        phase_outputs: dict[str, Any] = Field(default_factory=dict)
+        metadata: dict[str, Any] = Field(default_factory=dict)
 
     class _Service:
         async def get(self, _ctx, **_kwargs):
@@ -237,7 +239,14 @@ def test_document_resume_and_quality_helpers() -> None:
                 payload={
                     "current_phase": "finalize",
                     "narrative": "Recovered draft",
-                    "metadata": {"input_digest": "digest", "capability_id": "agent.demo.write"},
+                    "phase_outputs": {
+                        "finalize": {"checkpoint_version": 2, "narrative_chars": 15}
+                    },
+                    "metadata": {
+                        "input_digest": "digest",
+                        "capability_id": "agent.demo.write",
+                        "checkpoint_version": 2,
+                    },
                 },
             )
 
@@ -256,6 +265,62 @@ def test_document_resume_and_quality_helpers() -> None:
 
     assert candidate is not None
     assert candidate.payload.narrative == "Recovered draft"
+
+    class _LegacyService:
+        async def get(self, _ctx, **_kwargs):
+            return SimpleNamespace(
+                checkpoint_id="legacy-ckpt",
+                payload={
+                    "current_phase": "finalize",
+                    "narrative": "RAW_SECRET_USER_PROMPT",
+                    "phase_outputs": {"draft": {"narrative_chars": 24}},
+                    "metadata": {
+                        "input_digest": "digest",
+                        "capability_id": "agent.demo.write",
+                    },
+                },
+            )
+
+    assert asyncio.run(
+        get_matching_document_checkpoint(
+            _LegacyService(),
+            ctx,
+            payload_model=_Payload,
+            owner_agent_id="demo",
+            capability_id="agent.demo.write",
+            input_digest="digest",
+            step_id="",
+        )
+    ) is None
+
+    class _PreFixFinalService:
+        async def get(self, _ctx, **_kwargs):
+            return SimpleNamespace(
+                checkpoint_id="pre-fix-final-ckpt",
+                payload={
+                    "current_phase": "finalize",
+                    "narrative": "RAW_SECRET_USER_OR_SKILL_PROMPT",
+                    "phase_outputs": {
+                        "finalize": {"checkpoint_version": 1, "narrative_chars": 31}
+                    },
+                    "metadata": {
+                        "input_digest": "digest",
+                        "capability_id": "agent.demo.write",
+                    },
+                },
+            )
+
+    assert asyncio.run(
+        get_matching_document_checkpoint(
+            _PreFixFinalService(),
+            ctx,
+            payload_model=_Payload,
+            owner_agent_id="demo",
+            capability_id="agent.demo.write",
+            input_digest="digest",
+            step_id="",
+        )
+    ) is None
 
     def _phase_metadata(**kwargs):
         return dict(kwargs)

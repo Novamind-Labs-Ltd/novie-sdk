@@ -238,6 +238,24 @@ async def test_task_store_cancel():
 
 
 @pytest.mark.asyncio
+async def test_task_store_rejects_events_after_terminal_transition():
+    store = InMemoryTaskStore()
+    await store.create_task("t1", {})
+    await store.update_task_status("t1", "running")
+    await store.cancel_task("t1")
+    await store.append_event(
+        "t1",
+        {"kind": "content", "draft": "RAW_AFTER_CANCEL"},
+    )
+    await store.set_task_result("t1", {"late": True})
+    await store.set_task_error("t1", "late failure")
+    task = await store.get_task("t1")
+    assert task is not None
+    assert task.status == "cancelled"
+    assert await store.get_events("t1") == []
+
+
+@pytest.mark.asyncio
 async def test_task_store_cancel_terminal_returns_false():
     store = InMemoryTaskStore()
     await store.create_task("t1", {})
@@ -516,6 +534,47 @@ async def test_sqlite_task_store_persists_across_instances(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_sqlite_task_store_quarantines_legacy_state(tmp_path: Path):
+    import sqlite3
+
+    db_path = str(tmp_path / "legacy-tasks.db")
+    marker = "RAW_SECRET_USER_PROMPT"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sdk_tasks (
+                task_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                input_json TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                result_json TEXT, error TEXT
+            );
+            CREATE TABLE sdk_task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL, event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sdk_tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-task", "failed", "2000", "2000", "{}", "", json.dumps({"draft": marker}), marker),
+        )
+        conn.execute(
+            "INSERT INTO sdk_task_events (task_id, event_json, created_at) VALUES (?, ?, ?)",
+            ("legacy-task", json.dumps({"kind": "content", "draft": marker}), "2000"),
+        )
+        conn.commit()
+
+    store = SqliteTaskStore(db_path)
+    task = await store.get_task("legacy-task")
+    assert task is not None
+    assert task.result is None
+    assert task.error is None
+    assert await store.get_result("legacy-task") is None
+    assert await store.get_events("legacy-task") == []
+
+
+@pytest.mark.asyncio
 async def test_sqlite_one_shot_invocation_store_persists_completed_response(
     tmp_path: Path,
 ):
@@ -535,6 +594,61 @@ async def test_sqlite_one_shot_invocation_store_persists_completed_response(
     assert started is False
     assert replay.status == "completed"
     assert replay.response == {"status": "completed", "output": {"answer": 42}}
+
+
+@pytest.mark.asyncio
+async def test_sqlite_invocation_store_quarantines_legacy_state(tmp_path: Path):
+    import sqlite3
+
+    db_path = str(tmp_path / "legacy-invocations.db")
+    marker = "RAW_SECRET_USER_PROMPT"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sdk_one_shot_invocations (
+                mode TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+                invocation_id TEXT, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                response_json TEXT, events_json TEXT, error TEXT,
+                PRIMARY KEY (mode, idempotency_key)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO sdk_one_shot_invocations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "stream", "legacy-key", "inv-legacy", "completed", "2000", "2000",
+                json.dumps({"output": marker}), json.dumps([{"kind": "content", "text": marker}]), marker,
+            ),
+        )
+        conn.commit()
+
+    store = SqliteOneShotInvocationStore(db_path)
+    started, record = await store.start_or_get("legacy-key", "stream")
+    assert started is False
+    assert record.status == "completed"
+    assert record.response is None
+    assert record.events is None
+    assert record.error is None
+
+
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_does_not_fail_completed_record():
+    store = InMemoryOneShotInvocationStore()
+    started, _ = await store.start_or_get("idem-terminal-race", "stream")
+    assert started is True
+
+    await store.complete(
+        "idem-terminal-race",
+        "stream",
+        response={"status": "completed"},
+    )
+    await store.fail("idem-terminal-race", "stream", "late disconnect")
+
+    started, replay = await store.start_or_get("idem-terminal-race", "stream")
+    assert started is False
+    assert replay.status == "completed"
+    assert replay.error is None
 
 
 # ── Tier B: lease + heartbeat regression coverage ─────────────────────────────
@@ -610,6 +724,41 @@ async def test_inmemory_invocation_store_stale_in_progress_recycled():
 
 
 @pytest.mark.asyncio
+async def test_inmemory_stale_invocation_owner_cannot_mutate_replacement():
+    store = InMemoryOneShotInvocationStore()
+    started, old = await store.start_or_get("idem-owner-race", "stream")
+    assert started is True
+    old.updated_at = "2000-01-01T00:00:00+00:00"
+
+    started_again, fresh = await store.start_or_get("idem-owner-race", "stream")
+    assert started_again is True
+    assert fresh.invocation_id != old.invocation_id
+
+    await store.complete(
+        "idem-owner-race",
+        "stream",
+        invocation_id=old.invocation_id,
+        response={"from": "old"},
+    )
+    await store.fail(
+        "idem-owner-race",
+        "stream",
+        "old failure",
+        invocation_id=old.invocation_id,
+    )
+    await store.touch(
+        "idem-owner-race",
+        "stream",
+        invocation_id=old.invocation_id,
+    )
+
+    _, current = await store.start_or_get("idem-owner-race", "stream")
+    assert current.invocation_id == fresh.invocation_id
+    assert current.status == "in_progress"
+    assert current.response is None
+
+
+@pytest.mark.asyncio
 async def test_inmemory_invocation_store_touch_renews_lease():
     """touch() bumps updated_at so a long-running but actively-streaming
     handler does not get recycled by the stale-lease check."""
@@ -675,6 +824,50 @@ async def test_sqlite_invocation_store_stale_in_progress_recycled(tmp_path: Path
     assert fresh.status == "in_progress"
     # The recycled row should now show a current (recent) updated_at.
     assert fresh.updated_at >= record.updated_at
+
+
+@pytest.mark.asyncio
+async def test_sqlite_stale_invocation_owner_cannot_mutate_replacement(tmp_path: Path):
+    db_path = str(tmp_path / "invocations.db")
+    store = SqliteOneShotInvocationStore(db_path)
+    started, old = await store.start_or_get("idem-owner-race", "stream")
+    assert started is True
+
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE sdk_one_shot_invocations SET updated_at = ? "
+            "WHERE mode = ? AND idempotency_key = ?",
+            ("2000-01-01T00:00:00+00:00", "stream", "idem-owner-race"),
+        )
+        conn.commit()
+
+    started_again, fresh = await store.start_or_get("idem-owner-race", "stream")
+    assert started_again is True
+    assert fresh.invocation_id != old.invocation_id
+
+    await store.complete(
+        "idem-owner-race",
+        "stream",
+        invocation_id=old.invocation_id,
+        response={"from": "old"},
+    )
+    await store.fail(
+        "idem-owner-race",
+        "stream",
+        "old failure",
+        invocation_id=old.invocation_id,
+    )
+    await store.touch(
+        "idem-owner-race",
+        "stream",
+        invocation_id=old.invocation_id,
+    )
+
+    _, current = await store.start_or_get("idem-owner-race", "stream")
+    assert current.invocation_id == fresh.invocation_id
+    assert current.status == "in_progress"
+    assert current.response is None
 
 
 @pytest.mark.asyncio
@@ -974,6 +1167,31 @@ def test_simple_agent_rejects_completed_envelope_with_error_and_output() -> None
         "error_code": "agent_internal_error",
         "output": {},
     }
+
+
+def test_simple_agent_sanitizes_failure_nested_under_arbitrary_result_key() -> None:
+    from fastapi.testclient import TestClient
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    agent = Agent(_simple_manifest("invoke-nested-failure"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext) -> dict[str, Any]:
+        return {
+            "status": "completed",
+            "result": {"data": ({"status": "FAILED", "error": marker, "draft": marker},)},
+        }
+
+    response = TestClient(agent.build_app()).post("/invoke", json={"input": {"q": "x"}})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Agent execution failed.",
+        "error_code": "agent_internal_error",
+        "output": {},
+    }
+    assert marker not in response.text
 
 
 @pytest.mark.asyncio
@@ -1576,6 +1794,176 @@ def test_stream_invocation_status_events_and_result_endpoints():
 
 
 @pytest.mark.asyncio
+async def test_stream_final_resolves_invocation_before_client_disconnect():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_stream_manifest("stream-final-disconnect"), invocation_store=store)
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "final", "output": {"answer": "done"}}
+        await asyncio.sleep(1)
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        headers={"Idempotency-Key": "stream-final-disconnect-key"},
+        json={"input": {"q": "x"}},
+    ) as response:
+        assert response.status_code == 200
+        first_line = next(line for line in response.iter_lines() if line.strip())
+        assert json.loads(first_line)["kind"] == "final"
+
+    await asyncio.sleep(0.05)
+    started, record = await store.start_or_get(
+        "stream-final-disconnect-key", "stream"
+    )
+    assert started is False
+    assert record.status == "completed"
+    assert record.response is not None
+    assert record.response["output"]["answer"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stream_drops_events_after_terminal_final():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_stream_manifest("stream-final-boundary"), invocation_store=store)
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "final", "output": {"answer": "done"}}
+        yield {"kind": "content", "text": marker}
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        headers={"Idempotency-Key": "stream-final-boundary-key"},
+        json={"input": {"q": "x"}},
+    ) as response:
+        lines = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in lines] == ["final", "done"]
+    assert marker not in json.dumps(lines)
+    _, record = await store.start_or_get("stream-final-boundary-key", "stream")
+    assert record.events is not None
+    assert marker not in json.dumps(record.events)
+
+
+@pytest.mark.asyncio
+async def test_stream_drops_events_after_terminal_artifact():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(
+        _stream_manifest("stream-artifact-boundary"),
+        invocation_store=store,
+    )
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "artifact", "artifact_type": "document", "summary": "done"}
+        yield {"kind": "content", "text": marker}
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        json={"input": {"q": "x"}},
+        headers={"Idempotency-Key": "stream-artifact-boundary-key"},
+    ) as response:
+        lines = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in lines] == ["artifact", "done"]
+    assert marker not in json.dumps(lines)
+    _, record = await store.start_or_get("stream-artifact-boundary-key", "stream")
+    assert record.response is not None
+    assert record.response["output"]["kind"] == "artifact"
+    assert record.response["output"]["artifact_type"] == "document"
+    assert marker not in json.dumps(record.response)
+
+
+@pytest.mark.asyncio
+async def test_stream_drops_events_after_terminal_confirmation():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    agent = Agent(_stream_manifest("stream-confirmation-boundary"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "needs_confirmation", "gate_id": "gate-1"}
+        yield {"kind": "content", "text": marker}
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        json={"input": {"q": "x"}},
+    ) as response:
+        lines = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in lines] == ["needs_confirmation", "done"]
+    assert marker not in json.dumps(lines)
+
+
+@pytest.mark.asyncio
+async def test_stream_invocation_result_rebuilds_from_bounded_events():
+    from fastapi.testclient import TestClient
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    store = InMemoryOneShotInvocationStore()
+    started, record = await store.start_or_get("stream-result-boundary", "stream")
+    assert started is True
+    await store.complete(
+        "stream-result-boundary",
+        "stream",
+        invocation_id=record.invocation_id,
+        response={"status": "completed", "output": {"transcript": marker}},
+        events=[
+            {"kind": "content", "content": "public"},
+            {"kind": "final", "output": {"answer": "done"}},
+            {"kind": "content", "content": marker},
+        ],
+    )
+    agent = Agent(_stream_manifest("stream-result-boundary"), invocation_store=store)
+    result = TestClient(agent.build_app()).get(
+        f"/invocations/{record.invocation_id}/result"
+    )
+
+    assert result.status_code == 200
+    assert result.json()["output"]["answer"] == "done"
+    assert marker not in result.text
+
+
+def test_sanitized_replay_stops_at_legacy_terminal_boundary():
+    from novie_agent_sdk.runtime import _sanitized_replay_events
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    events = _sanitized_replay_events(
+        [
+            {"kind": "content", "text": "public"},
+            {"kind": "final", "output": {"answer": "done"}},
+            {"kind": "content", "text": marker},
+        ],
+        stop_at_terminal=True,
+    )
+
+    assert [event["kind"] for event in events] == ["content", "final"]
+    assert marker not in json.dumps(events)
+
+
+@pytest.mark.asyncio
 async def test_stream_agent_replays_duplicate_idempotency_key():
     import httpx
     from novie_agent_sdk.runtime import StreamContext
@@ -1792,14 +2180,17 @@ async def test_tasks_agent_cancel():
 
 
 @pytest.mark.asyncio
-async def test_tasks_agent_handler_exception():
+async def test_tasks_agent_handler_exception(caplog):
     from fastapi.testclient import TestClient
 
-    agent = Agent(_tasks_manifest())
+    marker = "RAW_SECRET_USER_PROMPT"
+    store = InMemoryTaskStore()
+    agent = Agent(_tasks_manifest(), task_store=store)
 
     @agent.task
     async def handle(ctx: TaskContext) -> dict:
-        raise RuntimeError("Something went wrong")
+        await ctx.emit_event("content", {"draft": marker}, summary=marker)
+        raise RuntimeError(marker)
 
     app = agent.build_app()
     client = TestClient(app)
@@ -1811,6 +2202,34 @@ async def test_tasks_agent_handler_exception():
     resp = client.get(f"/tasks/{task_id}")
     assert resp.json()["status"] == "failed"
     assert resp.json()["error"] is not None
+    stored_events = await store.get_events(task_id)
+    assert marker not in json.dumps(stored_events)
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tasks_agent_failed_result_clears_events() -> None:
+    from fastapi.testclient import TestClient
+
+    marker = "RAW_SECRET_USER_PROMPT"
+    store = InMemoryTaskStore()
+    agent = Agent(_tasks_manifest(), task_store=store)
+
+    @agent.task
+    async def handle(ctx: TaskContext) -> dict[str, Any]:
+        await ctx.emit_event("content", {"draft": marker}, summary=marker)
+        return {"status": "failed", "error": marker, "output": {"draft": marker}}
+
+    client = TestClient(agent.build_app())
+    response = client.post("/tasks", json={"input": {}})
+    task_id = response.json()["task_id"]
+
+    await asyncio.sleep(0.2)
+    result = client.get(f"/tasks/{task_id}/result")
+    assert result.status_code == 200
+    assert result.json()["status"] == "failed"
+    assert marker not in result.text
+    assert marker not in json.dumps(await store.get_events(task_id))
 
 
 @pytest.mark.asyncio

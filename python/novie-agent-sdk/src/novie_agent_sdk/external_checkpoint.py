@@ -77,6 +77,11 @@ async def put_external_agent_checkpoint(
     metadata: dict[str, Any],
 ) -> Any:
     """Write an external-agent checkpoint across old and new service shapes."""
+    metadata = dict(metadata)
+    phase_outputs = payload.get("phase_outputs")
+    finalize_output = phase_outputs.get("finalize") if isinstance(phase_outputs, dict) else None
+    if isinstance(finalize_output, dict) and "checkpoint_version" in finalize_output:
+        metadata.setdefault("checkpoint_version", finalize_output["checkpoint_version"])
     try:
         return await checkpoint_service.put(
             ctx,
