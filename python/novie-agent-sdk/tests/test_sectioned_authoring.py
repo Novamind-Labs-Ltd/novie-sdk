@@ -993,6 +993,43 @@ async def test_sectioned_author_rejects_placeholder_section_drafts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deferred_intermediate_artifacts_keep_successful_final_in_memory() -> None:
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        defer_intermediate_artifacts=True,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert result.markdown
+    assert result.ledger["final_ref"] == {}
+    assert result.ledger["artifact_refs"] == []
+    assert platform.artifacts.created == []
+    assert platform.workpads.entries == []
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
 async def test_deferred_intermediate_artifacts_do_not_persist_on_failure() -> None:
     platform = _FakePlatform()
     author = SectionedLongformAuthor(
