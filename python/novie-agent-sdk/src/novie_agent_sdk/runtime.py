@@ -87,7 +87,7 @@ from .platform_security import (
     AgentPlatformSignatureError,
     verify_agent_platform_headers,
 )
-from .public_errors import public_error_fields
+from .public_errors import public_error_fields, public_error_fields_from_envelope
 from .tenant_scoping import validate_tenant_context
 
 
@@ -1096,6 +1096,14 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
         if not isinstance(event, dict):
             continue
         kind = str(event.get("kind") or event.get("type") or "")
+        if kind in {"error", "failed", "terminal_error"}:
+            public_error = public_error_fields_from_envelope(event)
+            return {
+                "status": "failed",
+                "error": public_error.public_message,
+                "error_code": public_error.error_code,
+                "output": {},
+            }
         if kind == "content":
             text = str(event.get("content") or event.get("text") or "")
             if text:
@@ -1136,6 +1144,14 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
                 or "confirmation" in result
             )
         ):
+            if status in {"failed", "cancelled"} and "error" in result:
+                public_error = public_error_fields_from_envelope(result)
+                return {
+                    "status": status,
+                    "error": public_error.public_message,
+                    "error_code": public_error.error_code,
+                    "output": {},
+                }
             return dict(result)
     return {"output": result, "status": "completed"}
 
@@ -2207,11 +2223,18 @@ class Agent:
                         raise
                     response = _coerce_invoke_response(result)
                     if started_invocation and hdrs.idempotency_key:
-                        await self._invocation_store.complete(
-                            hdrs.idempotency_key,
-                            "invoke",
-                            response=response,
-                        )
+                        if response.get("status") == "failed":
+                            await self._invocation_store.fail(
+                                hdrs.idempotency_key,
+                                "invoke",
+                                str(response.get("error") or "Agent execution failed."),
+                            )
+                        else:
+                            await self._invocation_store.complete(
+                                hdrs.idempotency_key,
+                                "invoke",
+                                response=response,
+                            )
                         invocation_resolved = True
                     return response
                 finally:
@@ -2389,16 +2412,10 @@ class Agent:
                                 }
                                 emitted_events.append(error_event)
                                 if started_invocation and hdrs.idempotency_key:
-                                    await self._invocation_store.complete(
+                                    await self._invocation_store.fail(
                                         hdrs.idempotency_key,
                                         "stream",
-                                        response={
-                                            "status": "failed",
-                                            "error": public_error.public_message,
-                                            "error_code": public_error.error_code,
-                                            "output": {},
-                                        },
-                                        events=emitted_events,
+                                        public_error.public_message,
                                     )
                                     invocation_resolved = True
                                 yield (json.dumps(error_event) + "\n").encode()
@@ -2406,6 +2423,31 @@ class Agent:
                             if kind == "obs":
                                 # Already a fully-formed dict (UsageReport.
                                 # to_platform_task_event); forward verbatim.
+                                if isinstance(payload, dict) and str(
+                                    payload.get("kind") or payload.get("type") or ""
+                                ) in {"error", "failed", "terminal_error"}:
+                                    terminal_error_emitted = True
+                                    public_error = public_error_fields_from_envelope(payload)
+                                    safe_event = {
+                                        "kind": "terminal_error",
+                                        "error": public_error.public_message,
+                                        "error_code": public_error.error_code,
+                                        "output": {},
+                                        "metadata": {
+                                            "terminal_source": "sdk_observability_guard",
+                                            "agent_id": m.agent_id,
+                                        },
+                                    }
+                                    emitted_events.append(safe_event)
+                                    if started_invocation and hdrs.idempotency_key:
+                                        await self._invocation_store.fail(
+                                            hdrs.idempotency_key,
+                                            "stream",
+                                            public_error.public_message,
+                                        )
+                                        invocation_resolved = True
+                                    yield (json.dumps(safe_event) + "\n").encode()
+                                    break
                                 emitted_events.append(payload)
                                 last_event_at = time.monotonic()
                                 yield (json.dumps(payload) + "\n").encode()
@@ -2416,6 +2458,31 @@ class Agent:
                                 event = payload
                             else:
                                 event = {"kind": "content", "text": str(payload)}
+                            if str(event.get("kind") or event.get("type") or "") in {
+                                "error", "failed", "terminal_error",
+                            }:
+                                terminal_error_emitted = True
+                                public_error = public_error_fields_from_envelope(event)
+                                safe_event = {
+                                    "kind": "terminal_error",
+                                    "error": public_error.public_message,
+                                    "error_code": public_error.error_code,
+                                    "output": {},
+                                    "metadata": {
+                                        "terminal_source": "sdk_envelope_guard",
+                                        "agent_id": m.agent_id,
+                                    },
+                                }
+                                emitted_events.append(safe_event)
+                                if started_invocation and hdrs.idempotency_key:
+                                    await self._invocation_store.fail(
+                                        hdrs.idempotency_key,
+                                        "stream",
+                                        public_error.public_message,
+                                    )
+                                    invocation_resolved = True
+                                yield (json.dumps(safe_event) + "\n").encode()
+                                break
                             emitted_events.append(event)
                             last_event_at = time.monotonic()
                             yield (json.dumps(event) + "\n").encode()

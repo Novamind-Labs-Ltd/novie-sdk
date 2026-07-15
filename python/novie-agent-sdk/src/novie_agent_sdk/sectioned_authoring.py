@@ -7,7 +7,7 @@ import os
 import re
 import inspect
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, NamedTuple
 
 from novie_protocol.agents import AgentStreamEvent
@@ -364,6 +364,7 @@ async def run_sectioned_document_finalization(
     required_strategy: str = "sectioned_longform",
     quality_reason: str = "sectioned_authoring_quality_gates",
     quality_metadata: Mapping[str, Any] | None = None,
+    defer_intermediate_artifacts: bool = False,
 ) -> SectionedDocumentFinalizationResult:
     """Run sectioned longform finalization for document agents.
 
@@ -417,6 +418,7 @@ async def run_sectioned_document_finalization(
             skill_contract,
             artifact_type=artifact_type,
         ),
+        defer_intermediate_artifacts=defer_intermediate_artifacts,
     )
     authoring_upstream: dict[str, Any] = dict(upstream)
     if draft_narrative_key:
@@ -593,6 +595,7 @@ class SectionedLongformAuthor:
         authoring_contract: Mapping[str, Any] | SectionedAuthoringContract | None = None,
         phase_event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
         phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        defer_intermediate_artifacts: bool = False,
     ) -> None:
         self._llm = llm_facade
         self._platform = platform
@@ -605,6 +608,12 @@ class SectionedLongformAuthor:
             if isinstance(authoring_contract, SectionedAuthoringContract)
             else SectionedAuthoringContract.from_mapping(authoring_contract)
         )
+        if defer_intermediate_artifacts:
+            self._contract = replace(
+                self._contract,
+                record_outline_ref=False,
+                record_section_refs=False,
+            )
         self._ledger = ArtifactLedger(platform)
         self._evidence = EvidencePackBuilder(platform, budget=context_budget)
         self._max_section_revision_rounds = _positive_int(
