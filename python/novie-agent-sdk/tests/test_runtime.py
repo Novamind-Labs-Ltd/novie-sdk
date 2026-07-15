@@ -927,6 +927,30 @@ def test_simple_agent_sanitizes_explicit_failed_envelope_and_store() -> None:
     assert "RAW_SECRET_USER_PROMPT" not in json.dumps(record.__dict__)
 
 
+def test_simple_agent_sanitizes_failed_envelope_without_error_field() -> None:
+    from fastapi.testclient import TestClient
+
+    agent = Agent(_simple_manifest("invoke-malformed-failure"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "output": {"draft": "RAW_SECRET_USER_PROMPT"},
+        }
+
+    client = TestClient(agent.build_app())
+    response = client.post("/invoke", json={"input": {"q": "x"}})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Agent execution failed.",
+        "error_code": "agent_internal_error",
+        "output": {},
+    }
+
+
 @pytest.mark.asyncio
 async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     from fastapi.testclient import TestClient

@@ -1139,19 +1139,29 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
             isinstance(status, str)
             and status in _INVOKE_RESPONSE_STATUSES
             and (
+                status in {"failed", "cancelled"}
+                or
                 "output" in result
                 or "error" in result
                 or "confirmation" in result
             )
         ):
-            if status in {"failed", "cancelled"} and "error" in result:
+            if status in {"failed", "cancelled"} or "error" in result:
                 public_error = public_error_fields_from_envelope(result)
-                return {
+                sanitized: dict[str, Any] = {
                     "status": status,
                     "error": public_error.public_message,
                     "error_code": public_error.error_code,
-                    "output": {},
                 }
+                if status in {"failed", "cancelled"}:
+                    sanitized["output"] = {}
+                else:
+                    # Preserve the non-error part of a confirmation/completed
+                    # envelope, but never forward the handler's raw error.
+                    for key in ("output", "confirmation"):
+                        if key in result:
+                            sanitized[key] = result[key]
+                return sanitized
             return dict(result)
     return {"output": result, "status": "completed"}
 
