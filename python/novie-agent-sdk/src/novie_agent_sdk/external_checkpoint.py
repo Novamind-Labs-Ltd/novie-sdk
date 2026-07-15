@@ -73,6 +73,7 @@ async def put_external_agent_checkpoint(
     payload: dict[str, Any],
     workflow_id: str | None,
     step_id: str | None,
+    parent_checkpoint_id: str | None = None,
     summary: str,
     metadata: dict[str, Any],
 ) -> Any:
@@ -85,6 +86,7 @@ async def put_external_agent_checkpoint(
             payload=payload,
             workflow_id=workflow_id,
             step_id=step_id,
+            parent_checkpoint_id=parent_checkpoint_id,
             summary=summary,
             metadata=metadata,
         )
