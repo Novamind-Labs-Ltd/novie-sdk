@@ -935,7 +935,7 @@ def test_simple_agent_sanitizes_failed_envelope_without_error_field() -> None:
     @agent.invoke
     async def handle(ctx: InvokeContext) -> dict[str, Any]:
         return {
-            "status": "failed",
+            "status": "FAILED",
             "output": {"draft": "RAW_SECRET_USER_PROMPT"},
         }
 
@@ -959,7 +959,7 @@ def test_simple_agent_rejects_completed_envelope_with_error_and_output() -> None
     @agent.invoke
     async def handle(ctx: InvokeContext) -> dict[str, Any]:
         return {
-            "status": "completed",
+            "status": "COMPLETED",
             "error": "RAW_SECRET_USER_PROMPT",
             "output": {"draft": "RAW_SECRET_USER_PROMPT"},
         }
@@ -1351,10 +1351,34 @@ def test_stream_endpoint_rejects_nested_failed_final_output():
         yield {
             "kind": "final",
             "output": {
-                "status": "failed",
+                "status": "FAILED",
                 "error": "RAW_SECRET_USER_PROMPT",
                 "draft": "RAW_SECRET_USER_PROMPT",
             },
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as response:
+        events = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in events] == ["terminal_error"]
+    assert events[0]["error"] == "Agent execution failed."
+    assert events[0]["error_code"] == "agent_internal_error"
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
+
+
+def test_stream_endpoint_rejects_top_level_failed_done_without_output_mapping():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-top-level-failure"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {
+            "kind": "DONE",
+            "status": "FAILED",
+            "error": "RAW_SECRET_USER_PROMPT",
         }
 
     client = TestClient(agent.build_app())
