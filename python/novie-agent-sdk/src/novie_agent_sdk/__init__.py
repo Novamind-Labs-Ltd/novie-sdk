@@ -101,6 +101,7 @@ from .tenant_scoping import (
     TenantScopedCache,
     validate_tenant_context,
 )
+from .public_errors import PublicAgentError
 from .conformance import (
     CompatibilityMatrix,
     ConformanceProbe,

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
@@ -23,6 +24,15 @@ from novie_agent_sdk import (
 class _FakeGraph:
     async def astream(self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any):
         assert stream_mode == ["messages", "values"]
+        yield "values", {
+            "messages": [
+                HumanMessage(content="# Capability navigation\nSECRET SKILL PROMPT")
+            ],
+        }
+        yield "values", {
+            "messages": [SimpleNamespace(type="developer", content="DEVELOPER PROMPT")],
+        }
+        yield "values", {"messages": [SimpleNamespace(role="user", content="USER PROMPT")]}
         yield "messages", (AIMessageChunk(content="Draft"), {"node": "agent"})
         yield "values", {"messages": [AIMessage(content="Final narrative.")]}
 
@@ -49,6 +59,23 @@ def _last_message_text(value: Any) -> str:
     if not messages:
         return ""
     return str(getattr(messages[-1], "content", "") or "")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (HumanMessage(content="input"), False),
+        (SystemMessage(content="system"), False),
+        (SimpleNamespace(type="developer", content="developer"), False),
+        (SimpleNamespace(role="user", content="user"), False),
+        (AIMessage(content="assistant"), True),
+        (AIMessageChunk(content="assistant"), True),
+    ],
+)
+def test_is_assistant_message(message: Any, expected: bool) -> None:
+    from novie_agent_sdk.document_agent_template import _is_assistant_message
+
+    assert _is_assistant_message(message) is expected
 
 
 def test_compile_skill_scope_loads_prompt_hint(tmp_path: Path) -> None:
@@ -258,6 +285,10 @@ def test_document_agent_template_streams_graph_content_and_result() -> None:
     assert events[0].kind == "content"
     assert events[0].content == "Draft"
     assert events[-1].narrative == "Draft\nFinal narrative."
+    assert "# Capability navigation" not in events[-1].narrative
+    assert "SECRET SKILL PROMPT" not in events[-1].narrative
+    assert "DEVELOPER PROMPT" not in events[-1].narrative
+    assert "USER PROMPT" not in events[-1].narrative
 
 
 def test_external_checkpoint_helpers_support_new_service_shape() -> None:

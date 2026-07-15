@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from .platform_namespace import build_platform_namespace
+from .public_errors import PublicAgentError
 from .runtime import (
     Agent,
     InMemoryTaskStore,
@@ -57,7 +58,7 @@ _SAFE_AGENT_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 # ── Failure path ─────────────────────────────────────────────────────────────
 
 
-class WorkerFailure(Exception):
+class WorkerFailure(PublicAgentError):
     """Raised by ``ctx.fail(...)`` to terminate a task with an explicit
     failure reason.
 
@@ -69,7 +70,7 @@ class WorkerFailure(Exception):
     """
 
     def __init__(self, reason: str, *, metadata: Mapping[str, Any] | None = None) -> None:
-        super().__init__(reason)
+        super().__init__(error_code="worker_failure", public_message=reason)
         self.reason = reason
         self.metadata = dict(metadata) if metadata else {}
 
