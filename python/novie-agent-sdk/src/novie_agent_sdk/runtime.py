@@ -29,7 +29,6 @@
     if __name__ == "__main__":
         asyncio.run(agent.serve())
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -88,11 +87,7 @@ from .platform_security import (
     AgentPlatformSignatureError,
     verify_agent_platform_headers,
 )
-from .public_errors import (
-    PublicAgentError,
-    public_error_fields,
-    public_error_fields_from_envelope,
-)
+from .public_errors import public_error_fields, public_error_fields_from_envelope
 from .tenant_scoping import validate_tenant_context
 
 
@@ -111,9 +106,7 @@ def _build_ctx_platform_and_llm(
         from .llm_facade import build_llm_facade
 
         platform_ns = build_platform_namespace(hdrs, agent_id=agent_id)
-        llm = build_llm_facade(
-            platform_ns, agent_id=agent_id, observability=observability
-        )
+        llm = build_llm_facade(platform_ns, agent_id=agent_id, observability=observability)
         return platform_ns, llm
     except Exception as exc:  # noqa: BLE001 — best-effort
         _log.debug("ctx platform/llm build failed: %s", exc)
@@ -122,11 +115,9 @@ def _build_ctx_platform_and_llm(
 
 # ── Contexts ──────────────────────────────────────────────────────────────────
 
-
 @dataclass
 class RequestHeaders:
     """A2A 请求头，由 Platform 注入。"""
-
     tenant_id: str = ""
     session_id: str = ""
     step_id: str = ""
@@ -241,7 +232,6 @@ class AskBudgetExceeded(RuntimeError):
 @dataclass
 class InvokeContext:
     """simple protocol handler 上下文。"""
-
     input: dict[str, Any]
     headers: RequestHeaders
     agent_manifest: AgentManifestV2
@@ -278,7 +268,6 @@ class InvokeContext:
 @dataclass
 class StreamContext:
     """stream protocol handler 上下文。"""
-
     input: dict[str, Any]
     headers: RequestHeaders
     agent_manifest: AgentManifestV2
@@ -317,7 +306,6 @@ class TaskContext:
 
     用于在 task handler 中发布 events、检查 cancel token 等。
     """
-
     task_id: str
     input: dict[str, Any]
     headers: RequestHeaders
@@ -357,9 +345,7 @@ class TaskContext:
     def is_cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    async def emit_event(
-        self, kind: str, payload: dict[str, Any] | None = None, summary: str = ""
-    ) -> None:
+    async def emit_event(self, kind: str, payload: dict[str, Any] | None = None, summary: str = "") -> None:
         """发布一条 task event。"""
         event = _make_event(self.task_id, kind, payload or {}, summary)
         await self._store.append_event(self.task_id, event)
@@ -386,9 +372,7 @@ class TaskContext:
             payload["message"] = message
         if interval_seconds is not None:
             payload["interval_seconds"] = interval_seconds
-        await self.emit_event(
-            "heartbeat", payload, summary=message or phase or "heartbeat"
-        )
+        await self.emit_event("heartbeat", payload, summary=message or phase or "heartbeat")
 
     async def ask(
         self,
@@ -552,7 +536,6 @@ class TaskContext:
 
 # ── Task / Event stores ───────────────────────────────────────────────────────
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -595,9 +578,7 @@ def _timeout_resolution(
     *,
     recommended_option: str | None,
 ) -> dict[str, Any]:
-    resolution_type = (
-        "auto_policy" if default_action == "auto_recommended" else "skipped"
-    )
+    resolution_type = "auto_policy" if default_action == "auto_recommended" else "skipped"
     return {
         "gate_id": gate_id,
         "resolution_type": resolution_type,
@@ -622,9 +603,7 @@ def _max_mid_run_asks(inputs: dict[str, Any]) -> int:
     return max(0, parsed)
 
 
-def _make_event(
-    task_id: str, kind: str, payload: dict[str, Any], summary: str = ""
-) -> dict[str, Any]:
+def _make_event(task_id: str, kind: str, payload: dict[str, Any], summary: str = "") -> dict[str, Any]:
     return {
         "event_id": f"evt-{uuid.uuid4().hex[:16]}",
         "task_id": task_id,
@@ -667,16 +646,13 @@ class TaskRecord:
 #      case where Tier A's finally never ran). The stream handler renews the
 #      lease via ``touch`` every ``NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS``.
 _DEFAULT_INVOCATION_LEASE_SECONDS = _env_int(
-    "NOVIE_AGENT_INVOCATION_LEASE_SECONDS",
-    default=300,
+    "NOVIE_AGENT_INVOCATION_LEASE_SECONDS", default=300,
 )
 _DEFAULT_INVOCATION_HEARTBEAT_EVENTS = _env_int(
-    "NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS",
-    default=10,
+    "NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS", default=10,
 )
 _DEFAULT_STREAM_KEEPALIVE_SECONDS = _env_float(
-    "NOVIE_AGENT_STREAM_KEEPALIVE_SECONDS",
-    default=25.0,
+    "NOVIE_AGENT_STREAM_KEEPALIVE_SECONDS", default=25.0,
 )
 
 
@@ -691,9 +667,7 @@ class OneShotInvocationRecord:
     response: dict[str, Any] | None = None
     events: list[dict[str, Any]] | None = None
     error: str | None = None
-    lease_seconds: int = field(
-        default_factory=lambda: _DEFAULT_INVOCATION_LEASE_SECONDS
-    )
+    lease_seconds: int = field(default_factory=lambda: _DEFAULT_INVOCATION_LEASE_SECONDS)
 
 
 def _is_lease_stale(record: OneShotInvocationRecord) -> bool:
@@ -842,9 +816,7 @@ class SqliteOneShotInvocationStore:
         mode: str,
     ) -> tuple[bool, OneShotInvocationRecord]:
         return await asyncio.to_thread(
-            self._start_or_get_sync,
-            idempotency_key,
-            mode,
+            self._start_or_get_sync, idempotency_key, mode,
         )
 
     def _start_or_get_sync(
@@ -1061,7 +1033,8 @@ class SqliteOneShotInvocationStore:
             }
             if "invocation_id" not in columns:
                 conn.execute(
-                    "ALTER TABLE sdk_one_shot_invocations ADD COLUMN invocation_id TEXT"
+                    "ALTER TABLE sdk_one_shot_invocations "
+                    "ADD COLUMN invocation_id TEXT"
                 )
             conn.execute(
                 """
@@ -1107,8 +1080,7 @@ def _duplicate_one_shot_response(record: OneShotInvocationRecord) -> Any:
 def _one_shot_invocation_view(record: OneShotInvocationRecord) -> dict[str, Any]:
     public_error = (
         "Agent execution failed."
-        if record.status in {"failed", "cancelled", "error", "terminal_error"}
-        and record.error
+        if record.status in {"failed", "cancelled", "error", "terminal_error"} and record.error
         else record.error
     )
     return {
@@ -1138,16 +1110,10 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
     terminal_kind = kind in {
-        "error",
-        "failed",
-        "terminal_error",
-        "cancelled",
-        "canceled",
-        "cancel",
+        "error", "failed", "terminal_error", "cancelled", "canceled", "cancel"
     }
     if (
-        status
-        in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"}
+        status in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"}
         or terminal_kind
         or _has_nonempty_error(envelope.get("error"))
     ):
@@ -1168,12 +1134,7 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
 def _failure_status(envelope: dict[str, Any]) -> str:
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
-    return (
-        "cancelled"
-        if status in {"cancelled", "canceled", "cancel"}
-        or kind in {"cancelled", "canceled", "cancel"}
-        else "failed"
-    )
+    return "cancelled" if status in {"cancelled", "canceled", "cancel"} or kind in {"cancelled", "canceled", "cancel"} else "failed"
 
 
 def _safe_failure_response(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -1251,17 +1212,14 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
         if failure is not None:
             return _safe_failure_response(failure)
         raw_status = result.get("status")
-        status = (
-            str(raw_status).strip().lower()
-            if isinstance(raw_status, str)
-            else raw_status
-        )
+        status = str(raw_status).strip().lower() if isinstance(raw_status, str) else raw_status
         if (
             isinstance(status, str)
             and status in _INVOKE_RESPONSE_STATUSES
             and (
                 status in {"failed", "cancelled"}
-                or "output" in result
+                or
+                "output" in result
                 or "error" in result
                 or "confirmation" in result
             )
@@ -1358,16 +1316,12 @@ class InMemoryTaskStore:
         self._lock = asyncio.Lock()
         self._status_waiters: dict[str, asyncio.Condition] = {}
         self._ask_waiters: dict[tuple[str, str], asyncio.Condition] = {}
-        self._max_tasks = (
-            max_tasks
-            if max_tasks is not None
-            else _env_int("NOVIE_SDK_TASK_STORE_MAX_TASKS", default=0) or None
-        )
-        self._ttl_seconds = (
-            ttl_seconds
-            if ttl_seconds is not None
-            else _env_float("NOVIE_SDK_TASK_STORE_TTL_SECONDS", default=0.0) or None
-        )
+        self._max_tasks = max_tasks if max_tasks is not None else _env_int(
+            "NOVIE_SDK_TASK_STORE_MAX_TASKS", default=0
+        ) or None
+        self._ttl_seconds = ttl_seconds if ttl_seconds is not None else _env_float(
+            "NOVIE_SDK_TASK_STORE_TTL_SECONDS", default=0.0
+        ) or None
 
     def _evict_expired_locked(self) -> None:
         """Drop tasks whose ``created_at`` is older than the TTL.
@@ -1438,12 +1392,12 @@ class InMemoryTaskStore:
             # caller.
             self._evict_expired_locked()
             if idempotency_key and any(
-                t.idempotency_key == idempotency_key for t in self._tasks.values()
+                t.idempotency_key == idempotency_key
+                for t in self._tasks.values()
             ):
                 # Idempotent: return existing task
                 existing = next(
-                    t
-                    for t in self._tasks.values()
+                    t for t in self._tasks.values()
                     if t.idempotency_key == idempotency_key
                 )
                 return existing
@@ -1477,9 +1431,7 @@ class InMemoryTaskStore:
             if not is_valid_transition(old_status, new_status):
                 _log.warning(
                     "Invalid task status transition %s→%s task_id=%s",
-                    old_status,
-                    new_status,
-                    task_id,
+                    old_status, new_status, task_id,
                 )
                 return
             task.status = new_status
@@ -1508,12 +1460,7 @@ class InMemoryTaskStore:
                 cond.notify_all()
         await self.append_event(
             task_id,
-            _make_event(
-                task_id,
-                "task_completed" if status == "completed" else "task_failed",
-                {},
-                "",
-            ),
+            _make_event(task_id, "task_completed" if status == "completed" else "task_failed", {}, ""),
         )
 
     async def set_task_error(self, task_id: str, error: str) -> None:
@@ -1643,13 +1590,9 @@ class SqliteTaskStore:
         input_data: dict[str, Any],
         idempotency_key: str = "",
     ) -> TaskRecord:
-        return await asyncio.to_thread(
-            self._create_task_sync, task_id, input_data, idempotency_key
-        )
+        return await asyncio.to_thread(self._create_task_sync, task_id, input_data, idempotency_key)
 
-    def _create_task_sync(
-        self, task_id: str, input_data: dict[str, Any], idempotency_key: str
-    ) -> TaskRecord:
+    def _create_task_sync(self, task_id: str, input_data: dict[str, Any], idempotency_key: str) -> TaskRecord:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             if idempotency_key:
@@ -1688,9 +1631,7 @@ class SqliteTaskStore:
     def _get_task_sync(self, task_id: str) -> TaskRecord | None:
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM sdk_tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM sdk_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 return None
             return self._row_to_task_record(row)
@@ -1701,9 +1642,7 @@ class SqliteTaskStore:
     def _update_task_status_sync(self, task_id: str, new_status: str) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT status FROM sdk_tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
+            row = conn.execute("SELECT status FROM sdk_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 return
             old_status = str(row["status"])
@@ -1726,17 +1665,10 @@ class SqliteTaskStore:
         await asyncio.to_thread(self._set_task_result_sync, task_id, result, status)
         await self.append_event(
             task_id,
-            _make_event(
-                task_id,
-                "task_completed" if status == "completed" else "task_failed",
-                {},
-                "",
-            ),
+            _make_event(task_id, "task_completed" if status == "completed" else "task_failed", {}, ""),
         )
 
-    def _set_task_result_sync(
-        self, task_id: str, result: dict[str, Any], status: str
-    ) -> None:
+    def _set_task_result_sync(self, task_id: str, result: dict[str, Any], status: str) -> None:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "UPDATE sdk_tasks SET status = ?, result_json = ?, updated_at = ? WHERE task_id = ?",
@@ -1765,9 +1697,7 @@ class SqliteTaskStore:
     def _cancel_task_sync(self, task_id: str) -> bool:
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT status FROM sdk_tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
+            row = conn.execute("SELECT status FROM sdk_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 return False
             status = str(row["status"])
@@ -1812,9 +1742,7 @@ class SqliteTaskStore:
     def _get_result_sync(self, task_id: str) -> dict[str, Any] | None:
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT result_json FROM sdk_tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
+            row = conn.execute("SELECT result_json FROM sdk_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None or row["result_json"] is None:
                 return None
             return json.loads(str(row["result_json"]))
@@ -1886,9 +1814,7 @@ class SqliteTaskStore:
         gate_id: str,
         timeout: float | None,
     ) -> dict[str, Any] | None:
-        deadline = (
-            None if timeout is None else time.monotonic() + max(0.0, float(timeout))
-        )
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         while True:
             resolution = await asyncio.to_thread(
                 self._get_ask_resolution_sync,
@@ -2020,7 +1946,6 @@ class RegistrationClient:
 
     async def register(self) -> None:
         import httpx
-
         last_exc: Exception | None = None
         for attempt in range(1, self._register_max_attempts + 1):
             try:
@@ -2074,16 +1999,13 @@ class RegistrationClient:
 
     async def deregister(self) -> None:
         import httpx
-
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.delete(
                     f"{self._platform_url}/agents/{self._manifest.agent_id}",
                     headers=self._auth_headers(),
                 )
-                _log.info(
-                    "Deregistered from Platform agent_id=%s", self._manifest.agent_id
-                )
+                _log.info("Deregistered from Platform agent_id=%s", self._manifest.agent_id)
         except Exception:
             _log.debug("Deregister failed (non-fatal)", exc_info=True)
 
@@ -2100,7 +2022,6 @@ class RegistrationClient:
 
     async def _heartbeat_loop(self) -> None:
         import httpx
-
         while True:
             await asyncio.sleep(self._heartbeat_interval)
             try:
@@ -2165,9 +2086,7 @@ class Agent:
         self._registration_client: RegistrationClient | None = None
         self._observability = AgentObservability(
             agent_id=manifest.agent_id,
-            sinks=observability_sinks
-            if observability_sinks is not None
-            else build_default_sinks(),
+            sinks=observability_sinks if observability_sinks is not None else build_default_sinks(),
         )
 
     # ── Factory ────────────────────────────────────────────────────────────────
@@ -2268,9 +2187,7 @@ class Agent:
         async def get_invocation(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
             _verify_agent_request_headers(
-                hdrs,
-                method=request.method,
-                path=request.url.path,
+                hdrs, method=request.method, path=request.url.path,
             )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
@@ -2282,9 +2199,7 @@ class Agent:
         async def get_invocation_events(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
             _verify_agent_request_headers(
-                hdrs,
-                method=request.method,
-                path=request.url.path,
+                hdrs, method=request.method, path=request.url.path,
             )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
@@ -2299,9 +2214,7 @@ class Agent:
         async def get_invocation_result(invocation_id: str, request: Request):
             hdrs = RequestHeaders.from_request(request.headers)
             _verify_agent_request_headers(
-                hdrs,
-                method=request.method,
-                path=request.url.path,
+                hdrs, method=request.method, path=request.url.path,
             )
             validate_tenant_context(hdrs)
             record = await self._invocation_store.get_by_invocation_id(invocation_id)
@@ -2328,7 +2241,6 @@ class Agent:
 
         # simple mode
         if m.protocol_mode == "simple" or self._invoke_handler is not None:
-
             @app.post("/invoke")
             async def invoke_endpoint(request: Request):
                 if self._invoke_handler is None:
@@ -2336,25 +2248,17 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    hdrs,
-                    method=request.method,
-                    path=request.url.path,
+                    hdrs, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
-                    (
-                        started_invocation,
-                        invocation,
-                    ) = await self._invocation_store.start_or_get(
+                    started_invocation, invocation = await self._invocation_store.start_or_get(
                         hdrs.idempotency_key,
                         "invoke",
                     )
                     if not started_invocation:
-                        if (
-                            invocation.status == "completed"
-                            and invocation.response is not None
-                        ):
+                        if invocation.status == "completed" and invocation.response is not None:
                             return _coerce_invoke_response(invocation.response)
                         return _duplicate_one_shot_response(invocation)
                 scoped_observability = self._observability.scoped(
@@ -2380,21 +2284,14 @@ class Agent:
                     try:
                         result = await self._invoke_handler(ctx)
                     except Exception as exc:
-                        public_error = public_error_fields(exc)
                         if started_invocation and hdrs.idempotency_key:
+                            public_error = public_error_fields(exc)
                             await self._invocation_store.fail(
                                 hdrs.idempotency_key,
                                 "invoke",
                                 public_error.public_message,
                             )
                             invocation_resolved = True
-                        if isinstance(exc, PublicAgentError):
-                            return {
-                                "status": "failed",
-                                "error": public_error.public_message,
-                                "error_code": public_error.error_code,
-                                "output": {},
-                            }
                         raise
                     response = _coerce_invoke_response(result)
                     if started_invocation and hdrs.idempotency_key:
@@ -2439,7 +2336,6 @@ class Agent:
 
         # stream mode
         if m.protocol_mode == "stream" or self._stream_handler is not None:
-
             @app.post("/stream")
             async def stream_endpoint(request: Request):
                 if self._stream_handler is None:
@@ -2447,30 +2343,19 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    hdrs,
-                    method=request.method,
-                    path=request.url.path,
+                    hdrs, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(hdrs)
                 started_invocation = False
                 if hdrs.idempotency_key:
-                    (
-                        started_invocation,
-                        invocation,
-                    ) = await self._invocation_store.start_or_get(
+                    started_invocation, invocation = await self._invocation_store.start_or_get(
                         hdrs.idempotency_key,
                         "stream",
                     )
                     if not started_invocation:
-                        if (
-                            invocation.status == "completed"
-                            and invocation.events is not None
-                        ):
-
+                        if invocation.status == "completed" and invocation.events is not None:
                             async def _replay() -> AsyncIterator[bytes]:
-                                for event in _sanitized_replay_events(
-                                    list(invocation.events or [])
-                                ):
+                                for event in _sanitized_replay_events(list(invocation.events or [])):
                                     yield (json.dumps(event) + "\n").encode()
 
                             return StreamingResponse(
@@ -2531,8 +2416,7 @@ class Agent:
                             return
                         try:
                             await self._invocation_store.touch(
-                                hdrs.idempotency_key,
-                                "stream",
+                                hdrs.idempotency_key, "stream",
                             )
                         except Exception:  # noqa: BLE001
                             # Heartbeat failure is non-fatal; the lease will
@@ -2578,9 +2462,7 @@ class Agent:
                             try:
                                 kind, payload = await asyncio.wait_for(
                                     event_queue.get(),
-                                    timeout=max(
-                                        _DEFAULT_STREAM_KEEPALIVE_SECONDS, 0.001
-                                    ),
+                                    timeout=max(_DEFAULT_STREAM_KEEPALIVE_SECONDS, 0.001),
                                 )
                             except asyncio.TimeoutError:
                                 yield await _emit_stream_keepalive()
@@ -2649,11 +2531,9 @@ class Agent:
                                 event = payload
                             else:
                                 event = {"kind": "content", "text": str(payload)}
-                            event_kind = (
-                                str(event.get("kind") or event.get("type") or "")
-                                .strip()
-                                .lower()
-                            )
+                            event_kind = str(
+                                event.get("kind") or event.get("type") or ""
+                            ).strip().lower()
                             event_failure_envelope = _failure_envelope(event)
                             if event_failure_envelope is not None:
                                 terminal_error_emitted = True
@@ -2700,9 +2580,7 @@ class Agent:
                                 await self._invocation_store.complete(
                                     hdrs.idempotency_key,
                                     "stream",
-                                    response=_stream_response_from_events(
-                                        emitted_events
-                                    ),
+                                    response=_stream_response_from_events(emitted_events),
                                     events=emitted_events,
                                 )
                                 invocation_resolved = True
@@ -2742,7 +2620,6 @@ class Agent:
 
         # tasks mode
         if m.protocol_mode == "tasks" or self._task_handler is not None:
-
             @app.post("/tasks", status_code=202)
             async def create_task(request: Request, background: BackgroundTasks):
                 if self._task_handler is None:
@@ -2750,9 +2627,7 @@ class Agent:
                 body = await _parse_json(request, HTTPException)
                 hdrs = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    hdrs,
-                    method=request.method,
-                    path=request.url.path,
+                    hdrs, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(hdrs)
                 task_id = f"task-{uuid.uuid4().hex}"
@@ -2767,7 +2642,6 @@ class Agent:
 
                 cancel_event = asyncio.Event()
                 self._cancel_events[task_id] = cancel_event
-
                 async def _emit_usage_event(event: dict[str, Any]) -> None:
                     await self._store.append_event(task_id, event)
 
@@ -2801,9 +2675,7 @@ class Agent:
             async def get_task_status(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    _hdrs_local,
-                    method=request.method,
-                    path=request.url.path,
+                    _hdrs_local, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
@@ -2821,9 +2693,7 @@ class Agent:
             async def get_task_events(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    _hdrs_local,
-                    method=request.method,
-                    path=request.url.path,
+                    _hdrs_local, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
@@ -2839,9 +2709,7 @@ class Agent:
             async def resolve_task_ask(task_id: str, gate_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    _hdrs_local,
-                    method=request.method,
-                    path=request.url.path,
+                    _hdrs_local, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
@@ -2857,11 +2725,7 @@ class Agent:
                         },
                     )
                 body = await _parse_json(request, HTTPException)
-                resolution = (
-                    body.get("resolution")
-                    if isinstance(body.get("resolution"), dict)
-                    else body
-                )
+                resolution = body.get("resolution") if isinstance(body.get("resolution"), dict) else body
                 accepted = await self._store.resolve_ask(
                     task_id,
                     gate_id,
@@ -2879,9 +2743,7 @@ class Agent:
             async def get_task_result(task_id: str, request: Request):
                 _hdrs_local = RequestHeaders.from_request(request.headers)
                 _verify_agent_request_headers(
-                    _hdrs_local,
-                    method=request.method,
-                    path=request.url.path,
+                    _hdrs_local, method=request.method, path=request.url.path,
                 )
                 validate_tenant_context(_hdrs_local)
                 record = await self._store.get_task(task_id)
@@ -2899,29 +2761,18 @@ class Agent:
                 if record.result is None:
                     raise HTTPException(
                         422,
-                        detail={
-                            "error": "no_result",
-                            "task_id": task_id,
-                            "status": record.status,
-                        },
+                        detail={"error": "no_result", "task_id": task_id, "status": record.status},
                     )
                 failure = _failure_envelope(record.result)
-                output = (
-                    _safe_failure_response(failure)
-                    if failure is not None
-                    else record.result
-                )
+                output = _safe_failure_response(failure) if failure is not None else record.result
                 return {"task_id": task_id, "status": record.status, "output": output}
 
             if m.execution.supports_cancel:
-
                 @app.post("/tasks/{task_id}/cancel", status_code=202)
                 async def cancel_task(task_id: str, request: Request):
                     _hdrs_local = RequestHeaders.from_request(request.headers)
                     _verify_agent_request_headers(
-                        _hdrs_local,
-                        method=request.method,
-                        path=request.url.path,
+                        _hdrs_local, method=request.method, path=request.url.path,
                     )
                     validate_tenant_context(_hdrs_local)
                     record = await self._store.get_task(task_id)
@@ -2955,12 +2806,8 @@ class Agent:
             if not isinstance(result, dict):
                 result = {"result": result}
             failure = _failure_envelope(result)
-            normalized = (
-                _safe_failure_response(failure) if failure is not None else result
-            )
-            normalized_status = (
-                str(normalized.get("status") or "completed").strip().lower()
-            )
+            normalized = _safe_failure_response(failure) if failure is not None else result
+            normalized_status = str(normalized.get("status") or "completed").strip().lower()
             await self._store.set_task_result(
                 task_id,
                 normalized,
@@ -2995,18 +2842,12 @@ class Agent:
         url = platform_url or os.environ.get("NOVIE_PLATFORM_BASE_URL", "")
         if url:
             if required is None:
-                required_raw = (
-                    os.environ.get("NOVIE_AGENT_REGISTRATION_REQUIRED", "")
-                    .strip()
-                    .lower()
-                )
+                required_raw = os.environ.get("NOVIE_AGENT_REGISTRATION_REQUIRED", "").strip().lower()
                 required = required_raw in {"1", "true", "yes", "on"}
                 if not required:
                     runtime_mode = os.getenv("NOVIE_RUNTIME_MODE", "").strip().lower()
                     runtime_env = os.getenv("NOVIE_ENV", "").strip().lower()
-                    required = (
-                        runtime_mode == "production" or runtime_env == "production"
-                    )
+                    required = runtime_mode == "production" or runtime_env == "production"
             token = registration_token
             if token is None:
                 token = (
@@ -3049,7 +2890,6 @@ class Agent:
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
-
 
 async def _parse_json(request: Any, http_exc: type) -> dict[str, Any]:
     raw = await request.body()
