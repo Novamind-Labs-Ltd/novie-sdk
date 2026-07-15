@@ -37,6 +37,7 @@ from novie_agent_sdk.runtime import (
     SqliteTaskStore,
     TaskContext,
 )
+from novie_agent_sdk import PublicAgentError
 from novie_agent_sdk.platform_security import sign_agent_platform_headers
 from novie_agent_sdk.testing import (
     assert_http_json_invoke_idempotency_replay,
@@ -1183,7 +1184,7 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
     @agent.stream
     async def handle(ctx: StreamContext):
         yield {"kind": "content", "content": "body"}
-        raise RuntimeError("boom")
+        raise RuntimeError("provider failed: SECRET_USER_OR_SKILL_PROMPT_MARKER")
 
     client = TestClient(agent.build_app())
     with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
@@ -1191,8 +1192,56 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
         events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
 
     assert [event.get("kind") for event in events] == ["content", "terminal_error"]
-    assert events[-1]["error"] == "boom"
+    assert events[-1]["error"] == "Agent execution failed."
+    assert events[-1]["error_code"] == "agent_internal_error"
+    assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(events)
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
+
+
+def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-public-error"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        raise PublicAgentError(
+            error_code="sectioned_authoring_llm_failed",
+            public_message="Document finalization failed.",
+        )
+        yield {"kind": "content", "content": "unreachable"}
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    assert events[-1]["error"] == "Document finalization failed."
+    assert events[-1]["error_code"] == "sectioned_authoring_llm_failed"
+
+
+def test_invoke_handler_failure_stores_only_safe_error():
+    from fastapi.testclient import TestClient
+
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_simple_manifest("invoke-safe-error"), invocation_store=store)
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext):
+        raise RuntimeError("provider failed: SECRET_USER_OR_SKILL_PROMPT_MARKER")
+
+    client = TestClient(agent.build_app(), raise_server_exceptions=False)
+    response = client.post(
+        "/invoke",
+        headers={"Idempotency-Key": "invoke-safe-error-key"},
+        json={"input": {"q": "x"}},
+    )
+    assert response.status_code == 500
+
+    record = store._records[("invoke", "invoke-safe-error-key")]  # noqa: SLF001
+    assert record.error == "Agent execution failed."
+    assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(record.__dict__)
 
 
 def test_stream_endpoint_emits_keepalive_while_handler_is_silent(monkeypatch):

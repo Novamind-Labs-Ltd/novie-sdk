@@ -526,7 +526,7 @@ async def test_stream_handler_exception_propagates_as_500() -> None:
 
     @app.handle
     async def handle(ctx: ArtifactAgentContext) -> ArtifactResult:
-        raise RuntimeError("boom")
+        raise RuntimeError("provider failed: SECRET_USER_OR_SKILL_PROMPT_MARKER")
 
     client = TestClient(app.build_app())
     events: list[dict[str, Any]] = []
@@ -540,7 +540,9 @@ async def test_stream_handler_exception_propagates_as_500() -> None:
             events.append(json.loads(line))
 
     assert events[-1]["kind"] == "terminal_error"
-    assert events[-1]["error"] == "boom"
+    assert events[-1]["error"] == "Agent execution failed."
+    assert events[-1]["error_code"] == "agent_internal_error"
+    assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(events)
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
 
 

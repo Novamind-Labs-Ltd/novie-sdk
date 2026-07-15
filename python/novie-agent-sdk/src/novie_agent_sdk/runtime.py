@@ -87,6 +87,7 @@ from .platform_security import (
     AgentPlatformSignatureError,
     verify_agent_platform_headers,
 )
+from .public_errors import public_error_fields
 from .tenant_scoping import validate_tenant_context
 
 
@@ -2196,10 +2197,11 @@ class Agent:
                         result = await self._invoke_handler(ctx)
                     except Exception as exc:
                         if started_invocation and hdrs.idempotency_key:
+                            public_error = public_error_fields(exc)
                             await self._invocation_store.fail(
                                 hdrs.idempotency_key,
                                 "invoke",
-                                str(exc),
+                                public_error.public_message,
                             )
                             invocation_resolved = True
                         raise
@@ -2374,9 +2376,11 @@ class Agent:
                                 break
                             if kind == "error":
                                 terminal_error_emitted = True
+                                public_error = public_error_fields(payload)
                                 error_event = {
                                     "kind": "terminal_error",
-                                    "error": str(payload),
+                                    "error": public_error.public_message,
+                                    "error_code": public_error.error_code,
                                     "output": {},
                                     "metadata": {
                                         "terminal_source": "sdk_exception_guard",
@@ -2390,7 +2394,8 @@ class Agent:
                                         "stream",
                                         response={
                                             "status": "failed",
-                                            "error": str(payload),
+                                            "error": public_error.public_message,
+                                            "error_code": public_error.error_code,
                                             "output": {},
                                         },
                                         events=emitted_events,
@@ -2651,7 +2656,10 @@ class Agent:
             await self._store.cancel_task(task_id)
         except Exception as exc:
             _log.exception("Task handler raised exception task_id=%s", task_id)
-            await self._store.set_task_error(task_id, str(exc))
+            await self._store.set_task_error(
+                task_id,
+                public_error_fields(exc).public_message,
+            )
         finally:
             self._cancel_events.pop(task_id, None)
 

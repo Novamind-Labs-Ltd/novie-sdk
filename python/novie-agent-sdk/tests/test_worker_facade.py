@@ -463,7 +463,7 @@ async def test_handler_exception_marks_task_failed() -> None:
 
     @app.task
     async def run(ctx: WorkerTaskContext) -> WorkerResult:
-        raise RuntimeError("boom")
+        raise RuntimeError("provider failed: SECRET_USER_OR_SKILL_PROMPT_MARKER")
 
     client = TestClient(app.build_app(), raise_server_exceptions=False)
     resp = client.post("/tasks", json={"input": {}})
@@ -475,7 +475,8 @@ async def test_handler_exception_marks_task_failed() -> None:
         if status["status"] in ("failed", "completed"):
             break
     assert status["status"] == "failed"
-    assert "boom" in status["error"]
+    assert status["error"] == "Agent execution failed."
+    assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in str(status)
 
 
 @pytest.mark.asyncio
