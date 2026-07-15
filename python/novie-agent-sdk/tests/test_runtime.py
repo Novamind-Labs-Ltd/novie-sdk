@@ -8,6 +8,7 @@
 5. Cancel propagation
 6. Task handler 异常处理
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -21,8 +22,17 @@ import pytest
 
 # set up path
 import sys
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent / "novie-platform" / "protocol" / "src"))
+sys.path.insert(
+    0,
+    str(
+        Path(__file__).parent.parent.parent.parent.parent
+        / "novie-platform"
+        / "protocol"
+        / "src"
+    ),
+)
 
 from novie_agent_sdk.runtime import (
     Agent,
@@ -54,6 +64,7 @@ from novie_protocol.contracts.agent_sdk_v2 import AgentManifestV2, ExecutionHint
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _simple_manifest(agent_id: str = "test") -> AgentManifestV2:
     return AgentManifestV2(
@@ -203,13 +214,16 @@ async def test_task_store_idempotency():
 async def test_task_store_events():
     store = InMemoryTaskStore()
     await store.create_task("t1", {})
-    await store.append_event("t1", {
-        "event_id": "e1",
-        "task_id": "t1",
-        "kind": "message",
-        "timestamp": "2026-04-26T00:00:00Z",
-        "text": "hello",
-    })
+    await store.append_event(
+        "t1",
+        {
+            "event_id": "e1",
+            "task_id": "t1",
+            "kind": "message",
+            "timestamp": "2026-04-26T00:00:00Z",
+            "text": "hello",
+        },
+    )
     events = await store.get_events("t1")
     assert len(events) == 1
     assert events[0]["kind"] == "message"
@@ -265,7 +279,9 @@ async def test_task_context_report_llm_usage_emits_platform_token_usage_event():
     ctx = TaskContext(
         task_id="usage-task",
         input={"q": "hello"},
-        headers=RequestHeaders(session_id="sess-1", step_id="step-1", trace_id="trace-1"),
+        headers=RequestHeaders(
+            session_id="sess-1", step_id="step-1", trace_id="trace-1"
+        ),
         agent_manifest=_tasks_manifest("usage-agent"),
         observability=observability,
         _store=store,
@@ -283,7 +299,8 @@ async def test_task_context_report_llm_usage_emits_platform_token_usage_event():
 
     events = await store.get_events("usage-task")
     usage_events = [
-        event for event in events
+        event
+        for event in events
         if event.get("payload", {}).get("agent_event_kind") == "token_usage"
     ]
     assert report["agent_id"] == "usage-agent"
@@ -662,6 +679,7 @@ async def test_sqlite_invocation_store_stale_in_progress_recycled(tmp_path: Path
     # Backdate the row directly to simulate an agent that crashed mid-stream
     # ages ago. (In production this would happen by elapsed wall-clock time.)
     import sqlite3
+
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "UPDATE sdk_one_shot_invocations SET updated_at = ? "
@@ -1306,6 +1324,29 @@ def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
     assert events[-1]["error_code"] == "sectioned_authoring_llm_failed"
 
 
+def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():
+    from fastapi.testclient import TestClient
+
+    agent = Agent(_simple_manifest("invoke-public-error"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext):
+        raise PublicAgentError(
+            error_code="context_budget_exceeded",
+            public_message="Input exceeds worker capacity.",
+        )
+
+    response = TestClient(agent.build_app()).post("/invoke", json={"input": {"q": "x"}})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Input exceeds worker capacity.",
+        "error_code": "context_budget_exceeded",
+        "output": {},
+    }
+
+
 def test_stream_endpoint_sanitizes_explicit_terminal_error_and_marks_store_failed():
     from fastapi.testclient import TestClient
     from novie_agent_sdk.runtime import StreamContext
@@ -1459,9 +1500,7 @@ def test_invoke_endpoint_rejects_nested_failed_output():
             }
         }
 
-    response = TestClient(agent.build_app()).post(
-        "/invoke", json={"input": {"q": "x"}}
-    )
+    response = TestClient(agent.build_app()).post("/invoke", json={"input": {"q": "x"}})
     assert response.status_code == 200
     assert response.json() == {
         "status": "failed",
@@ -1544,7 +1583,9 @@ def test_stream_invocation_status_events_and_result_endpoints():
         json={"input": {"q": "x"}},
     ) as resp:
         assert resp.status_code == 200
-        assert [json.loads(line)["kind"] for line in resp.iter_lines() if line.strip()] == [
+        assert [
+            json.loads(line)["kind"] for line in resp.iter_lines() if line.strip()
+        ] == [
             "content",
             "final",
             "done",
@@ -1635,9 +1676,7 @@ def test_result_cache_stream_agent_replays_after_restart(
     ) as first_resp:
         assert first_resp.status_code == 200
         first_events = [
-            json.loads(line)
-            for line in first_resp.iter_lines()
-            if line.strip()
+            json.loads(line) for line in first_resp.iter_lines() if line.strip()
         ]
 
     agent_b = Agent(_result_cache_stream_manifest("restart-stream"))
@@ -1656,9 +1695,7 @@ def test_result_cache_stream_agent_replays_after_restart(
     ) as replay_resp:
         assert replay_resp.status_code == 200
         replay_events = [
-            json.loads(line)
-            for line in replay_resp.iter_lines()
-            if line.strip()
+            json.loads(line) for line in replay_resp.iter_lines() if line.strip()
         ]
 
     assert replay_events == first_events
@@ -1858,7 +1895,9 @@ async def test_in_memory_task_store_evicts_oldest_when_max_tasks_exceeded():
     await store.create_task("t1", {"x": 1})
     await store.create_task("t2", {"x": 2})
     await store.create_task("t3", {"x": 3})
-    assert {await store.get_task(tid) is not None for tid in ("t1", "t2", "t3")} == {True}
+    assert {await store.get_task(tid) is not None for tid in ("t1", "t2", "t3")} == {
+        True
+    }
 
     # Adding a 4th evicts the oldest (t1).
     await store.create_task("t4", {"x": 4})
