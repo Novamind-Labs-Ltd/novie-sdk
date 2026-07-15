@@ -26,11 +26,13 @@ class _FakeGraph:
         assert stream_mode == ["messages", "values"]
         yield "values", {
             "messages": [
-                HumanMessage(content="# Capability navigation\nSECRET SKILL PROMPT"),
-                SimpleNamespace(type="developer", content="DEVELOPER PROMPT"),
-                SimpleNamespace(role="user", content="USER PROMPT"),
+                HumanMessage(content="# Capability navigation\nSECRET SKILL PROMPT")
             ],
         }
+        yield "values", {
+            "messages": [SimpleNamespace(type="developer", content="DEVELOPER PROMPT")],
+        }
+        yield "values", {"messages": [SimpleNamespace(role="user", content="USER PROMPT")]}
         yield "messages", (AIMessageChunk(content="Draft"), {"node": "agent"})
         yield "values", {"messages": [AIMessage(content="Final narrative.")]}
 

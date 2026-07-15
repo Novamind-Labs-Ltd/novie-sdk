@@ -329,7 +329,7 @@ class DocumentAgentTemplate:
             if stream_mode == "values":
                 if isinstance(payload, dict):
                     last_messages = payload.get("messages") or last_messages
-                if not last_messages or not _is_assistant_message(last_messages[-1]):
+                if last_messages and not _is_assistant_message(last_messages[-1]):
                     continue
                 value_text = extract_values_text(payload) if extract_values_text else ""
                 if value_text:
