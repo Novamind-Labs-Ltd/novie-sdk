@@ -1095,7 +1095,7 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
     for event in events:
         if not isinstance(event, dict):
             continue
-        kind = str(event.get("kind") or event.get("type") or "")
+        kind = str(event.get("kind") or event.get("type") or "").strip().lower()
         if kind in {"error", "failed", "terminal_error"}:
             public_error = public_error_fields_from_envelope(event)
             return {
@@ -1110,12 +1110,23 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
                 chunks.append(text)
         if kind in {"done", "final", "task_completed"}:
             output = event.get("output")
+            event_status = str(event.get("status") or "").strip().lower()
+            if event_status in {"failed", "cancelled"} or "error" in event:
+                public_error = public_error_fields_from_envelope(event)
+                return {
+                    "status": "cancelled" if event_status == "cancelled" else "failed",
+                    "error": public_error.public_message,
+                    "error_code": public_error.error_code,
+                    "output": {},
+                }
             if isinstance(output, dict) and output:
-                nested_status = output.get("status")
+                nested_status = str(output.get("status") or "").strip().lower()
                 if nested_status in {"failed", "cancelled"} or "error" in output:
                     public_error = public_error_fields_from_envelope(output)
                     return {
-                        "status": "failed",
+                        "status": "cancelled"
+                        if nested_status == "cancelled"
+                        else "failed",
                         "error": public_error.public_message,
                         "error_code": public_error.error_code,
                         "output": {},
@@ -1143,7 +1154,8 @@ _INVOKE_RESPONSE_STATUSES = {
 def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
     """Wrap legacy handler output unless it already is a response envelope."""
     if isinstance(result, dict):
-        status = result.get("status")
+        raw_status = result.get("status")
+        status = str(raw_status).strip().lower() if isinstance(raw_status, str) else raw_status
         if (
             isinstance(status, str)
             and status in _INVOKE_RESPONSE_STATUSES
@@ -1158,7 +1170,7 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
             if status in {"failed", "cancelled"} or "error" in result:
                 public_error = public_error_fields_from_envelope(result)
                 sanitized: dict[str, Any] = {
-                    "status": "failed",
+                    "status": "cancelled" if status == "cancelled" else "failed",
                     "error": public_error.public_message,
                     "error_code": public_error.error_code,
                     "output": {},
@@ -2435,11 +2447,53 @@ class Agent:
                             if kind == "obs":
                                 # Already a fully-formed dict (UsageReport.
                                 # to_platform_task_event); forward verbatim.
-                                if isinstance(payload, dict) and str(
-                                    payload.get("kind") or payload.get("type") or ""
-                                ) in {"error", "failed", "terminal_error"}:
+                                obs_kind = (
+                                    str(payload.get("kind") or payload.get("type") or "")
+                                    .strip()
+                                    .lower()
+                                    if isinstance(payload, dict)
+                                    else ""
+                                )
+                                obs_status = (
+                                    str(payload.get("status") or "").strip().lower()
+                                    if isinstance(payload, dict)
+                                    else ""
+                                )
+                                obs_output = (
+                                    payload.get("output")
+                                    if isinstance(payload, dict)
+                                    else None
+                                )
+                                obs_output_status = (
+                                    str(obs_output.get("status") or "").strip().lower()
+                                    if isinstance(obs_output, dict)
+                                    else ""
+                                )
+                                if isinstance(payload, dict) and (
+                                    obs_kind in {"error", "failed", "terminal_error"}
+                                    or obs_status in {"failed", "cancelled"}
+                                    or "error" in payload
+                                    or (
+                                        isinstance(obs_output, dict)
+                                        and (
+                                            obs_output_status in {"failed", "cancelled"}
+                                            or "error" in obs_output
+                                        )
+                                    )
+                                ):
                                     terminal_error_emitted = True
-                                    public_error = public_error_fields_from_envelope(payload)
+                                    failure_envelope = (
+                                        obs_output
+                                        if isinstance(obs_output, dict)
+                                        and (
+                                            obs_output_status in {"failed", "cancelled"}
+                                            or "error" in obs_output
+                                        )
+                                        else payload
+                                    )
+                                    public_error = public_error_fields_from_envelope(
+                                        failure_envelope
+                                    )
                                     safe_event = {
                                         "kind": "terminal_error",
                                         "error": public_error.public_message,
@@ -2470,18 +2524,44 @@ class Agent:
                                 event = payload
                             else:
                                 event = {"kind": "content", "text": str(payload)}
-                            event_kind = str(event.get("kind") or event.get("type") or "")
+                            event_kind = str(
+                                event.get("kind") or event.get("type") or ""
+                            ).strip().lower()
+                            event_status = str(event.get("status") or "").strip().lower()
                             event_output = event.get("output")
+                            event_output_status = (
+                                str(event_output.get("status") or "").strip().lower()
+                                if isinstance(event_output, dict)
+                                else ""
+                            )
                             if (
                                 event_kind in {"done", "final", "task_completed"}
-                                and isinstance(event_output, dict)
                                 and (
-                                    event_output.get("status") in {"failed", "cancelled"}
-                                    or "error" in event_output
+                                    event_status in {"failed", "cancelled"}
+                                    or "error" in event
+                                    or (
+                                        isinstance(event_output, dict)
+                                        and (
+                                            event_output_status in {"failed", "cancelled"}
+                                            or "error" in event_output
+                                        )
+                                    )
                                 )
                             ):
                                 terminal_error_emitted = True
-                                public_error = public_error_fields_from_envelope(event_output)
+                                # A terminal envelope may carry the failure at the
+                                # top level (with no mapping-valued ``output``).
+                                # Always sanitize the mapping that actually owns
+                                # the failure fields so malformed envelopes cannot
+                                # crash the stream guard or leak their payload.
+                                failure_envelope = (
+                                    event_output
+                                    if isinstance(event_output, dict)
+                                    else event
+                                )
+                                public_error = public_error_fields_from_envelope(
+                                    failure_envelope
+                                )
                                 safe_event = {
                                     "kind": "terminal_error",
                                     "error": public_error.public_message,
