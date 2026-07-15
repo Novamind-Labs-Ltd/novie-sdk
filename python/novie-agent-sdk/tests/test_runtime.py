@@ -951,6 +951,31 @@ def test_simple_agent_sanitizes_failed_envelope_without_error_field() -> None:
     }
 
 
+def test_simple_agent_rejects_completed_envelope_with_error_and_output() -> None:
+    from fastapi.testclient import TestClient
+
+    agent = Agent(_simple_manifest("invoke-inconsistent-completed"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext) -> dict[str, Any]:
+        return {
+            "status": "completed",
+            "error": "RAW_SECRET_USER_PROMPT",
+            "output": {"draft": "RAW_SECRET_USER_PROMPT"},
+        }
+
+    client = TestClient(agent.build_app())
+    response = client.post("/invoke", json={"input": {"q": "x"}})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Agent execution failed.",
+        "error_code": "agent_internal_error",
+        "output": {},
+    }
+
+
 @pytest.mark.asyncio
 async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     from fastapi.testclient import TestClient
@@ -1313,6 +1338,33 @@ def test_stream_endpoint_sanitizes_explicit_terminal_error_and_marks_store_faile
     record = store._records[("stream", "explicit-stream-failure-key")]  # noqa: SLF001
     assert record.status == "failed"
     assert record.error == "Agent execution failed."
+
+
+def test_stream_endpoint_rejects_nested_failed_final_output():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-nested-failure"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {
+            "kind": "final",
+            "output": {
+                "status": "failed",
+                "error": "RAW_SECRET_USER_PROMPT",
+                "draft": "RAW_SECRET_USER_PROMPT",
+            },
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as response:
+        events = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in events] == ["terminal_error"]
+    assert events[0]["error"] == "Agent execution failed."
+    assert events[0]["error_code"] == "agent_internal_error"
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
 
 
 def test_invoke_handler_failure_stores_only_safe_error():

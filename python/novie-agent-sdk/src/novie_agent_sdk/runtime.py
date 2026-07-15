@@ -1111,6 +1111,15 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
         if kind in {"done", "final", "task_completed"}:
             output = event.get("output")
             if isinstance(output, dict) and output:
+                nested_status = output.get("status")
+                if nested_status in {"failed", "cancelled"} or "error" in output:
+                    public_error = public_error_fields_from_envelope(output)
+                    return {
+                        "status": "failed",
+                        "error": public_error.public_message,
+                        "error_code": public_error.error_code,
+                        "output": {},
+                    }
                 final_output = dict(output)
     transcript = "".join(chunks)
     return {
@@ -1149,18 +1158,11 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
             if status in {"failed", "cancelled"} or "error" in result:
                 public_error = public_error_fields_from_envelope(result)
                 sanitized: dict[str, Any] = {
-                    "status": status,
+                    "status": "failed",
                     "error": public_error.public_message,
                     "error_code": public_error.error_code,
+                    "output": {},
                 }
-                if status in {"failed", "cancelled"}:
-                    sanitized["output"] = {}
-                else:
-                    # Preserve the non-error part of a confirmation/completed
-                    # envelope, but never forward the handler's raw error.
-                    for key in ("output", "confirmation"):
-                        if key in result:
-                            sanitized[key] = result[key]
                 return sanitized
             return dict(result)
     return {"output": result, "status": "completed"}
@@ -2468,7 +2470,39 @@ class Agent:
                                 event = payload
                             else:
                                 event = {"kind": "content", "text": str(payload)}
-                            if str(event.get("kind") or event.get("type") or "") in {
+                            event_kind = str(event.get("kind") or event.get("type") or "")
+                            event_output = event.get("output")
+                            if (
+                                event_kind in {"done", "final", "task_completed"}
+                                and isinstance(event_output, dict)
+                                and (
+                                    event_output.get("status") in {"failed", "cancelled"}
+                                    or "error" in event_output
+                                )
+                            ):
+                                terminal_error_emitted = True
+                                public_error = public_error_fields_from_envelope(event_output)
+                                safe_event = {
+                                    "kind": "terminal_error",
+                                    "error": public_error.public_message,
+                                    "error_code": public_error.error_code,
+                                    "output": {},
+                                    "metadata": {
+                                        "terminal_source": "sdk_envelope_guard",
+                                        "agent_id": m.agent_id,
+                                    },
+                                }
+                                emitted_events.append(safe_event)
+                                if started_invocation and hdrs.idempotency_key:
+                                    await self._invocation_store.fail(
+                                        hdrs.idempotency_key,
+                                        "stream",
+                                        public_error.public_message,
+                                    )
+                                    invocation_resolved = True
+                                yield (json.dumps(safe_event) + "\n").encode()
+                                break
+                            if event_kind in {
                                 "error", "failed", "terminal_error",
                             }:
                                 terminal_error_emitted = True

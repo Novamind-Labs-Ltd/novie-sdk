@@ -602,6 +602,7 @@ class SectionedLongformAuthor:
         self._artifact_type = artifact_type
         self._step_id = step_id
         self._capability_id = capability_id
+        self._defer_intermediate_artifacts = defer_intermediate_artifacts
         self._context_budget = dict(context_budget or {})
         self._contract = (
             authoring_contract
@@ -959,12 +960,19 @@ class SectionedLongformAuthor:
             finalization=self._contract.finalization,
         )
         final_markdown = await self._polish_final(brief=brief, drafts=drafts)
-        final_ref = await self._record_final(
-            final_markdown,
-            workflow_id=workflow_id,
-            thread_id=thread_id,
-            agent_id=agent_id,
-        )
+        # Fail-closed document agents publish the final deliverable through
+        # the platform's completed-output materializer. Keeping the SDK-side
+        # artifact in memory until that boundary avoids a durable final
+        # artifact surviving cancellation between authoring and transport
+        # success. Legacy callers retain the original ledger behavior.
+        final_ref: dict[str, Any] = {}
+        if not self._defer_intermediate_artifacts:
+            final_ref = await self._record_final(
+                final_markdown,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+            )
         await self._checkpoint(
             current_phase="finalize",
             length_profile=length_profile,
