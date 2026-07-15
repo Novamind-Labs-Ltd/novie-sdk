@@ -1080,7 +1080,7 @@ def _duplicate_one_shot_response(record: OneShotInvocationRecord) -> Any:
 def _one_shot_invocation_view(record: OneShotInvocationRecord) -> dict[str, Any]:
     public_error = (
         "Agent execution failed."
-        if record.status in {"failed", "cancelled"} and record.error
+        if record.status in {"failed", "cancelled", "error", "terminal_error"} and record.error
         else record.error
     )
     return {
@@ -1112,7 +1112,11 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
     terminal_kind = kind in {
         "error", "failed", "terminal_error", "cancelled", "canceled", "cancel"
     }
-    if status in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"} or terminal_kind or _has_nonempty_error(envelope.get("error")):
+    if (
+        status in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"}
+        or terminal_kind
+        or _has_nonempty_error(envelope.get("error"))
+    ):
         return envelope
     for key in ("output", "payload", "metadata"):
         nested = _failure_envelope(envelope.get(key))
@@ -1130,7 +1134,7 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
 def _failure_status(envelope: dict[str, Any]) -> str:
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
-    return "cancelled" if status == "cancelled" or kind in {"cancelled", "canceled", "cancel"} else "failed"
+    return "cancelled" if status in {"cancelled", "canceled", "cancel"} or kind in {"cancelled", "canceled", "cancel"} else "failed"
 
 
 def _safe_failure_response(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -2682,11 +2686,7 @@ class Agent:
                     "status": record.status,
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,
-                    "error": (
-                        "Agent execution failed."
-                        if record.status in {"failed", "cancelled"} and record.error
-                        else record.error
-                    ),
+                    "error": record.error,
                 }
 
             @app.get("/tasks/{task_id}/events")
