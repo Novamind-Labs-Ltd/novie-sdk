@@ -1306,6 +1306,31 @@ def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
     assert events[-1]["error_code"] == "sectioned_authoring_llm_failed"
 
 
+def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():
+    from fastapi.testclient import TestClient
+
+    agent = Agent(_simple_manifest("invoke-public-error"))
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext):
+        raise PublicAgentError(
+            error_code="context_budget_exceeded",
+            public_message="Input exceeds worker capacity.",
+        )
+
+    response = TestClient(agent.build_app()).post(
+        "/invoke", json={"input": {"q": "x"}}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "failed",
+        "error": "Input exceeds worker capacity.",
+        "error_code": "context_budget_exceeded",
+        "output": {},
+    }
+
+
 def test_stream_endpoint_sanitizes_explicit_terminal_error_and_marks_store_failed():
     from fastapi.testclient import TestClient
     from novie_agent_sdk.runtime import StreamContext

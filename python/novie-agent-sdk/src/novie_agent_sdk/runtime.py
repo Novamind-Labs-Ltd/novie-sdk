@@ -87,7 +87,11 @@ from .platform_security import (
     AgentPlatformSignatureError,
     verify_agent_platform_headers,
 )
-from .public_errors import public_error_fields, public_error_fields_from_envelope
+from .public_errors import (
+    PublicAgentError,
+    public_error_fields,
+    public_error_fields_from_envelope,
+)
 from .tenant_scoping import validate_tenant_context
 
 
@@ -2284,14 +2288,21 @@ class Agent:
                     try:
                         result = await self._invoke_handler(ctx)
                     except Exception as exc:
+                        public_error = public_error_fields(exc)
                         if started_invocation and hdrs.idempotency_key:
-                            public_error = public_error_fields(exc)
                             await self._invocation_store.fail(
                                 hdrs.idempotency_key,
                                 "invoke",
                                 public_error.public_message,
                             )
                             invocation_resolved = True
+                        if isinstance(exc, PublicAgentError):
+                            return {
+                                "status": "failed",
+                                "error": public_error.public_message,
+                                "error_code": public_error.error_code,
+                                "output": {},
+                            }
                         raise
                     response = _coerce_invoke_response(result)
                     if started_invocation and hdrs.idempotency_key:
