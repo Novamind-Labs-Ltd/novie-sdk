@@ -1316,6 +1316,8 @@ def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():
         raise PublicAgentError(
             error_code="context_budget_exceeded",
             public_message="Input exceeds worker capacity.",
+            replan_eligible=True,
+            repair_eligible=True,
         )
 
     response = TestClient(agent.build_app()).post(
@@ -1328,6 +1330,9 @@ def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():
         "error": "Input exceeds worker capacity.",
         "error_code": "context_budget_exceeded",
         "output": {},
+        "retryable": False,
+        "replan_eligible": True,
+        "repair_eligible": True,
     }
 
 

@@ -16,10 +16,21 @@ class PublicErrorFields:
 class PublicAgentError(RuntimeError):
     """An intentional public failure with no raw-cause serialization."""
 
-    def __init__(self, *, error_code: str, public_message: str) -> None:
+    def __init__(
+        self,
+        *,
+        error_code: str,
+        public_message: str,
+        retryable: bool = False,
+        replan_eligible: bool = False,
+        repair_eligible: bool = False,
+    ) -> None:
         super().__init__(public_message)
         self.error_code = error_code
         self.public_message = public_message
+        self.retryable = retryable
+        self.replan_eligible = replan_eligible
+        self.repair_eligible = repair_eligible
 
 
 _SAFE_ENVELOPE_MESSAGES = {

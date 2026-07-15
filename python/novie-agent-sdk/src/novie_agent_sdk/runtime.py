@@ -2302,6 +2302,9 @@ class Agent:
                                 "error": public_error.public_message,
                                 "error_code": public_error.error_code,
                                 "output": {},
+                                "retryable": exc.retryable,
+                                "replan_eligible": exc.replan_eligible,
+                                "repair_eligible": exc.repair_eligible,
                             }
                         raise
                     response = _coerce_invoke_response(result)
@@ -2493,6 +2496,12 @@ class Agent:
                                         "agent_id": m.agent_id,
                                     },
                                 }
+                                if isinstance(payload, PublicAgentError):
+                                    error_event.update(
+                                        retryable=payload.retryable,
+                                        replan_eligible=payload.replan_eligible,
+                                        repair_eligible=payload.repair_eligible,
+                                    )
                                 emitted_events.append(error_event)
                                 if started_invocation and hdrs.idempotency_key:
                                     await self._invocation_store.fail(
