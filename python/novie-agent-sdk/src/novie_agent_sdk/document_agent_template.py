@@ -35,6 +35,14 @@ class DocumentGraphStreamResult:
 PhaseMetadataBuilder = Callable[..., dict[str, Any]]
 
 
+def _is_assistant_message(message: Any) -> bool:
+    message_type = str(getattr(message, "type", "") or "").strip().lower()
+    if message_type in {"ai", "assistant", "aimessage", "aimessagechunk"}:
+        return True
+    role = str(getattr(message, "role", "") or "").strip().lower()
+    return role in {"ai", "assistant"}
+
+
 class DocumentAgentTemplate:
     """Shared runtime helpers for custom document-agent loops.
 
@@ -321,6 +329,8 @@ class DocumentAgentTemplate:
             if stream_mode == "values":
                 if isinstance(payload, dict):
                     last_messages = payload.get("messages") or last_messages
+                if not last_messages or not _is_assistant_message(last_messages[-1]):
+                    continue
                 value_text = extract_values_text(payload) if extract_values_text else ""
                 if value_text:
                     narrative_parts.append(value_text)
