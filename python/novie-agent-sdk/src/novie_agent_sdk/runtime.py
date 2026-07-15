@@ -1112,12 +1112,18 @@ def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
     terminal_kind = kind in {
         "error", "failed", "terminal_error", "cancelled", "canceled", "cancel"
     }
-    if status in {"failed", "cancelled"} or terminal_kind or _has_nonempty_error(envelope.get("error")):
+    if status in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"} or terminal_kind or _has_nonempty_error(envelope.get("error")):
         return envelope
     for key in ("output", "payload", "metadata"):
         nested = _failure_envelope(envelope.get(key))
         if nested is not None:
             return nested
+    for item in envelope.values():
+        if isinstance(item, list):
+            for nested_item in item:
+                nested = _failure_envelope(nested_item)
+                if nested is not None:
+                    return nested
     return None
 
 
@@ -2676,7 +2682,11 @@ class Agent:
                     "status": record.status,
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,
-                    "error": record.error,
+                    "error": (
+                        "Agent execution failed."
+                        if record.status in {"failed", "cancelled"} and record.error
+                        else record.error
+                    ),
                 }
 
             @app.get("/tasks/{task_id}/events")
@@ -2690,7 +2700,10 @@ class Agent:
                 if record is None:
                     raise HTTPException(404, f"Task {task_id!r} not found")
                 events = await self._store.get_events(task_id)
-                return {"task_id": task_id, "events": events}
+                return {
+                    "task_id": task_id,
+                    "events": _sanitized_replay_events(events),
+                }
 
             @app.post("/tasks/{task_id}/asks/{gate_id}/resolve", status_code=202)
             async def resolve_task_ask(task_id: str, gate_id: str, request: Request):
@@ -2750,7 +2763,9 @@ class Agent:
                         422,
                         detail={"error": "no_result", "task_id": task_id, "status": record.status},
                     )
-                return {"task_id": task_id, "status": record.status, "output": record.result}
+                failure = _failure_envelope(record.result)
+                output = _safe_failure_response(failure) if failure is not None else record.result
+                return {"task_id": task_id, "status": record.status, "output": output}
 
             if m.execution.supports_cancel:
                 @app.post("/tasks/{task_id}/cancel", status_code=202)
