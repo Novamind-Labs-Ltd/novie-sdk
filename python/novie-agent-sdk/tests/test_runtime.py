@@ -891,6 +891,42 @@ async def test_simple_agent_invoke_passes_through_terminal_envelope():
     assert "output" not in body
 
 
+def test_simple_agent_sanitizes_explicit_failed_envelope_and_store() -> None:
+    from fastapi.testclient import TestClient
+
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_simple_manifest("invoke-explicit-failure"), invocation_store=store)
+
+    @agent.invoke
+    async def handle(ctx: InvokeContext) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "error": "RAW_SECRET_USER_PROMPT",
+            "error_code": "provider_raw_error",
+            "output": {"draft": "RAW_SECRET_USER_PROMPT"},
+        }
+
+    client = TestClient(agent.build_app())
+    response = client.post(
+        "/invoke",
+        headers={"Idempotency-Key": "explicit-failure-key"},
+        json={"input": {"q": "x"}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "status": "failed",
+        "error": "Agent execution failed.",
+        "error_code": "agent_internal_error",
+        "output": {},
+    }
+    record = store._records[("invoke", "explicit-failure-key")]  # noqa: SLF001
+    assert record.status == "failed"
+    assert record.error == "Agent execution failed."
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(record.__dict__)
+
+
 @pytest.mark.asyncio
 async def test_simple_agent_requires_signed_headers_in_production(monkeypatch):
     from fastapi.testclient import TestClient
@@ -1219,6 +1255,40 @@ def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
 
     assert events[-1]["error"] == "Document finalization failed."
     assert events[-1]["error_code"] == "sectioned_authoring_llm_failed"
+
+
+def test_stream_endpoint_sanitizes_explicit_terminal_error_and_marks_store_failed():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    store = InMemoryOneShotInvocationStore()
+    agent = Agent(_stream_manifest("stream-explicit-failure"), invocation_store=store)
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "draft"}
+        yield {
+            "kind": "terminal_error",
+            "error": "RAW_SECRET_USER_PROMPT",
+            "error_code": "provider_raw_error",
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        headers={"Idempotency-Key": "explicit-stream-failure-key"},
+        json={"input": {"q": "x"}},
+    ) as response:
+        events = [json.loads(line) for line in response.iter_lines() if line.strip()]
+
+    assert [event["kind"] for event in events] == ["content", "terminal_error"]
+    assert events[-1]["error"] == "Agent execution failed."
+    assert events[-1]["error_code"] == "agent_internal_error"
+    assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
+    record = store._records[("stream", "explicit-stream-failure-key")]  # noqa: SLF001
+    assert record.status == "failed"
+    assert record.error == "Agent execution failed."
 
 
 def test_invoke_handler_failure_stores_only_safe_error():

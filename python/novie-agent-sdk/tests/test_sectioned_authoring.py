@@ -993,6 +993,40 @@ async def test_sectioned_author_rejects_placeholder_section_drafts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deferred_intermediate_artifacts_do_not_persist_on_failure() -> None:
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_EmptyDraftLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+        },
+        defer_intermediate_artifacts=True,
+    )
+
+    with pytest.raises(RuntimeError, match="section_quality_gate_failed:context"):
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
+
+    assert platform.artifacts.created == []
+    assert platform.workpads.entries == []
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
 async def test_sectioned_author_excludes_current_step_workpad_refs_from_evidence() -> None:
     platform = _FakePlatform()
     platform.workpads.snapshot_entries = [
