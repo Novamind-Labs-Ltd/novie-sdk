@@ -290,6 +290,7 @@ record = await put_external_agent_checkpoint(
     payload=checkpoint_payload,
     workflow_id=ctx.workflow_id or None,
     step_id=step_id or None,
+    parent_checkpoint_id=previous_checkpoint_id or None,
     summary="draft complete",
     metadata={
         "capability_id": spec.capability_id,
@@ -303,6 +304,7 @@ Purpose:
 
 - Writes an external-agent checkpoint across old and new platform service
   shapes.
+- Links the new record to its parent when `parent_checkpoint_id` is supplied.
 
 ### `get_matching_document_checkpoint`
 

@@ -317,6 +317,7 @@ def test_external_checkpoint_helpers_support_new_service_shape() -> None:
             payload={"current_phase": "finalize"},
             workflow_id="workflow-1",
             step_id="step-1",
+            parent_checkpoint_id="ckpt-parent",
             summary="draft complete",
             metadata={"capability_id": "agent.demo.write"},
         )
@@ -326,3 +327,4 @@ def test_external_checkpoint_helpers_support_new_service_shape() -> None:
     assert calls[0]["owner_agent_id"] == "demo"
     assert calls[0]["thread_id"] == "thread-1"
     assert calls[0]["payload"]["current_phase"] == "finalize"
+    assert calls[0]["parent_checkpoint_id"] == "ckpt-parent"
