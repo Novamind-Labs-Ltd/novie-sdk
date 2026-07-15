@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 
 import httpx
@@ -51,13 +53,29 @@ def test_build_callback_headers_falls_back_to_service_principal() -> None:
     assert "x-novie-user-id" not in headers
 
 
+def test_build_callback_headers_forwards_delegated_billing_identity() -> None:
+    headers = build_platform_callback_headers(
+        {
+            "x-novie-tenant-id": "tenant-1",
+            "x-novie-project-id": "project-1",
+            "x-novie-service-principal": "agent:analyst",
+            "x-novie-on-behalf-of-user-id": "user-1",
+        },
+        agent_id="analyst",
+    )
+
+    assert headers["x-novie-service-principal"] == "agent:analyst"
+    assert headers["x-novie-on-behalf-of-user-id"] == "user-1"
+
+
 def test_sign_callback_headers_matches_gateway_canonical_shape() -> None:
     headers = sign_platform_callback_headers(
         {
             "x-novie-org-id": "tenant-1",
             "x-novie-project-id": "project-1",
             "x-novie-workspace-id": "workspace-1",
-            "x-novie-user-id": "user-1",
+            "x-novie-service-principal": "agent:analyst",
+            "x-novie-on-behalf-of-user-id": "user-1",
             "x-novie-session-id": "session-1",
             "x-novie-request-id": "request-1",
         },
@@ -69,8 +87,16 @@ def test_sign_callback_headers_matches_gateway_canonical_shape() -> None:
 
     assert headers["x-novie-timestamp"] == "100"
     assert headers["x-novie-sig"].startswith("sha256=")
-    # Signature includes workspace_id to match gateway trusted-header canonical.
     assert headers["x-novie-workspace-id"] == "workspace-1"
+    canonical = "\n".join(
+        [
+            "POST", "/capabilities/platform.knowledge.search/invoke",
+            "tenant-1", "project-1", "workspace-1", "", "agent:analyst",
+            "session-1", "request-1", "100", "user-1",
+        ]
+    )
+    expected = hmac.new(b"secret", canonical.encode(), hashlib.sha256).hexdigest()
+    assert headers["x-novie-sig"] == f"sha256={expected}"
 
 
 @pytest.mark.asyncio

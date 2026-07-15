@@ -97,20 +97,22 @@ def agent_platform_signature(
     timestamp: str,
 ) -> str:
     values = _lower_headers(headers)
-    canonical = "\n".join(
-        [
-            method.upper(),
-            _normalize_path(path),
-            values.get("x-novie-org-id") or values.get("x-novie-tenant-id", ""),
-            values.get("x-novie-project-id", ""),
-            values.get("x-novie-workspace-id", ""),
-            values.get("x-novie-user-id", ""),
-            values.get("x-novie-service-principal", ""),
-            values.get("x-novie-session-id", ""),
-            values.get("x-novie-request-id", ""),
-            timestamp,
-        ]
-    )
+    canonical_parts = [
+        method.upper(),
+        _normalize_path(path),
+        values.get("x-novie-org-id") or values.get("x-novie-tenant-id", ""),
+        values.get("x-novie-project-id", ""),
+        values.get("x-novie-workspace-id", ""),
+        values.get("x-novie-user-id", ""),
+        values.get("x-novie-service-principal", ""),
+        values.get("x-novie-session-id", ""),
+        values.get("x-novie-request-id", ""),
+        timestamp,
+    ]
+    on_behalf_of_user_id = values.get("x-novie-on-behalf-of-user-id", "")
+    if on_behalf_of_user_id:
+        canonical_parts.append(on_behalf_of_user_id)
+    canonical = "\n".join(canonical_parts)
     return hmac.new(
         secret.encode("utf-8"),
         canonical.encode("utf-8"),
