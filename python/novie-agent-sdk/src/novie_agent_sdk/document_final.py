@@ -108,7 +108,16 @@ def document_final_output(
     if flags:
         output["degraded_flags"] = flags
     if quality:
-        output.update(dict(quality))
+        quality_metadata = dict(quality)
+        if "status" in quality_metadata:
+            quality_metadata.setdefault(
+                "quality_status", quality_metadata.pop("status")
+            )
+        if "reason" in quality_metadata:
+            quality_metadata.setdefault(
+                "quality_reason", quality_metadata.pop("reason")
+            )
+        output.update(quality_metadata)
     if resumed_from_checkpoint:
         output["resumed_from_checkpoint"] = True
     if extra:
