@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
 import os
 import re
-import inspect
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 from novie_protocol.agents import AgentStreamEvent
 
@@ -467,6 +468,320 @@ async def run_sectioned_document_finalization(
         finalize_strategy=required_strategy,
         finalize_attempts=1,
     )
+
+
+async def astream_sectioned_document_finalization(
+    *,
+    llm_facade: Any | None,
+    skill_contract: SkillRuntimeContract | None,
+    artifact_type: str,
+    step_id: str,
+    capability_id: str,
+    context_budget: Mapping[str, Any],
+    brief: Mapping[str, Any],
+    upstream: Mapping[str, Any],
+    workflow_id: str | None = None,
+    thread_id: str | None = None,
+    agent_id: str | None = None,
+    mode_metadata: Mapping[str, Any] | None = None,
+    draft_narrative: str = "",
+    draft_narrative_key: str = "",
+    draft_narrative_artifact_type: str = "",
+    draft_narrative_summary: str = "",
+    document_input: Mapping[str, Any] | None = None,
+    agent_disabled_env_var: str | None = None,
+    agent_enabled_env_var: str | None = None,
+    required_strategy: str = "sectioned_longform",
+    quality_reason: str = "sectioned_authoring_quality_gates",
+    quality_metadata: Mapping[str, Any] | None = None,
+    defer_intermediate_artifacts: bool = False,
+    length_profile: str | None = None,
+    profile_source: str = "skill_default",
+    profile_confidence: str = "confirmed",
+    resume_state: Mapping[str, Any] | None = None,
+    phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+    rebase_artifact_types_to_runtime: bool = False,
+) -> AsyncIterator[AgentStreamEvent | SectionedDocumentFinalizationResult]:
+    """Gold-path sectioned finalize used by report_synthesis-style document agents.
+
+    Streams phase/content events while ``SectionedLongformAuthor`` runs, then
+    yields a terminal ``SectionedDocumentFinalizationResult``. Callers own the
+    typed artifact envelope and final event.
+    """
+    if skill_contract is None or skill_contract.is_empty:
+        raise RuntimeError(
+            "sectioned_authoring_required: document finalization requires "
+            "a skill runtime contract"
+        )
+    if skill_contract.strategy != required_strategy:
+        raise RuntimeError(
+            "sectioned_authoring_required: document finalization requires "
+            f"runtime.strategy={required_strategy} skill contracts"
+        )
+    if not sectioned_authoring_enabled(
+        agent_disabled_env_var=agent_disabled_env_var,
+        agent_enabled_env_var=agent_enabled_env_var,
+    ):
+        raise RuntimeError("sectioned_authoring_disabled")
+    if llm_facade is None:
+        raise RuntimeError("sectioned_authoring_llm_unavailable")
+    platform_ns = platform_namespace_from_llm_facade(llm_facade)
+    if platform_ns is None:
+        raise RuntimeError("sectioned_authoring_platform_namespace_unavailable")
+
+    resolved_profile = _resolve_length_profile_for_finalize(
+        skill_contract,
+        length_profile=length_profile,
+        profile_source=profile_source,
+        profile_confidence=profile_confidence,
+    )
+    authoring_contract = sectioned_authoring_contract_from_skill(
+        skill_contract,
+        artifact_type=artifact_type,
+        length_profile=resolved_profile["profile"],
+        profile_source=resolved_profile["source"],
+        profile_confidence=resolved_profile["confidence"],
+    )
+    if rebase_artifact_types_to_runtime and isinstance(authoring_contract, dict):
+        declared_final = authoring_contract.get("final_artifact_type")
+        if artifact_type and declared_final != artifact_type:
+            authoring_contract = {
+                **authoring_contract,
+                "outline_artifact_type": f"{artifact_type}.outline",
+                "section_artifact_type": f"{artifact_type}.section",
+                "final_artifact_type": artifact_type,
+            }
+
+    mode_meta = dict(mode_metadata or {})
+    yield AgentStreamEvent(
+        kind="trace",
+        metadata={
+            "event": "sectioned_authoring_started",
+            "runtime_phase": "sectioned_authoring",
+            "semantic_phase": "finalizing_output",
+            **mode_meta,
+            "capability_id": capability_id,
+            "authoring_strategy": required_strategy,
+            "length_profile": resolved_profile["profile"],
+            "profile_source": resolved_profile["source"],
+            "profile_confidence": resolved_profile["confidence"],
+            "skill_contract": skill_contract.to_metadata(),
+        },
+    )
+
+    sectioned_done = object()
+    sectioned_events: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+
+    def _collect_sectioned_event(event: Mapping[str, Any]) -> None:
+        sectioned_events.put_nowait(dict(event))
+
+    author = SectionedLongformAuthor(
+        llm_facade=llm_facade,
+        platform=platform_ns,
+        artifact_type=artifact_type,
+        step_id=step_id or "",
+        capability_id=capability_id,
+        context_budget=dict(context_budget),
+        authoring_contract=authoring_contract,
+        defer_intermediate_artifacts=defer_intermediate_artifacts,
+        phase_event_sink=_collect_sectioned_event,
+        phase_checkpoint_sink=phase_checkpoint_sink,
+    )
+    authoring_upstream: dict[str, Any] = dict(upstream)
+    if draft_narrative_key:
+        authoring_upstream[draft_narrative_key] = {
+            "artifact_type": draft_narrative_artifact_type or draft_narrative_key,
+            "summary": draft_narrative_summary,
+            "content": draft_narrative,
+        }
+    if document_input:
+        authoring_upstream["_document_input"] = dict(document_input)
+
+    async def _author_document() -> SectionedAuthoringResult:
+        try:
+            return await author.author(
+                brief=brief,
+                upstream=authoring_upstream,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+                resume_state=dict(resume_state) if resume_state is not None else None,
+            )
+        finally:
+            sectioned_events.put_nowait(sectioned_done)
+
+    author_task = asyncio.create_task(_author_document())
+    try:
+        while True:
+            sectioned_event = await sectioned_events.get()
+            if sectioned_event is sectioned_done:
+                break
+            event_metadata = {
+                **mode_meta,
+                "capability_id": capability_id,
+                **dict(sectioned_event),
+            }
+            for stream_event in project_sectioned_phase_event(event_metadata):
+                yield stream_event
+        authoring_result = await author_task
+    finally:
+        if not author_task.done():
+            author_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await author_task
+
+    completed_event = AgentStreamEvent(
+        kind="trace",
+        metadata={
+            "event": "sectioned_authoring_completed",
+            "runtime_phase": "sectioned_authoring",
+            "semantic_phase": "finalizing_output",
+            **mode_meta,
+            "capability_id": capability_id,
+            "finalize_strategy": required_strategy,
+            "authoring_strategy": required_strategy,
+            "length_profile": resolved_profile["profile"],
+            "profile_source": resolved_profile["source"],
+            "section_count": len(authoring_result.drafts),
+            "authoring_ledger": dict(authoring_result.ledger),
+        },
+    )
+    yield completed_event
+    quality_result = skipped_quality_result(
+        authoring_result.markdown,
+        reason=quality_reason,
+        metadata={
+            **dict(quality_metadata or {}),
+            "section_count": len(authoring_result.drafts),
+            "authoring_ledger": dict(authoring_result.ledger),
+            "length_profile": resolved_profile["profile"],
+        },
+    )
+    yield SectionedDocumentFinalizationResult(
+        authoring_result=authoring_result,
+        quality_result=quality_result,
+        started_event=AgentStreamEvent(
+            kind="trace",
+            metadata={
+                "event": "sectioned_authoring_started",
+                "runtime_phase": "sectioned_authoring",
+                "semantic_phase": "finalizing_output",
+                **mode_meta,
+                "capability_id": capability_id,
+                "authoring_strategy": required_strategy,
+            },
+        ),
+        completed_event=completed_event,
+        finalize_strategy=required_strategy,
+        finalize_attempts=1,
+    )
+
+
+def project_sectioned_phase_event(
+    metadata: Mapping[str, Any],
+) -> list[AgentStreamEvent]:
+    """Project SDK sectioned-authoring phase events onto A2A stream primitives."""
+    event_name = str(metadata.get("event") or "").strip()
+    meta = dict(metadata)
+    if event_name == "agent.llm_call.delta":
+        delta = str(meta.get("text_delta") or "")
+        if not delta:
+            return []
+        content_metadata = dict(meta)
+        content_metadata["event"] = "agent.stream_content"
+        content_metadata["source_event"] = event_name
+        return [
+            AgentStreamEvent(
+                kind="content",
+                content=delta,
+                metadata=content_metadata,
+            )
+        ]
+    if event_name == "agent.tool_call":
+        return [
+            AgentStreamEvent(
+                kind="tool_call",
+                tool_name=str(meta.get("tool_name") or ""),
+                tool_call_id=str(meta.get("tool_call_id") or ""),
+                tool_args={
+                    key: value
+                    for key, value in meta.items()
+                    if key
+                    not in {
+                        "event",
+                        "tool_name",
+                        "tool_call_id",
+                        "tool_result",
+                        "result_preview",
+                    }
+                },
+                metadata=meta,
+            )
+        ]
+    if event_name == "agent.tool_result":
+        result_preview = str(
+            meta.get("tool_result")
+            or meta.get("result_preview")
+            or meta.get("summary")
+            or ""
+        )
+        return [
+            AgentStreamEvent(
+                kind="tool_result",
+                tool_name=str(meta.get("tool_name") or ""),
+                tool_call_id=str(meta.get("tool_call_id") or ""),
+                tool_result=result_preview,
+                metadata=meta,
+            )
+        ]
+    if event_name == "agent.tool_error":
+        result_preview = str(
+            meta.get("message")
+            or meta.get("error")
+            or meta.get("result_preview")
+            or "tool failed"
+        )
+        return [
+            AgentStreamEvent(
+                kind="tool_result",
+                tool_name=str(meta.get("tool_name") or ""),
+                tool_call_id=str(meta.get("tool_call_id") or ""),
+                tool_result=result_preview,
+                metadata={**meta, "ok": False},
+            )
+        ]
+    return [AgentStreamEvent(kind="trace", metadata=meta)]
+
+
+def _resolve_length_profile_for_finalize(
+    skill_contract: SkillRuntimeContract,
+    *,
+    length_profile: str | None,
+    profile_source: str,
+    profile_confidence: str,
+) -> dict[str, str]:
+    supported = set(skill_contract.document.length_profiles) or {
+        "short",
+        "medium",
+        "long",
+    }
+    defaults = dict(skill_contract.task_profile.defaults or {})
+    selected = str(length_profile or "").strip().lower()
+    source = profile_source
+    if not selected:
+        selected = str(defaults.get("length_profile") or "adaptive").strip().lower()
+        source = "skill_default"
+    if selected == "adaptive":
+        selected = "medium"
+    if selected not in supported and "medium" in supported:
+        selected = "medium"
+    if selected not in supported:
+        selected = next(iter(sorted(supported)))
+    return {
+        "profile": selected,
+        "source": source,
+        "confidence": profile_confidence or "confirmed",
+    }
 
 
 def sectioned_authoring_contract_from_skill(
