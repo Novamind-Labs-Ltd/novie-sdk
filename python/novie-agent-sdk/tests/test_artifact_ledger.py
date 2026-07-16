@@ -255,3 +255,82 @@ async def test_evidence_pack_builder_reads_deduped_refs_with_budget() -> None:
         "summarize",
         "search",
     ]
+
+
+@pytest.mark.asyncio
+async def test_evidence_pack_builder_ignores_empty_wiki_or_artifact_bodies() -> None:
+    """Empty wiki/artifact payloads must not enter the authoring evidence pack."""
+
+    class _EmptyArtifacts(_Artifacts):
+        async def summarize(self, artifact_id: str, *, purpose: str = "") -> dict[str, Any]:
+            await super().summarize(artifact_id, purpose=purpose)
+            if artifact_id == "art-empty-wiki":
+                return {"available": True, "summary": ""}
+            return {"available": True, "summary": f"summary for {artifact_id}"}
+
+        async def search(
+            self,
+            artifact_id: str,
+            query: str,
+            *,
+            purpose: str = "",
+            max_bytes: int = 12000,
+        ) -> dict[str, Any]:
+            await super().search(
+                artifact_id, query, purpose=purpose, max_bytes=max_bytes
+            )
+            if artifact_id == "art-empty-wiki":
+                return {"available": True, "content": "", "metadata": {"bytes": 0}}
+            return {
+                "available": True,
+                "content": f"matched content for {artifact_id}: {query}",
+                "metadata": {"bytes": 32},
+            }
+
+        async def read_chunks(
+            self,
+            artifact_id: str,
+            *,
+            purpose: str = "",
+            offset: int = 0,
+            max_bytes: int = 12000,
+        ) -> dict[str, Any]:
+            await super().read_chunks(
+                artifact_id, purpose=purpose, offset=offset, max_bytes=max_bytes
+            )
+            if artifact_id == "art-empty-wiki":
+                return {"available": True, "content": "   ", "metadata": {"bytes": 0}}
+            return {
+                "available": True,
+                "content": ("chunk-" + artifact_id + "-") * 20,
+                "metadata": {"bytes": max_bytes},
+            }
+
+    platform = _Platform()
+    platform.artifacts = _EmptyArtifacts()
+    upstream = {
+        "s0": {
+            "artifact_refs": [
+                {
+                    "artifact_id": "art-empty-wiki",
+                    "artifact_type": "wiki_page",
+                    "ref": "artifact://art-empty-wiki",
+                },
+                {
+                    "artifact_id": "art-handoff",
+                    "artifact_type": "bounded_handoff",
+                    "ref": "artifact://art-handoff",
+                },
+            ]
+        }
+    }
+    builder = EvidencePackBuilder(platform, budget=ContextBudget(max_refs=4))
+    pack = await builder.build(
+        workflow_id="wf-1",
+        upstream=upstream,
+        query="tenant isolation",
+        purpose="section draft",
+    )
+
+    assert [item.artifact_id for item in pack.items] == ["art-handoff"]
+    assert "empty_evidence_ignored" in pack.warnings

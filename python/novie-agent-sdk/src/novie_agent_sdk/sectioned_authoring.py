@@ -825,7 +825,10 @@ class SectionedLongformAuthor:
             )
             await self._emit(
                 "document.section.quality_checked",
-                status="passed" if quality.passed else "failed",
+                # ponytail: use gate_failed (not failed) so A2A stream guards
+                # that scan metadata.status do not treat a soft quality miss as
+                # a terminal agent failure; degrade/revise still runs below.
+                status="passed" if quality.passed else "gate_failed",
                 section_id=plan.section_id,
                 section_title=plan.title,
                 section_index=index,
@@ -865,7 +868,7 @@ class SectionedLongformAuthor:
                 )
                 await self._emit(
                     "document.section.quality_checked",
-                    status="passed" if quality.passed else "failed",
+                    status="passed" if quality.passed else "gate_failed",
                     section_id=plan.section_id,
                     section_title=plan.title,
                     section_index=index,
