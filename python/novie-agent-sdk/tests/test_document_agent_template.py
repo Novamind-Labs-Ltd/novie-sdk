@@ -37,6 +37,13 @@ class _FakeGraph:
         yield "values", {"messages": [AIMessage(content="Final narrative.")]}
 
 
+class _MessagesOnlyGraph:
+    async def astream(self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any):
+        assert stream_mode == ["messages", "values"]
+        yield "messages", (AIMessageChunk(content="Fallback "), {"node": "agent"})
+        yield "messages", (AIMessageChunk(content="narrative."), {"node": "agent"})
+
+
 def _metadata(
     *,
     runtime_phase: str,
@@ -284,11 +291,40 @@ def test_document_agent_template_streams_graph_content_and_result() -> None:
 
     assert events[0].kind == "content"
     assert events[0].content == "Draft"
-    assert events[-1].narrative == "Draft\nFinal narrative."
+    assert events[-1].narrative == "Final narrative."
     assert "# Capability navigation" not in events[-1].narrative
     assert "SECRET SKILL PROMPT" not in events[-1].narrative
     assert "DEVELOPER PROMPT" not in events[-1].narrative
     assert "USER PROMPT" not in events[-1].narrative
+
+
+def test_document_agent_template_falls_back_to_streamed_content_without_final_values() -> None:
+    template = DocumentAgentTemplate(
+        owner_agent_id="demo",
+        phase_metadata=_metadata,
+        keepalive_env_var="NOVIE_TEST_KEEPALIVE_INTERVAL_S",
+        context_budget_source="test",
+    )
+
+    async def _collect():
+        return [
+            event
+            async for event in template.stream_graph_run(
+                graph=_MessagesOnlyGraph(),
+                prompt="Write",
+                callbacks=[],
+                runtime_phase="draft",
+                semantic_phase="drafting",
+                mode="write",
+                phase="default",
+                capability_id="agent.demo.write",
+                extract_values_text=_last_message_text,
+            )
+        ]
+
+    events = asyncio.run(_collect())
+
+    assert events[-1].narrative == "Fallback narrative."
 
 
 def test_external_checkpoint_helpers_support_new_service_shape() -> None:

@@ -280,7 +280,8 @@ class DocumentAgentTemplate:
             ) from exc
 
         run_input = {"messages": [HumanMessage(content=prompt)]}
-        narrative_parts: list[str] = []
+        streamed_narrative_parts: list[str] = []
+        final_narrative = ""
         last_messages: list[Any] = []
         content_chars = 0
 
@@ -318,7 +319,7 @@ class DocumentAgentTemplate:
                 if is_assistant_content_chunk(message_chunk):
                     text = extract_chunk_text(message_chunk)
                     if text:
-                        narrative_parts.append(text)
+                        streamed_narrative_parts.append(text)
                         content_chars += len(text)
                         yield AgentStreamEvent(
                             kind="content",
@@ -333,10 +334,10 @@ class DocumentAgentTemplate:
                     continue
                 value_text = extract_values_text(payload) if extract_values_text else ""
                 if value_text:
-                    narrative_parts.append(value_text)
+                    final_narrative = value_text
 
         yield DocumentGraphStreamResult(
-            narrative="\n".join(part for part in narrative_parts if part).strip(),
+            narrative=(final_narrative or "".join(streamed_narrative_parts)).strip(),
             last_messages=last_messages,
             content_chars=content_chars,
         )

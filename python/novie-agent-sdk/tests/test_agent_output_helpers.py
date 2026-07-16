@@ -200,6 +200,25 @@ def test_document_final_helpers_shape() -> None:
     assert event.metadata["event"] == "done"
 
 
+def test_document_final_output_namespaces_legacy_quality_status() -> None:
+    output = document_final_output(
+        artifact_type="demo_markdown",
+        artifact_family="document",
+        capability_id="agent.demo.write",
+        analysis="# Done",
+        narrative="Draft notes",
+        quality={
+            "status": "skipped",
+            "reason": "sectioned_authoring_llm_failed",
+        },
+    )
+
+    assert "status" not in output
+    assert "reason" not in output
+    assert output["quality_status"] == "skipped"
+    assert output["quality_reason"] == "sectioned_authoring_llm_failed"
+
+
 def test_stream_event_helpers_shape() -> None:
     progress = progress_event(
         "Writing section",
