@@ -888,6 +888,13 @@ async def test_sectioned_author_degrades_soft_gate_failure_instead_of_raising() 
     assert all(draft.quality["degraded"] is True for draft in result.drafts)
     assert "Evidence gap (auto-flagged)" in result.drafts[0].markdown
     assert "document.section.quality_degraded" in [e["event"] for e in phase_events]
+    quality_events = [
+        event
+        for event in phase_events
+        if event["event"] == "document.section.quality_checked"
+    ]
+    assert quality_events
+    assert all(event["status"] == "gate_failed" for event in quality_events)
 
 
 @pytest.mark.asyncio

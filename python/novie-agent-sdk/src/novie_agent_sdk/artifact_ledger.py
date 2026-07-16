@@ -298,6 +298,7 @@ class EvidencePackBuilder:
 
         items: list[EvidencePackItem] = []
         remaining = self._budget.max_total_chars
+        empty_ignored = 0
         for ref in deduped:
             if remaining <= 0:
                 warnings.append("evidence_pack_budget_exhausted")
@@ -309,10 +310,15 @@ class EvidencePackBuilder:
                 max_chars=min(self._budget.max_item_chars, remaining),
             )
             if item is None:
+                if str(ref.get("artifact_id") or "").strip():
+                    empty_ignored += 1
                 continue
             items.append(item)
             remaining -= len(item.content or item.summary)
 
+        if empty_ignored:
+            # Empty wiki/artifact payloads must not participate in authoring.
+            warnings.append("empty_evidence_ignored")
         return EvidencePack(
             items=tuple(items),
             warnings=tuple(dict.fromkeys(warnings)),
@@ -383,8 +389,10 @@ class EvidencePackBuilder:
                     if isinstance(metadata, Mapping) and metadata.get("next_offset") is not None:
                         warnings.append("artifact_truncated_by_evidence_budget")
 
-        if not summary and not content:
-            warnings.append("artifact_unavailable")
+        # Empty wiki / unavailable artifact bodies: skip entirely so they do
+        # not enter the section draft evidence pack or quality gates.
+        if not str(summary or "").strip() and not str(content or "").strip():
+            return None
         return EvidencePackItem(
             artifact_id=artifact_id,
             artifact_type=artifact_type,

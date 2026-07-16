@@ -1108,22 +1108,52 @@ def _has_nonempty_error(value: Any) -> bool:
     return True
 
 
+_TERMINAL_STATUS_VALUES = frozenset(
+    {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"}
+)
+_TERMINAL_KIND_VALUES = frozenset(
+    {"error", "failed", "terminal_error", "cancelled", "canceled", "cancel"}
+)
+
+
 def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
+    """Detect a terminal failure envelope without false-positive phase events.
+
+    Stream traces often nest phase outcomes under ``metadata.status`` (for
+    example ``document.section.quality_checked`` with ``status="failed"`` when
+    a soft quality gate did not pass). Those are observability signals, not
+    stream-terminal failures. Only treat nested ``metadata`` ``status`` as
+    terminal when the payload is not a named phase ``event``.
+    """
     if not isinstance(envelope, dict):
         return None
+    return _failure_envelope_dict(envelope, allow_status_terminal=True)
+
+
+def _failure_envelope_dict(
+    envelope: dict[str, Any],
+    *,
+    allow_status_terminal: bool,
+) -> dict[str, Any] | None:
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
-    terminal_kind = kind in {
-        "error", "failed", "terminal_error", "cancelled", "canceled", "cancel"
-    }
+    terminal_kind = kind in _TERMINAL_KIND_VALUES
     if (
-        status in {"failed", "cancelled", "canceled", "cancel", "error", "terminal_error"}
+        (allow_status_terminal and status in _TERMINAL_STATUS_VALUES)
         or terminal_kind
         or _has_nonempty_error(envelope.get("error"))
     ):
         return envelope
     for key in ("output", "payload", "metadata"):
-        nested = _failure_envelope(envelope.get(key))
+        child = envelope.get(key)
+        if not isinstance(child, dict):
+            continue
+        # Named phase events encode local outcomes in metadata.status.
+        nested_allow_status = key != "metadata" or not str(child.get("event") or "").strip()
+        nested = _failure_envelope_dict(
+            child,
+            allow_status_terminal=nested_allow_status,
+        )
         if nested is not None:
             return nested
     for item in envelope.values():

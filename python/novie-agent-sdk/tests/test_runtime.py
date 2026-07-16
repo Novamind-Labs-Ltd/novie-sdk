@@ -36,6 +36,7 @@ from novie_agent_sdk.runtime import (
     SqliteOneShotInvocationStore,
     SqliteTaskStore,
     TaskContext,
+    _failure_envelope,
 )
 from novie_agent_sdk import PublicAgentError
 from novie_agent_sdk.platform_security import sign_agent_platform_headers
@@ -1933,3 +1934,58 @@ async def test_in_memory_task_store_env_override_for_capacity(monkeypatch):
     await store.create_task("c", {})  # evicts "a"
     assert await store.get_task("a") is None
     assert await store.get_task("c") is not None
+
+
+def test_failure_envelope_ignores_phase_metadata_status_failed() -> None:
+    """Soft quality-gate traces must not abort the A2A stream.
+
+    Regression: ``document.section.quality_checked`` with
+    ``metadata.status="failed"`` was recursively treated as a terminal
+    failure envelope and rewritten to ``agent_internal_error``.
+    """
+    wire = {
+        "kind": "trace",
+        "metadata": {
+            "event": "document.section.quality_checked",
+            "status": "failed",
+            "quality": {
+                "passed": False,
+                "failures": ["artifact_only_citations"],
+                "hard_failures": [],
+                "soft_failures": ["artifact_only_citations"],
+            },
+        },
+    }
+    assert _failure_envelope(wire) is None
+    assert (
+        _failure_envelope(
+            {
+                "kind": "trace",
+                "metadata": {
+                    "event": "document.section.quality_checked",
+                    "status": "gate_failed",
+                },
+            }
+        )
+        is None
+    )
+    # Top-level terminal envelopes still fail closed.
+    assert _failure_envelope({"status": "failed", "error": "boom"}) is not None
+    assert (
+        _failure_envelope({"kind": "terminal_error", "error_code": "agent_internal_error"})
+        is not None
+    )
+    # Phase events that carry an explicit error field remain detectable.
+    assert (
+        _failure_envelope(
+            {
+                "kind": "trace",
+                "metadata": {
+                    "event": "agent.llm_call.failed",
+                    "status": "failed",
+                    "error": "TimeoutError",
+                },
+            }
+        )
+        is not None
+    )
