@@ -14,6 +14,11 @@ from typing import Any, NamedTuple
 from novie_protocol.agents import AgentStreamEvent
 
 from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
+from .context_budget import wall_clock_deadline as context_wall_clock_deadline
+from .document_authoring_budget import (
+    DocumentAuthoringDeadlineExceeded,
+    DocumentOutputBudget,
+)
 from .document_quality import DocumentQualityLoopResult, skipped_quality_result
 from .skill_contracts import SkillRuntimeContract
 
@@ -99,6 +104,10 @@ def _finish_reason_of(completed_result: Mapping[str, Any] | None) -> str:
     return str(reason or "").strip().lower()
 
 
+def _remaining_deadline_seconds(deadline: float) -> float:
+    return max(0.0, deadline - asyncio.get_running_loop().time())
+
+
 def _validated_finalization(value: Any) -> str:
     mode = str(value or "single_polish").strip()
     if mode not in KNOWN_FINALIZATION_MODES:
@@ -144,6 +153,7 @@ class SectionedAuthoringContract:
     default_section_words: int = 180
     max_section_words: int = 280
     max_section_revision_rounds: int = 1
+    max_document_output_tokens: int = 0
     final_retention_ratio: float = 0.8
     seam_context_chars: int = 1500
     finalize_model: str = ""
@@ -188,6 +198,10 @@ class SectionedAuthoringContract:
             max_section_revision_rounds=_positive_int(
                 raw.get("max_section_revision_rounds"),
                 1,
+            ),
+            max_document_output_tokens=_positive_int(
+                raw.get("max_document_output_tokens"),
+                0,
             ),
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.8),
             seam_context_chars=_positive_int(raw.get("seam_context_chars"), 1500),
@@ -367,6 +381,7 @@ async def run_sectioned_document_finalization(
     quality_reason: str = "sectioned_authoring_quality_gates",
     quality_metadata: Mapping[str, Any] | None = None,
     defer_intermediate_artifacts: bool = False,
+    wall_clock_deadline: float | None = None,
 ) -> SectionedDocumentFinalizationResult:
     """Run sectioned longform finalization for document agents.
 
@@ -433,13 +448,32 @@ async def run_sectioned_document_finalization(
     if document_input:
         authoring_upstream["_document_input"] = dict(document_input)
 
-    authoring_result = await author.author(
-        brief=brief,
-        upstream=authoring_upstream,
-        workflow_id=workflow_id,
-        thread_id=thread_id,
-        agent_id=agent_id,
-    )
+    deadline = wall_clock_deadline or context_wall_clock_deadline(dict(context_budget))
+    try:
+        if deadline is None:
+            authoring_result = await author.author(
+                brief=brief,
+                upstream=authoring_upstream,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+            )
+        else:
+            authoring_result = await asyncio.wait_for(
+                author.author(
+                    brief=brief,
+                    upstream=authoring_upstream,
+                    workflow_id=workflow_id,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                ),
+                timeout=_remaining_deadline_seconds(deadline),
+            )
+    except TimeoutError as exc:
+        raise DocumentAuthoringDeadlineExceeded(
+            "document_authoring_deadline_exceeded: sectioned authoring exceeded "
+            "its absolute wall-clock deadline"
+        ) from exc
     completed_event = AgentStreamEvent(
         kind="trace",
         metadata={
@@ -504,6 +538,7 @@ async def astream_sectioned_document_finalization(
     resume_state: Mapping[str, Any] | None = None,
     phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
     rebase_artifact_types_to_runtime: bool = False,
+    wall_clock_deadline: float | None = None,
 ) -> AsyncIterator[AgentStreamEvent | SectionedDocumentFinalizationResult]:
     """Gold-path sectioned finalize used by report_synthesis-style document agents.
 
@@ -614,10 +649,34 @@ async def astream_sectioned_document_finalization(
         finally:
             sectioned_events.put_nowait(sectioned_done)
 
+    deadline = wall_clock_deadline or context_wall_clock_deadline(dict(context_budget))
     author_task = asyncio.create_task(_author_document())
     try:
         while True:
-            sectioned_event = await sectioned_events.get()
+            try:
+                if deadline is None:
+                    sectioned_event = await sectioned_events.get()
+                else:
+                    sectioned_event = await asyncio.wait_for(
+                        sectioned_events.get(),
+                        timeout=_remaining_deadline_seconds(deadline),
+                    )
+            except TimeoutError as exc:
+                yield AgentStreamEvent(
+                    kind="trace",
+                    metadata={
+                        "event": "sectioned_authoring_deadline_exceeded",
+                        "runtime_phase": "sectioned_authoring",
+                        "semantic_phase": "finalizing_output",
+                        "error_code": DocumentAuthoringDeadlineExceeded.code,
+                        **mode_meta,
+                        "capability_id": capability_id,
+                    },
+                )
+                raise DocumentAuthoringDeadlineExceeded(
+                    "document_authoring_deadline_exceeded: sectioned authoring "
+                    "exceeded its absolute wall-clock deadline"
+                ) from exc
             if sectioned_event is sectioned_done:
                 break
             event_metadata = {
@@ -838,6 +897,10 @@ def sectioned_authoring_contract_from_skill(
         max_section_revision_rounds = document.section.max_revision_rounds or 1
         final_retention_ratio = document.final.min_retention_ratio or 0.8
 
+    document_output_limit = _positive_int(raw_document.get("max_document_output_tokens"), 0)
+    if profile is not None:
+        document_output_limit = profile.max_document_output_tokens or document_output_limit
+
     settings: dict[str, Any] = {
         "coverage_model": raw_document.get("coverage_model") or artifact_type,
         "length_profile": base_length_profile,
@@ -855,6 +918,7 @@ def sectioned_authoring_contract_from_skill(
         "default_section_words": default_section_words,
         "max_section_words": max_section_words,
         "max_section_revision_rounds": max_section_revision_rounds,
+        "max_document_output_tokens": document_output_limit,
         "final_retention_ratio": final_retention_ratio,
         "require_evidence_refs": (
             contract.quality_gates.require_evidence_refs
@@ -951,6 +1015,10 @@ class SectionedLongformAuthor:
         # its own default.
         self._output_token_ceiling = (
             _positive_int(self._context_budget.get("max_output_tokens"), 0) or None
+        )
+        self._document_output_budget = DocumentOutputBudget.from_limits(
+            self._context_budget,
+            contract_limit=self._contract.max_document_output_tokens,
         )
         self._max_llm_stream_attempts = _positive_int(
             self._context_budget.get("llm_stream_max_attempts")
@@ -1134,6 +1202,7 @@ class SectionedLongformAuthor:
                 previous=drafts,
                 evidence_pack=evidence_pack_input,
                 running_context=running_context,
+                output_slots_remaining=len(outline) - index + 2,
             )
             if output_truncated:
                 await self._emit(
@@ -1177,6 +1246,7 @@ class SectionedLongformAuthor:
                     evidence_pack=evidence_pack_input,
                     running_context=running_context,
                     revision_feedback=quality,
+                    output_slots_remaining=len(outline) - index + 2,
                 )
                 if output_truncated:
                     await self._emit(
@@ -1273,7 +1343,11 @@ class SectionedLongformAuthor:
                 # The section that just left the recent-body window is folded once
                 # into the running summary (incremental fold).
                 dropped = drafts[len(drafts) - window_k - 1]
-                running_summary = await self._fold_running_summary(running_summary, dropped)
+                running_summary = await self._fold_running_summary(
+                    running_summary,
+                    dropped,
+                    output_slots_remaining=len(outline) - index + 2,
+                )
             await self._checkpoint(
                 current_phase="draft_sections",
                 length_profile=length_profile,
@@ -1459,16 +1533,22 @@ class SectionedLongformAuthor:
         messages: list[dict[str, Any]],
         temperature: float,
         max_output_tokens: int | None,
+        output_slots_remaining: int = 1,
         model: str | None = None,
         section: SectionPlan | None = None,
         section_index: int | None = None,
         extra_metadata: Mapping[str, Any] | None = None,
     ) -> _StreamedLlmText:
+        allocated_output_tokens = self._document_output_budget.reserve(
+            max_output_tokens,
+            slots_remaining=output_slots_remaining,
+        )
         call_id = self._next_llm_call_id(purpose)
         base_metadata = {
             "call_id": call_id,
             "llm_purpose": purpose,
-            "max_output_tokens": max_output_tokens,
+            "max_output_tokens": allocated_output_tokens,
+            **self._document_output_budget.metadata(),
             **(dict(extra_metadata or {})),
         }
         if section is not None:
@@ -1497,7 +1577,7 @@ class SectionedLongformAuthor:
                     result = await self._llm.chat(
                         messages=messages,
                         temperature=temperature,
-                        max_output_tokens=max_output_tokens,
+                        max_output_tokens=allocated_output_tokens,
                         model=model,
                     )
                     content = str(result.get("content") or "")
@@ -1517,7 +1597,7 @@ class SectionedLongformAuthor:
                     async for event in stream_text(
                         messages,
                         temperature=temperature,
-                        max_output_tokens=max_output_tokens,
+                        max_output_tokens=allocated_output_tokens,
                         model=model,
                     ):
                         delta = _llm_stream_event_delta(event)
@@ -1751,6 +1831,7 @@ class SectionedLongformAuthor:
         self,
         prior_summary: str,
         dropped: SectionDraft,
+        output_slots_remaining: int = 1,
     ) -> str:
         """Incrementally fold one section into the rolling running summary."""
         prompt = (
@@ -1770,6 +1851,7 @@ class SectionedLongformAuthor:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_output_tokens=max(1, self._contract.running_summary_max_tokens),
+            output_slots_remaining=output_slots_remaining,
             model=self._contract.running_summary_model or None,
             extra_metadata={"section_id": dropped.plan.section_id},
         )
@@ -1794,6 +1876,7 @@ class SectionedLongformAuthor:
         evidence_pack: Mapping[str, Any],
         running_context: str = "",
         revision_feedback: SectionQualityGateResult | None = None,
+        output_slots_remaining: int = 1,
     ) -> tuple[str, bool]:
         """Draft one section; returns ``(markdown, output_truncated)``."""
         previous_index = [
@@ -1843,6 +1926,7 @@ class SectionedLongformAuthor:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.25,
             max_output_tokens=self._output_token_ceiling,
+            output_slots_remaining=output_slots_remaining,
             section=plan,
             section_index=section_index,
             extra_metadata={
@@ -1936,6 +2020,13 @@ class SectionedLongformAuthor:
         bodies = [draft.markdown.strip() for draft in drafts if draft.markdown.strip()]
         if len(bodies) <= 1:
             return combined
+        if self._document_output_budget.remaining_tokens == 0:
+            await self._emit(
+                "document.final.output_budget_exhausted",
+                status="degraded",
+                **self._document_output_budget.metadata(),
+            )
+            return combined
         finalize_model = self._contract.finalize_model or None
         limit = max(200, self._contract.seam_context_chars)
 
@@ -2023,6 +2114,13 @@ class SectionedLongformAuthor:
             f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
             f"Draft sections:\n{draft_sections}"
         )
+        if self._document_output_budget.remaining_tokens == 0:
+            await self._emit(
+                "document.final.output_budget_exhausted",
+                status="degraded",
+                **self._document_output_budget.metadata(),
+            )
+            return combined
         streamed = await self._stream_llm_text(
             purpose="final_polish",
             messages=[{"role": "user", "content": prompt}],
@@ -2072,6 +2170,13 @@ class SectionedLongformAuthor:
                 combined=combined,
             )
 
+        if self._document_output_budget.remaining_tokens == 0:
+            await self._emit(
+                "document.final.output_budget_exhausted",
+                status="degraded",
+                **self._document_output_budget.metadata(),
+            )
+            return combined
         merged_clusters: list[str] = []
         cluster_size = 4
         for cluster_index, start in enumerate(range(0, len(drafts), cluster_size), start=1):

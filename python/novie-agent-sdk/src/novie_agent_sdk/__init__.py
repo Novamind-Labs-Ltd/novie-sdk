@@ -151,6 +151,7 @@ from .artifact_ledger import (
     EvidencePackBuilder,
     EvidencePackItem,
 )
+from .document_authoring_budget import DocumentAuthoringBudgetExceeded
 from .platform_langchain_tools import (
     PlatformToolConfig,
     PlatformToolDegradationFlags,
@@ -158,6 +159,7 @@ from .platform_langchain_tools import (
     build_platform_langchain_tools,
 )
 from .sectioned_authoring import (
+    DocumentAuthoringDeadlineExceeded,
     SectionDraft,
     SectionPlan,
     SectionQualityGateResult,
@@ -689,6 +691,8 @@ __all__ = [
     "classify_envelope_error",
     "ArtifactLedger",
     "ContextBudget",
+    "DocumentAuthoringBudgetExceeded",
+    "DocumentAuthoringDeadlineExceeded",
     "SectionDraft",
     "SectionPlan",
     "SectionQualityGateResult",
