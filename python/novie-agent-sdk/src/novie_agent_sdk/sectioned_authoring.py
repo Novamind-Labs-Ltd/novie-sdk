@@ -1578,7 +1578,7 @@ class SectionedLongformAuthor:
                         messages=messages,
                         temperature=temperature,
                         max_output_tokens=allocated_output_tokens,
-                        model=model,
+                        model=model, **{"reasoning_mode": "disabled"},
                     )
                     content = str(result.get("content") or "")
                     if content:
@@ -1598,7 +1598,7 @@ class SectionedLongformAuthor:
                         messages,
                         temperature=temperature,
                         max_output_tokens=allocated_output_tokens,
-                        model=model,
+                        model=model, **{"reasoning_mode": "disabled"},
                     ):
                         delta = _llm_stream_event_delta(event)
                         if delta:

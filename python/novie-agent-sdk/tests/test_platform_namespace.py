@@ -1024,6 +1024,7 @@ async def test_llm_chat_streams_over_openai_chat_completions() -> None:
         model="anthropic/claude-opus-4.6",
         temperature=0.2,
         max_output_tokens=256,
+        reasoning_mode="disabled",
     )
 
     assert result["content"] == "hello"
@@ -1047,6 +1048,7 @@ async def test_llm_chat_streams_over_openai_chat_completions() -> None:
     assert body["model"] == "anthropic/claude-opus-4.6"
     assert body["temperature"] == 0.2
     assert body["max_tokens"] == 256
+    assert body["reasoning_mode"] == "disabled"
     assert "arguments" not in body
     assert "caller_type" not in body
 

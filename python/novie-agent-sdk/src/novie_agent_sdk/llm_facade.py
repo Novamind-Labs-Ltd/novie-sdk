@@ -33,17 +33,11 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 LlmMode = Literal["platform", "byok", "unavailable"]
+ReasoningMode = Literal["default", "disabled"]
 
 
 class LlmFacade:
-    """Unified LLM surface for SDK agent handlers.
-
-    Attributes:
-        platform_available: True when ``ctx.platform.is_available``.
-        mode: ``"platform"`` when using the platform-managed LLM,
-            ``"byok"`` when using the agent's own key, ``"unavailable"``
-            when neither is configured.
-    """
+    """Unified platform-or-BYOK LLM surface for SDK agent handlers."""
 
     def __init__(
         self,
@@ -103,6 +97,7 @@ class LlmFacade:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        reasoning_mode: ReasoningMode = "default",
     ) -> dict[str, Any]:
         """Send a chat request.
 
@@ -125,6 +120,7 @@ class LlmFacade:
                 tools=tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
+                reasoning_mode=reasoning_mode,
             )
             return {**result, "llm_mode": "platform"}
 
@@ -158,6 +154,7 @@ class LlmFacade:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        reasoning_mode: ReasoningMode = "default",
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a chat response as platform-shaped text events.
 
@@ -177,6 +174,7 @@ class LlmFacade:
                     tools=tools,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
+                    reasoning_mode=reasoning_mode,
                 ):
                     yield event
                 return
@@ -189,6 +187,7 @@ class LlmFacade:
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
+            reasoning_mode=reasoning_mode,
         )
         content = str(result.get("content") or "")
         if content:

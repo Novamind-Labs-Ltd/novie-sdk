@@ -102,6 +102,7 @@ class _FlakyStreamLlm:
         temperature: float,
         max_output_tokens: int,
         model: str | None = None,
+        **_kwargs: Any,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -360,8 +361,9 @@ class _FakePlatform:
 async def test_sectioned_author_records_outline_sections_and_final_ref() -> None:
     platform = _FakePlatform()
     phase_events: list[dict[str, Any]] = []
+    llm = _FakeLlm()
     author = SectionedLongformAuthor(
-        llm_facade=_FakeLlm(),
+        llm_facade=llm,
         platform=platform,
         artifact_type="example_document",
         step_id="s2",
@@ -405,6 +407,7 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         "example_document",
     ]
     assert platform.workpads.final_refs == ["artifact://artifact-4"]
+    assert all(item["reasoning_mode"] == "disabled" for item in llm.chat_kwargs)
     event_names = [event["event"] for event in phase_events]
     assert [name for name in event_names if name.startswith("document.")] == [
         "document.profile.selected",

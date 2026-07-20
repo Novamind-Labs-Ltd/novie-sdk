@@ -528,11 +528,9 @@ _CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 def _openai_chat_body(arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Map ``platform.llm.chat`` arguments onto an OpenAI chat body.
 
-    The platform's ``/v1/chat/completions`` endpoint is OpenAI-compatible, so
-    only the SDK's ``max_output_tokens`` alias needs renaming to ``max_tokens``.
+    The OpenAI-compatible endpoint only needs the SDK's output alias normalized.
     ``stream_options.include_usage`` asks the endpoint for a token-usage block
-    on the terminal chunk so the synthesized ``completed`` result can carry
-    ``usage_metadata``.
+    on the terminal chunk so the synthesized result carries ``usage_metadata``.
     """
     args = dict(arguments)
     body: dict[str, Any] = {
@@ -552,6 +550,8 @@ def _openai_chat_body(arguments: Mapping[str, Any]) -> dict[str, Any]:
         body["tool_choice"] = args["tool_choice"]
     if args.get("parallel_tool_calls") is not None:
         body["parallel_tool_calls"] = args["parallel_tool_calls"]
+    if args.get("reasoning_mode") == "disabled":
+        body["reasoning_mode"] = "disabled"
     return body
 
 
@@ -1677,14 +1677,7 @@ class LlmNamespace:
     - Hard stop when the pool is exhausted (``QuotaExceededError``).
     - Full audit trail and cost reporting in the Novie UI.
 
-    All methods raise ``QuotaExceededError`` when the platform returns
-    ``error_code="quota_exceeded"`` so the agent can surface a clear
-    message and stop processing, rather than receiving an opaque error.
-
-    All methods raise ``PlatformLlmTransportError`` /
-    ``PlatformLlmCallError`` (instead of returning ``{}``) when the
-    platform call cannot complete; this prevents transport timeouts from
-    being silently fed into Pydantic / JSON-schema validation downstream.
+    Failures raise typed quota or platform errors rather than silently degrading.
     """
 
     def __init__(self, parent: "PlatformNamespace") -> None:  # noqa: F821
@@ -1700,6 +1693,7 @@ class LlmNamespace:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        reasoning_mode: Literal["default", "disabled"] = "default",
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM.
 
@@ -1731,6 +1725,8 @@ class LlmNamespace:
             args["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             args["parallel_tool_calls"] = parallel_tool_calls
+        if reasoning_mode == "disabled":
+            args["reasoning_mode"] = reasoning_mode
         diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
         return normalise_llm_result(self._unwrap(diagnostics, _LLM_CHAT_CAP))
 
@@ -1744,6 +1740,7 @@ class LlmNamespace:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
+        reasoning_mode: Literal["default", "disabled"] = "default",
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream the platform chat LLM as raw platform events."""
         args: dict[str, Any] = {"messages": messages}
@@ -1759,6 +1756,8 @@ class LlmNamespace:
             args["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             args["parallel_tool_calls"] = parallel_tool_calls
+        if reasoning_mode == "disabled":
+            args["reasoning_mode"] = reasoning_mode
 
         stream = getattr(self._parent._llm_caller, "invoke_event_stream", None)
         if not callable(stream):
