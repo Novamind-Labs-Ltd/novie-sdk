@@ -232,6 +232,14 @@ from .document_quality import (
     DocumentQualityOutcome,
     skipped_quality_result,
 )
+from .document_execution import (
+    DIRECT_AUTHORING,
+    EVIDENCE_GRAPH,
+    GRAPH_HANDOFF,
+    DocumentExecutionPlan,
+    build_document_handoff_event,
+    resolve_document_execution_plan,
+)
 from .document_resume import (
     DocumentResumeCandidate,
     get_matching_document_checkpoint,
