@@ -2056,6 +2056,7 @@ class SectionedLongformAuthor:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_output_tokens=200,
+                output_slots_remaining=len(bodies) - seam_index - 1,
                 model=finalize_model,
                 extra_metadata={"seam_index": seam_index + 1},
             )

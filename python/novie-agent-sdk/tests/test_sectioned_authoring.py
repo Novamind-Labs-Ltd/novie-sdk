@@ -1326,6 +1326,34 @@ async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
 
 
 @pytest.mark.asyncio
+async def test_boundary_stitch_shares_remaining_budget_across_all_seams() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="Next.")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={"max_document_output_tokens": 400},
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id=f"s{index}", title=f"Section {index}"),
+            markdown=f"## Section {index}\n\nBody {index}.",
+        )
+        for index in range(1, 5)
+    ]
+
+    result = await author._boundary_stitch_final(
+        brief={"title": "Doc"},
+        drafts=drafts,
+        combined="\n\n".join(draft.markdown for draft in drafts),
+    )
+
+    assert all(draft.markdown in result for draft in drafts)
+    assert len(llm.chat_kwargs) == 3
+    assert sum(item["max_output_tokens"] for item in llm.chat_kwargs) == 400
+
+
+@pytest.mark.asyncio
 async def test_boundary_stitch_single_section_skips_llm() -> None:
     phase_events: list[dict[str, Any]] = []
     llm = _BridgeLlm()
