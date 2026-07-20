@@ -594,7 +594,13 @@ Purpose:
 - Builds bounded evidence packs from upstream/workpad refs for each section.
 - Applies a generic section quality gate before recording drafts, including exact planned-heading presence, minimum information units, process-language rejection, and evidence-ref checks.
 - Repairs missing planned Markdown headings before the quality gate so an otherwise valid section is not failed because the model used a different heading.
-- Sends bounded `max_output_tokens` for section and final-polish LLM calls so document agents do not leave a single section generation unbounded.
+- Treats the effective output allowance as one document-wide cumulative budget,
+  shared fairly by section drafts, summaries, and finalization; a skill length
+  profile can declare a stricter `max_document_output_tokens` cap.
+- Accepts an absolute `wall_clock_deadline` in both finalization runners and
+  surfaces `document_authoring_deadline_exceeded` without converting it into a
+  generic agent-runtime crash. When the final polish has no budget left, it
+  safely retains the already-complete assembled sections instead.
 
 ### `sectioned_authoring_enabled`
 

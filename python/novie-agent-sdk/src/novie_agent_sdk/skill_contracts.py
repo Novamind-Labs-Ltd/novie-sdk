@@ -75,6 +75,7 @@ class DocumentLengthProfileContract:
     default_units: int = 0
     max_units: int = 0
     max_revision_rounds: int = 0
+    max_document_output_tokens: int = 0
     final_retention_ratio: float = 0.0
     raw: Mapping[str, Any] = field(default_factory=dict)
 
@@ -419,6 +420,10 @@ def _length_profiles_from_raw(value: Any) -> dict[str, DocumentLengthProfileCont
             default_units=_non_negative_int(raw.get("default_units"), 0),
             max_units=_non_negative_int(raw.get("max_units"), 0),
             max_revision_rounds=_non_negative_int(raw.get("max_revision_rounds"), 0),
+            max_document_output_tokens=_non_negative_int(
+                raw.get("max_document_output_tokens"),
+                0,
+            ),
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.0),
             raw=raw,
         )

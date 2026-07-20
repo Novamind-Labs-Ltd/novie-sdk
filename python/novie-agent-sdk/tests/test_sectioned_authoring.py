@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from novie_agent_sdk import (
+    DocumentAuthoringDeadlineExceeded,
     PlatformLlmCallError,
     SectionDraft,
     SectionedLongformAuthor,
@@ -13,6 +15,7 @@ from novie_agent_sdk import (
     run_sectioned_document_finalization,
     sectioned_authoring_contract_from_skill,
 )
+from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _llm_stream_event_delta,
     _llm_stream_event_result,
@@ -167,6 +170,18 @@ class _LongFakeLlm(_FakeLlm):
                     )
                 }
         return {"content": "## Section 1\n\nalpha beta gamma delta epsilon zeta"}
+
+
+class _HangingLlm(_FakeLlm):
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
 
 def test_llm_stream_event_delta_extracts_content_blocks() -> None:
@@ -585,6 +600,63 @@ async def test_run_sectioned_document_finalization_requires_sectioned_contract()
 
 
 @pytest.mark.asyncio
+async def test_streaming_finalization_surfaces_absolute_deadline(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    skill = tmp_path / "skills" / "report"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: report
+metadata:
+  novie:
+    runtime_contract:
+      version: 1
+      runtime:
+        strategy: sectioned_longform
+      document:
+        outline:
+          min_sections: 2
+          max_sections: 2
+        section:
+          min_units: 5
+          default_units: 5
+          max_units: 20
+---
+
+# Report
+""",
+        encoding="utf-8",
+    )
+    contract = SkillContractResolver(root_dir=tmp_path).resolve(
+        ["skills/report"],
+        required=True,
+    )
+    llm = _HangingLlm()
+    llm.platform_ns = _FakePlatform()
+    events = []
+
+    with pytest.raises(DocumentAuthoringDeadlineExceeded) as exc_info:
+        async for event in astream_sectioned_document_finalization(
+            llm_facade=llm,
+            skill_contract=contract,
+            artifact_type="example_document",
+            step_id="s2",
+            capability_id="agent.example.write_document",
+            context_budget={},
+            brief={"title": "Example document"},
+            upstream={},
+            wall_clock_deadline=asyncio.get_running_loop().time() + 0.01,
+        ):
+            events.append(event)
+
+    assert exc_info.value.code == "document_authoring_deadline_exceeded"
+    assert any(
+        event.metadata.get("event") == "sectioned_authoring_deadline_exceeded"
+        for event in events
+        if hasattr(event, "metadata")
+    )
+
+
+@pytest.mark.asyncio
 async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None:
     platform = _FakePlatform()
     llm = _FakeLlm()
@@ -614,13 +686,13 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         agent_id="writer",
     )
 
-    # Two section drafts + the final polish all get the run's budget-contract
-    # ceiling — content length is governed by prompt targets and the quality
-    # gate, not by per-call heuristics.
+    # Two section drafts and final polish share one document allocation. The
+    # first two calls receive an equal share, preserving the last share for
+    # finalization instead of multiplying the run budget three times.
     assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        64000,
-        64000,
-        64000,
+        21333,
+        21333,
+        21334,
     ]
 
 
@@ -693,6 +765,7 @@ metadata:
             default_units: 520
             max_units: 900
             max_revision_rounds: 2
+            max_document_output_tokens: 12000
             finalization: progressive_section_merge
             evidence_depth: deep
 ---
@@ -717,6 +790,7 @@ metadata:
     assert authoring["max_outline_sections"] == 16
     assert authoring["default_section_words"] == 520
     assert authoring["max_section_revision_rounds"] == 2
+    assert authoring["max_document_output_tokens"] == 12000
     assert authoring["finalization"] == "progressive_section_merge"
     assert authoring["evidence_depth"] == "deep"
 
