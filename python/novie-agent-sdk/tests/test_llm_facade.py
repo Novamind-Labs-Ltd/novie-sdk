@@ -74,6 +74,14 @@ class TestPlatformMode:
         assert result["llm_mode"] == "platform"
         ns.llm.chat.assert_awaited_once()
 
+    def test_chat_forwards_disabled_reasoning_mode_to_platform(self) -> None:
+        ns = _make_available_platform_ns(responses={})
+        facade = LlmFacade(ns)
+        _run(facade.chat(
+            [{"role": "user", "content": "write"}], reasoning_mode="disabled",
+        ))
+        assert ns.llm.chat.await_args.kwargs["reasoning_mode"] == "disabled"
+
     def test_structured_delegates_to_platform(self) -> None:
         ns = _make_available_platform_ns(responses={"structured": {"structured": {"a": 1}}})
         facade = LlmFacade(ns)
