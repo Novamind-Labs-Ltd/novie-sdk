@@ -20,6 +20,7 @@ class RuntimeContract:
     """Generic runtime strategy declared by a skill."""
 
     strategy: str = ""
+    preparation: str = "direct"
     context_policy: str = ""
     finalization: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
@@ -74,6 +75,7 @@ class DocumentLengthProfileContract:
     default_units: int = 0
     max_units: int = 0
     max_revision_rounds: int = 0
+    max_document_output_tokens: int = 0
     final_retention_ratio: float = 0.0
     raw: Mapping[str, Any] = field(default_factory=dict)
 
@@ -184,6 +186,7 @@ class SkillRuntimeContract:
             "name": self.name,
             "version": self.version,
             "strategy": self.runtime.strategy,
+            "preparation": self.runtime.preparation,
             "context_policy": self.runtime.context_policy,
             "length_profiles": sorted(self.document.length_profiles),
             "sources": list(self.sources),
@@ -297,6 +300,7 @@ def _contract_from_mapping(
         name=str(raw.get("name") or ""),
         runtime=RuntimeContract(
             strategy=str(runtime.get("strategy") or ""),
+            preparation=str(runtime.get("preparation") or "direct"),
             context_policy=str(runtime.get("context_policy") or ""),
             finalization=str(runtime.get("finalization") or ""),
             raw=runtime,
@@ -416,6 +420,10 @@ def _length_profiles_from_raw(value: Any) -> dict[str, DocumentLengthProfileCont
             default_units=_non_negative_int(raw.get("default_units"), 0),
             max_units=_non_negative_int(raw.get("max_units"), 0),
             max_revision_rounds=_non_negative_int(raw.get("max_revision_rounds"), 0),
+            max_document_output_tokens=_non_negative_int(
+                raw.get("max_document_output_tokens"),
+                0,
+            ),
             final_retention_ratio=_ratio(raw.get("final_retention_ratio"), 0.0),
             raw=raw,
         )

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from novie_agent_sdk import (
+    DocumentAuthoringDeadlineExceeded,
     PlatformLlmCallError,
     SectionDraft,
     SectionedLongformAuthor,
@@ -13,6 +15,7 @@ from novie_agent_sdk import (
     run_sectioned_document_finalization,
     sectioned_authoring_contract_from_skill,
 )
+from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _llm_stream_event_delta,
     _llm_stream_event_result,
@@ -24,6 +27,7 @@ class _FakeLlm:
         self.force_wrong_heading = False
         self.chat_kwargs: list[dict[str, Any]] = []
         self.chat_prompts: list[str] = []
+        self.structured_prompts: list[str] = []
 
     async def structured(
         self,
@@ -32,6 +36,7 @@ class _FakeLlm:
         output_schema: dict[str, Any],
         temperature: float,
     ) -> dict[str, Any]:
+        self.structured_prompts.append(messages[0]["content"])
         return {
             "structured": {
                 "length_profile": "short",
@@ -97,6 +102,7 @@ class _FlakyStreamLlm:
         temperature: float,
         max_output_tokens: int,
         model: str | None = None,
+        **_kwargs: Any,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -165,6 +171,18 @@ class _LongFakeLlm(_FakeLlm):
                     )
                 }
         return {"content": "## Section 1\n\nalpha beta gamma delta epsilon zeta"}
+
+
+class _HangingLlm(_FakeLlm):
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
 
 def test_llm_stream_event_delta_extracts_content_blocks() -> None:
@@ -343,8 +361,9 @@ class _FakePlatform:
 async def test_sectioned_author_records_outline_sections_and_final_ref() -> None:
     platform = _FakePlatform()
     phase_events: list[dict[str, Any]] = []
+    llm = _FakeLlm()
     author = SectionedLongformAuthor(
-        llm_facade=_FakeLlm(),
+        llm_facade=llm,
         platform=platform,
         artifact_type="example_document",
         step_id="s2",
@@ -388,6 +407,7 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         "example_document",
     ]
     assert platform.workpads.final_refs == ["artifact://artifact-4"]
+    assert all(item["reasoning_mode"] == "disabled" for item in llm.chat_kwargs)
     event_names = [event["event"] for event in phase_events]
     assert [name for name in event_names if name.startswith("document.")] == [
         "document.profile.selected",
@@ -417,6 +437,37 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         event["event"] == "agent.tool_result" and event.get("tool_name") == "artifact.write"
         for event in phase_events
     )
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_passes_skill_instructions_to_outline_and_writer() -> None:
+    platform = _FakePlatform()
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        authoring_instructions="Use a decision log and state unresolved risks.",
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+    )
+
+    assert "Use a decision log" in llm.structured_prompts[0]
+    assert any("Use a decision log" in prompt for prompt in llm.chat_prompts)
 
 
 @pytest.mark.asyncio
@@ -552,6 +603,63 @@ async def test_run_sectioned_document_finalization_requires_sectioned_contract()
 
 
 @pytest.mark.asyncio
+async def test_streaming_finalization_surfaces_absolute_deadline(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    skill = tmp_path / "skills" / "report"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: report
+metadata:
+  novie:
+    runtime_contract:
+      version: 1
+      runtime:
+        strategy: sectioned_longform
+      document:
+        outline:
+          min_sections: 2
+          max_sections: 2
+        section:
+          min_units: 5
+          default_units: 5
+          max_units: 20
+---
+
+# Report
+""",
+        encoding="utf-8",
+    )
+    contract = SkillContractResolver(root_dir=tmp_path).resolve(
+        ["skills/report"],
+        required=True,
+    )
+    llm = _HangingLlm()
+    llm.platform_ns = _FakePlatform()
+    events = []
+
+    with pytest.raises(DocumentAuthoringDeadlineExceeded) as exc_info:
+        async for event in astream_sectioned_document_finalization(
+            llm_facade=llm,
+            skill_contract=contract,
+            artifact_type="example_document",
+            step_id="s2",
+            capability_id="agent.example.write_document",
+            context_budget={},
+            brief={"title": "Example document"},
+            upstream={},
+            wall_clock_deadline=asyncio.get_running_loop().time() + 0.01,
+        ):
+            events.append(event)
+
+    assert exc_info.value.code == "document_authoring_deadline_exceeded"
+    assert any(
+        event.metadata.get("event") == "sectioned_authoring_deadline_exceeded"
+        for event in events
+        if hasattr(event, "metadata")
+    )
+
+
+@pytest.mark.asyncio
 async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None:
     platform = _FakePlatform()
     llm = _FakeLlm()
@@ -581,13 +689,13 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         agent_id="writer",
     )
 
-    # Two section drafts + the final polish all get the run's budget-contract
-    # ceiling — content length is governed by prompt targets and the quality
-    # gate, not by per-call heuristics.
+    # Two section drafts and final polish share one document allocation. The
+    # first two calls receive an equal share, preserving the last share for
+    # finalization instead of multiplying the run budget three times.
     assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        64000,
-        64000,
-        64000,
+        21333,
+        21333,
+        21334,
     ]
 
 
@@ -660,6 +768,7 @@ metadata:
             default_units: 520
             max_units: 900
             max_revision_rounds: 2
+            max_document_output_tokens: 12000
             finalization: progressive_section_merge
             evidence_depth: deep
 ---
@@ -684,6 +793,7 @@ metadata:
     assert authoring["max_outline_sections"] == 16
     assert authoring["default_section_words"] == 520
     assert authoring["max_section_revision_rounds"] == 2
+    assert authoring["max_document_output_tokens"] == 12000
     assert authoring["finalization"] == "progressive_section_merge"
     assert authoring["evidence_depth"] == "deep"
 
@@ -1288,6 +1398,34 @@ async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
     assert events.count("document.final.seam_stitch_completed") == 2
     # Normal-size document must not trigger a truncation warning.
     assert "document.final.truncation_warning" not in events
+
+
+@pytest.mark.asyncio
+async def test_boundary_stitch_shares_remaining_budget_across_all_seams() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="Next.")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={"max_document_output_tokens": 400},
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id=f"s{index}", title=f"Section {index}"),
+            markdown=f"## Section {index}\n\nBody {index}.",
+        )
+        for index in range(1, 5)
+    ]
+
+    result = await author._boundary_stitch_final(
+        brief={"title": "Doc"},
+        drafts=drafts,
+        combined="\n\n".join(draft.markdown for draft in drafts),
+    )
+
+    assert all(draft.markdown in result for draft in drafts)
+    assert len(llm.chat_kwargs) == 3
+    assert sum(item["max_output_tokens"] for item in llm.chat_kwargs) == 400
 
 
 @pytest.mark.asyncio
