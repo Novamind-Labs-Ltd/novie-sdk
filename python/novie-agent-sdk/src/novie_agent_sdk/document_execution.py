@@ -15,6 +15,8 @@ from .skill_contracts import SkillRuntimeContract
 DIRECT_AUTHORING = "direct"
 EVIDENCE_GRAPH = "evidence_graph"
 GRAPH_HANDOFF = "graph_handoff"
+SECTIONED_LONGFORM = "sectioned_longform"
+DIRECT_ARTIFACT = "direct_artifact"
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,7 @@ class DocumentExecutionPlan:
     """One business-authoring pass for one platform execution step."""
 
     step_role: str
+    strategy: str
     preparation: str
     run_graph: bool
     graph_output: str
@@ -46,6 +49,7 @@ def resolve_document_execution_plan(
     if run_policy.is_upstream_handoff:
         return DocumentExecutionPlan(
             step_role=run_policy.step_role,
+            strategy=GRAPH_HANDOFF,
             preparation=GRAPH_HANDOFF,
             run_graph=True,
             graph_output="artifact",
@@ -62,12 +66,35 @@ def resolve_document_execution_plan(
             "invalid_document_runtime_preparation:"
             f"{preparation}; expected direct or evidence_graph"
         )
+    strategy = str(
+        getattr(getattr(skill_contract, "runtime", None), "strategy", "")
+        or SECTIONED_LONGFORM
+    ).strip().lower()
+    if strategy not in {SECTIONED_LONGFORM, DIRECT_ARTIFACT}:
+        raise RuntimeError(
+            "invalid_document_runtime_strategy:"
+            f"{strategy}; expected {SECTIONED_LONGFORM} or {DIRECT_ARTIFACT}"
+        )
+    if strategy == DIRECT_ARTIFACT and preparation != DIRECT_AUTHORING:
+        raise RuntimeError(
+            "invalid_document_runtime_combination:"
+            f"{DIRECT_ARTIFACT} requires {DIRECT_AUTHORING} preparation"
+        )
     return DocumentExecutionPlan(
         step_role=run_policy.step_role,
+        strategy=strategy,
         preparation=preparation,
-        run_graph=preparation == EVIDENCE_GRAPH,
-        graph_output="evidence_dossier" if preparation == EVIDENCE_GRAPH else "",
-        run_sectioned_authoring=True,
+        run_graph=(
+            preparation == EVIDENCE_GRAPH or strategy == DIRECT_ARTIFACT
+        ),
+        graph_output=(
+            "evidence_dossier"
+            if preparation == EVIDENCE_GRAPH
+            else "direct_artifact"
+            if strategy == DIRECT_ARTIFACT
+            else ""
+        ),
+        run_sectioned_authoring=strategy == SECTIONED_LONGFORM,
     )
 
 
@@ -116,8 +143,10 @@ def build_document_handoff_event(
 
 __all__ = [
     "DIRECT_AUTHORING",
+    "DIRECT_ARTIFACT",
     "EVIDENCE_GRAPH",
     "GRAPH_HANDOFF",
+    "SECTIONED_LONGFORM",
     "DocumentExecutionPlan",
     "build_document_handoff_event",
     "resolve_document_execution_plan",

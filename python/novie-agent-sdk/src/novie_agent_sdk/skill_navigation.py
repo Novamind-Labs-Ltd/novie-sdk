@@ -219,6 +219,7 @@ def compile_skill_scope(
     *,
     upstream: dict[str, Any] | None = None,
     source_resolver: Callable[[list[str], dict[str, Any]], list[str] | tuple[str, ...]] | None = None,
+    extra_sources: Sequence[str] = (),
     section_names: Sequence[str] = DEFAULT_DOCUMENT_SKILL_SECTIONS,
     max_digest_chars: int = 2200,
     synthesis_allowed_tools: tuple[str, ...] = (),
@@ -235,6 +236,9 @@ def compile_skill_scope(
         sources = list(source_resolver(base_sources, upstream or {}))
     else:
         sources = base_sources
+    for source in extra_sources:
+        if source not in sources:
+            sources.append(source)
 
     skills = load_skill_metadata_for_sources(
         spec,

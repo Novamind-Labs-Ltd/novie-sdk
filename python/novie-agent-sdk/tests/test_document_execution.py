@@ -4,8 +4,10 @@ import pytest
 
 from novie_agent_sdk import (
     DIRECT_AUTHORING,
+    DIRECT_ARTIFACT,
     EVIDENCE_GRAPH,
     GRAPH_HANDOFF,
+    SECTIONED_LONGFORM,
     RuntimeContract,
     SkillRuntimeContract,
     build_document_handoff_event,
@@ -14,8 +16,14 @@ from novie_agent_sdk import (
 )
 
 
-def _contract(preparation: str) -> SkillRuntimeContract:
-    return SkillRuntimeContract(runtime=RuntimeContract(preparation=preparation))
+def _contract(
+    preparation: str,
+    *,
+    strategy: str = SECTIONED_LONGFORM,
+) -> SkillRuntimeContract:
+    return SkillRuntimeContract(
+        runtime=RuntimeContract(preparation=preparation, strategy=strategy)
+    )
 
 
 def test_upstream_handoff_uses_graph_once_regardless_of_skill_preparation() -> None:
@@ -25,6 +33,7 @@ def test_upstream_handoff_uses_graph_once_regardless_of_skill_preparation() -> N
     )
 
     assert plan.preparation == GRAPH_HANDOFF
+    assert plan.strategy == GRAPH_HANDOFF
     assert plan.run_graph is True
     assert plan.graph_output == "artifact"
     assert plan.run_sectioned_authoring is False
@@ -51,6 +60,26 @@ def test_terminal_plan_has_exactly_one_sectioned_author(
     assert plan.run_graph is run_graph
     assert plan.graph_output == graph_output
     assert plan.run_sectioned_authoring is True
+
+
+def test_terminal_direct_artifact_uses_one_graph_author() -> None:
+    plan = resolve_document_execution_plan(
+        run_policy=step_run_policy({"output_contract": {"kind": "final_deliverable"}}),
+        skill_contract=_contract(DIRECT_AUTHORING, strategy=DIRECT_ARTIFACT),
+    )
+
+    assert plan.strategy == DIRECT_ARTIFACT
+    assert plan.run_graph is True
+    assert plan.graph_output == "direct_artifact"
+    assert plan.run_sectioned_authoring is False
+
+
+def test_terminal_direct_artifact_rejects_evidence_graph_preparation() -> None:
+    with pytest.raises(RuntimeError, match="invalid_document_runtime_combination"):
+        resolve_document_execution_plan(
+            run_policy=step_run_policy({}),
+            skill_contract=_contract(EVIDENCE_GRAPH, strategy=DIRECT_ARTIFACT),
+        )
 
 
 def test_terminal_plan_rejects_unknown_skill_preparation() -> None:
