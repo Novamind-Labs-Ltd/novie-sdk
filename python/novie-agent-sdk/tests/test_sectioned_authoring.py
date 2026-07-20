@@ -24,6 +24,7 @@ class _FakeLlm:
         self.force_wrong_heading = False
         self.chat_kwargs: list[dict[str, Any]] = []
         self.chat_prompts: list[str] = []
+        self.structured_prompts: list[str] = []
 
     async def structured(
         self,
@@ -32,6 +33,7 @@ class _FakeLlm:
         output_schema: dict[str, Any],
         temperature: float,
     ) -> dict[str, Any]:
+        self.structured_prompts.append(messages[0]["content"])
         return {
             "structured": {
                 "length_profile": "short",
@@ -417,6 +419,37 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
         event["event"] == "agent.tool_result" and event.get("tool_name") == "artifact.write"
         for event in phase_events
     )
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_passes_skill_instructions_to_outline_and_writer() -> None:
+    platform = _FakePlatform()
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        authoring_instructions="Use a decision log and state unresolved risks.",
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+    )
+
+    assert "Use a decision log" in llm.structured_prompts[0]
+    assert any("Use a decision log" in prompt for prompt in llm.chat_prompts)
 
 
 @pytest.mark.asyncio

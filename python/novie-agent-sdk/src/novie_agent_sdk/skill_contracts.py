@@ -20,6 +20,7 @@ class RuntimeContract:
     """Generic runtime strategy declared by a skill."""
 
     strategy: str = ""
+    preparation: str = "direct"
     context_policy: str = ""
     finalization: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
@@ -184,6 +185,7 @@ class SkillRuntimeContract:
             "name": self.name,
             "version": self.version,
             "strategy": self.runtime.strategy,
+            "preparation": self.runtime.preparation,
             "context_policy": self.runtime.context_policy,
             "length_profiles": sorted(self.document.length_profiles),
             "sources": list(self.sources),
@@ -297,6 +299,7 @@ def _contract_from_mapping(
         name=str(raw.get("name") or ""),
         runtime=RuntimeContract(
             strategy=str(runtime.get("strategy") or ""),
+            preparation=str(runtime.get("preparation") or "direct"),
             context_policy=str(runtime.get("context_policy") or ""),
             finalization=str(runtime.get("finalization") or ""),
             raw=runtime,
