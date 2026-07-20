@@ -234,12 +234,15 @@ from .document_quality import (
 )
 from .document_execution import (
     DIRECT_AUTHORING,
+    DIRECT_ARTIFACT,
     EVIDENCE_GRAPH,
     GRAPH_HANDOFF,
+    SECTIONED_LONGFORM,
     DocumentExecutionPlan,
     build_document_handoff_event,
     resolve_document_execution_plan,
 )
+from .document_profiles import select_document_length_profile
 from .document_resume import (
     DocumentResumeCandidate,
     get_matching_document_checkpoint,
@@ -698,6 +701,15 @@ __all__ = [
     "run_sectioned_document_finalization",
     "sectioned_authoring_contract_from_skill",
     "sectioned_authoring_enabled",
+    "DIRECT_AUTHORING",
+    "DIRECT_ARTIFACT",
+    "EVIDENCE_GRAPH",
+    "GRAPH_HANDOFF",
+    "SECTIONED_LONGFORM",
+    "DocumentExecutionPlan",
+    "build_document_handoff_event",
+    "resolve_document_execution_plan",
+    "select_document_length_profile",
     "ContextPack",
     "ContextPackBudget",
     "ContextPackBuilder",
