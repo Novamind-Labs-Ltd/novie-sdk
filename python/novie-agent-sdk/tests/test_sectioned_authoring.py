@@ -1037,6 +1037,78 @@ async def test_deferred_intermediate_artifacts_keep_successful_final_in_memory()
 
 
 @pytest.mark.asyncio
+async def test_deferred_final_keeps_resume_sections_but_does_not_commit_final() -> None:
+    """Fail-closed agents need resumable sections without an unvalidated final."""
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        defer_final_artifact=True,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    created_types = [item["artifact_type"] for item in platform.artifacts.created]
+    assert created_types == [
+        "example_document.outline",
+        "example_document.section",
+        "example_document.section",
+    ]
+    assert result.ledger["final_ref"] == {}
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
+async def test_authoring_instructions_reach_outline_draft_and_final_prompts() -> None:
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        authoring_instructions="CANONICAL DOCUMENT SHAPE MARKER",
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert any("CANONICAL DOCUMENT SHAPE MARKER" in prompt for prompt in llm.chat_prompts)
+
+
+@pytest.mark.asyncio
 async def test_deferred_intermediate_artifacts_do_not_persist_on_failure() -> None:
     platform = _FakePlatform()
     author = SectionedLongformAuthor(

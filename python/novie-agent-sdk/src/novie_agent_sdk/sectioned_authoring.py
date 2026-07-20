@@ -360,12 +360,14 @@ async def run_sectioned_document_finalization(
     draft_narrative_artifact_type: str = "",
     draft_narrative_summary: str = "",
     document_input: Mapping[str, Any] | None = None,
+    authoring_instructions: str = "",
     agent_disabled_env_var: str | None = None,
     agent_enabled_env_var: str | None = None,
     required_strategy: str = "sectioned_longform",
     quality_reason: str = "sectioned_authoring_quality_gates",
     quality_metadata: Mapping[str, Any] | None = None,
     defer_intermediate_artifacts: bool = False,
+    defer_final_artifact: bool = False,
 ) -> SectionedDocumentFinalizationResult:
     """Run sectioned longform finalization for document agents.
 
@@ -419,7 +421,9 @@ async def run_sectioned_document_finalization(
             skill_contract,
             artifact_type=artifact_type,
         ),
+        authoring_instructions=authoring_instructions,
         defer_intermediate_artifacts=defer_intermediate_artifacts,
+        defer_final_artifact=defer_final_artifact,
     )
     authoring_upstream: dict[str, Any] = dict(upstream)
     if draft_narrative_key:
@@ -489,12 +493,14 @@ async def astream_sectioned_document_finalization(
     draft_narrative_artifact_type: str = "",
     draft_narrative_summary: str = "",
     document_input: Mapping[str, Any] | None = None,
+    authoring_instructions: str = "",
     agent_disabled_env_var: str | None = None,
     agent_enabled_env_var: str | None = None,
     required_strategy: str = "sectioned_longform",
     quality_reason: str = "sectioned_authoring_quality_gates",
     quality_metadata: Mapping[str, Any] | None = None,
     defer_intermediate_artifacts: bool = False,
+    defer_final_artifact: bool = False,
     length_profile: str | None = None,
     profile_source: str = "skill_default",
     profile_confidence: str = "confirmed",
@@ -583,7 +589,9 @@ async def astream_sectioned_document_finalization(
         capability_id=capability_id,
         context_budget=dict(context_budget),
         authoring_contract=authoring_contract,
+        authoring_instructions=authoring_instructions,
         defer_intermediate_artifacts=defer_intermediate_artifacts,
+        defer_final_artifact=defer_final_artifact,
         phase_event_sink=_collect_sectioned_event,
         phase_checkpoint_sink=phase_checkpoint_sink,
     )
@@ -908,9 +916,11 @@ class SectionedLongformAuthor:
         capability_id: str,
         context_budget: Mapping[str, Any] | None = None,
         authoring_contract: Mapping[str, Any] | SectionedAuthoringContract | None = None,
+        authoring_instructions: str = "",
         phase_event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
         phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
         defer_intermediate_artifacts: bool = False,
+        defer_final_artifact: bool = False,
     ) -> None:
         self._llm = llm_facade
         self._platform = platform
@@ -918,12 +928,14 @@ class SectionedLongformAuthor:
         self._step_id = step_id
         self._capability_id = capability_id
         self._defer_intermediate_artifacts = defer_intermediate_artifacts
+        self._defer_final_artifact = defer_final_artifact
         self._context_budget = dict(context_budget or {})
         self._contract = (
             authoring_contract
             if isinstance(authoring_contract, SectionedAuthoringContract)
             else SectionedAuthoringContract.from_mapping(authoring_contract)
         )
+        self._authoring_instructions = str(authoring_instructions or "").strip()[:12000]
         if defer_intermediate_artifacts:
             self._contract = replace(
                 self._contract,
@@ -960,6 +972,14 @@ class SectionedLongformAuthor:
         self._phase_checkpoint_sink = phase_checkpoint_sink
         self._llm_call_seq = 0
         self._tool_call_seq = 0
+
+    def _skill_instruction_block(self) -> str:
+        if not self._authoring_instructions:
+            return ""
+        return (
+            "Skill authoring instructions (follow these when planning and writing):\n"
+            f"{self._authoring_instructions}\n\n"
+        )
 
     async def author(
         self,
@@ -1284,7 +1304,9 @@ class SectionedLongformAuthor:
         # artifact surviving cancellation between authoring and transport
         # success. Legacy callers retain the original ledger behavior.
         final_ref: dict[str, Any] = {}
-        if not self._defer_intermediate_artifacts:
+        if not (
+            self._defer_intermediate_artifacts or self._defer_final_artifact
+        ):
             final_ref = await self._record_final(
                 final_markdown,
                 workflow_id=workflow_id,
@@ -1305,6 +1327,10 @@ class SectionedLongformAuthor:
             "document.final.created",
             status="complete",
             artifact_ref=final_ref,
+            artifact_committed=bool(final_ref),
+            final_commit_deferred=bool(
+                self._defer_intermediate_artifacts or self._defer_final_artifact
+            ),
             section_count=len(drafts),
             length_profile=self._contract.length_profile,
             finalization=self._contract.finalization,
@@ -1593,6 +1619,7 @@ class SectionedLongformAuthor:
             f"Coverage model: {self._contract.coverage_model}.\n"
             f"Selected length profile: {self._contract.length_profile}.\n"
             f"Evidence depth: {self._contract.evidence_depth}.\n"
+            f"{self._skill_instruction_block()}"
             "The length profile is already selected by the runtime. Do not "
             "change it. Plan within the declared section and unit bounds. "
             f"Return {self._contract.min_outline_sections}-"
@@ -1802,6 +1829,7 @@ class SectionedLongformAuthor:
             "earlier sections established and avoid repeating their content. "
             "Do not include process notes. Cite artifact refs or source refs when evidence is used. "
             f"Write at least {plan.min_words} substantive information units.\n\n"
+            f"{self._skill_instruction_block()}"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Section plan:\n{_json_block(asdict(plan), limit=4000)}\n\n"
             f"{story_block}"
@@ -2002,6 +2030,7 @@ class SectionedLongformAuthor:
             "Polish the concatenated sections into one coherent final Markdown deliverable. "
             "Preserve factual claims, source refs, and section substance. "
             "Improve transitions and remove repetition without shortening materially.\n\n"
+            f"{self._skill_instruction_block()}"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
             f"Draft sections:\n{draft_sections}"
@@ -2086,6 +2115,7 @@ class SectionedLongformAuthor:
                 "coherent Markdown chapter block. Preserve all factual claims, "
                 "source refs, headings, and confidence markers. Reduce only "
                 "clear repetition.\n\n"
+                f"{self._skill_instruction_block()}"
                 f"Original task:\n{_json_block(brief, limit=6000)}\n\n"
                 f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
                 f"Cluster draft sections:\n{cluster_sections}"
