@@ -1282,6 +1282,48 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
     assert events[-1]["error_code"] == "agent_internal_error"
     assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(events)
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
+    assert events[-1]["metadata"]["exception_type"] == "RuntimeError"
+    assert events[-1]["metadata"]["raw_error_ref"].startswith("sdk-terminal:")
+
+
+def test_stream_endpoint_terminal_error_carries_last_safe_handler_metadata():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-terminal-metadata"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "body"}
+        yield {
+            "kind": "trace",
+            "metadata": {
+                "runtime_phase": "finalize",
+                "semantic_phase": "finalizing_output",
+                "artifact_type": "brainstorm_notes",
+                "artifact_family": "brainstorm",
+                "capability_id": "agent.analyst.brainstorming",
+                "content_stream_closed": True,
+                "prompt_should_not_leak": "SECRET",
+            },
+        }
+        raise RuntimeError("provider failed: SECRET_USER_OR_SKILL_PROMPT_MARKER")
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    terminal = events[-1]
+    assert terminal["kind"] == "terminal_error"
+    assert terminal["metadata"]["runtime_phase"] == "finalize"
+    assert terminal["metadata"]["semantic_phase"] == "finalizing_output"
+    assert terminal["metadata"]["artifact_type"] == "brainstorm_notes"
+    assert terminal["metadata"]["artifact_family"] == "brainstorm"
+    assert terminal["metadata"]["capability_id"] == "agent.analyst.brainstorming"
+    assert terminal["metadata"]["content_stream_closed"] is True
+    assert "prompt_should_not_leak" not in terminal["metadata"]
+    assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(events)
 
 
 def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():

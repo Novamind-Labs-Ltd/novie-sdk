@@ -35,6 +35,11 @@ class PublicAgentError(RuntimeError):
 
 _SAFE_ENVELOPE_MESSAGES = {
     "agent_internal_error": "Agent execution failed.",
+    "agent_finalize_failed": "Document finalization failed.",
+    "artifact_contract_violation": (
+        "The generated artifact did not satisfy its required structure."
+    ),
+    "provider_timeout": "Document finalization timed out.",
     "sectioned_authoring_llm_failed": "Document finalization failed.",
     "sectioned_authoring_finalize_timeout": "Document finalization timed out.",
 }

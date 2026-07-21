@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -2446,6 +2447,28 @@ class Agent:
                     invocation_resolved = False
                     events_since_touch = 0
                     last_event_at = time.monotonic()
+                    last_handler_metadata: dict[str, Any] = {}
+
+                    def _terminal_error_ref(error_code: str, exc: BaseException | None = None) -> str:
+                        seed = ":".join(
+                            (
+                                m.agent_id,
+                                str(hdrs.step_id or ""),
+                                str(error_code or "agent_internal_error"),
+                                type(exc).__name__ if exc is not None else "envelope",
+                            )
+                        )
+                        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+                        return f"sdk-terminal:{digest}"
+
+                    def _terminal_metadata(source: str, error_code: str, exc: BaseException | None = None) -> dict[str, Any]:
+                        return {
+                            "terminal_source": source,
+                            "agent_id": m.agent_id,
+                            "exception_type": type(exc).__name__ if exc is not None else "envelope",
+                            "raw_error_ref": _terminal_error_ref(error_code, exc),
+                            **last_handler_metadata,
+                        }
 
                     async def _maybe_heartbeat() -> None:
                         # Tier B: renew the in_progress lease so a long-running
@@ -2521,10 +2544,11 @@ class Agent:
                                     "error": public_error.public_message,
                                     "error_code": public_error.error_code,
                                     "output": {},
-                                    "metadata": {
-                                        "terminal_source": "sdk_exception_guard",
-                                        "agent_id": m.agent_id,
-                                    },
+                                    "metadata": _terminal_metadata(
+                                        "sdk_exception_guard",
+                                        public_error.error_code,
+                                        payload,
+                                    ),
                                 }
                                 if isinstance(payload, PublicAgentError):
                                     error_event.update(
@@ -2556,10 +2580,10 @@ class Agent:
                                         "error": public_error.public_message,
                                         "error_code": public_error.error_code,
                                         "output": {},
-                                        "metadata": {
-                                            "terminal_source": "sdk_observability_guard",
-                                            "agent_id": m.agent_id,
-                                        },
+                                        "metadata": _terminal_metadata(
+                                            "sdk_observability_guard",
+                                            public_error.error_code,
+                                        ),
                                     }
                                     emitted_events.append(safe_event)
                                     if started_invocation and hdrs.idempotency_key:
@@ -2581,6 +2605,24 @@ class Agent:
                                 event = payload
                             else:
                                 event = {"kind": "content", "text": str(payload)}
+                            event_metadata = event.get("metadata")
+                            if isinstance(event_metadata, dict):
+                                last_handler_metadata.update(
+                                    {
+                                        key: event_metadata[key]
+                                        for key in (
+                                            "runtime_phase",
+                                            "semantic_phase",
+                                            "artifact_type",
+                                            "artifact_family",
+                                            "capability_id",
+                                            "content_stream_closed",
+                                            "finalize_strategy",
+                                            "checkpoint_id",
+                                        )
+                                        if key in event_metadata
+                                    }
+                                )
                             event_kind = str(
                                 event.get("kind") or event.get("type") or ""
                             ).strip().lower()
@@ -2600,10 +2642,10 @@ class Agent:
                                     "error": public_error.public_message,
                                     "error_code": public_error.error_code,
                                     "output": {},
-                                    "metadata": {
-                                        "terminal_source": "sdk_envelope_guard",
-                                        "agent_id": m.agent_id,
-                                    },
+                                    "metadata": _terminal_metadata(
+                                        "sdk_envelope_guard",
+                                        public_error.error_code,
+                                    ),
                                 }
                                 emitted_events.append(safe_event)
                                 if started_invocation and hdrs.idempotency_key:
