@@ -619,7 +619,26 @@ Purpose:
 - Creates the SDK `LlmFacade` around a `PlatformNamespace`, with BYOK fallback only when the platform namespace is unavailable.
 - `LlmFacade.chat(...)` supports `max_output_tokens` and forwards it to platform or BYOK clients.
 - Platform LLM chat may first attempt the streaming capability endpoint for long calls; if the platform returns `stream_endpoint_not_found`, the namespace falls back to normal invoke and skips later stream attempts for the same namespace instance.
+- Platform LLM stream reads use a 60-second read-idle timeout. Platform SSE heartbeats reset that idle window without changing the invocation wall-clock budget.
+- A `stream_heartbeat_timeout` envelope remains a stable public error with the safe message `Platform LLM stream became unresponsive.`; the SDK does not collapse it into `agent_internal_error`.
 - `LlmFacade.report_usage(...)` and `LlmFacade.usage_callback(...)` let agent-owned LangChain/provider calls report token usage without the SDK owning a LangChain model adapter.
+
+### SDK timeout and liveness profile
+
+The Python SDK keeps transport and liveness defaults in
+`novie_agent_sdk.timeout_policy.DEFAULT_SDK_TIMEOUTS`:
+
+- capability request: 8 seconds;
+- LLM request: 120 seconds;
+- LLM stream read-idle: 60 seconds;
+- state request: 30 seconds;
+- artifact request: 60 seconds;
+- agent stream keepalive: 25 seconds;
+- invocation lease: 300 seconds, renewed by elapsed time at least three times per lease;
+- active subtask idle timeout: 120 seconds.
+
+These values are transport/liveness limits. They do not extend the workflow or
+step wall-clock budget supplied by the platform.
 
 ## Document A2A Runtime Adapters
 

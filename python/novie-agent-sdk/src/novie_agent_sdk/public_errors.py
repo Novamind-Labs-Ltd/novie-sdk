@@ -37,6 +37,7 @@ _SAFE_ENVELOPE_MESSAGES = {
     "agent_internal_error": "Agent execution failed.",
     "sectioned_authoring_llm_failed": "Document finalization failed.",
     "sectioned_authoring_finalize_timeout": "Document finalization timed out.",
+    "stream_heartbeat_timeout": "Platform LLM stream became unresponsive.",
 }
 
 

@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent / "novie-platform" / "protocol" / "src"))
 
+import novie_agent_sdk.runtime as runtime_module
 from novie_agent_sdk.runtime import (
     Agent,
     AskBudgetExceeded,
@@ -1305,6 +1306,69 @@ def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
 
     assert events[-1]["error"] == "Document finalization failed."
     assert events[-1]["error_code"] == "sectioned_authoring_llm_failed"
+
+
+def test_stream_endpoint_preserves_allowlisted_stream_timeout_code():
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    agent = Agent(_stream_manifest("stream-read-idle-timeout"))
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {
+            "kind": "terminal_error",
+            "error": "unsafe provider detail",
+            "error_code": "stream_heartbeat_timeout",
+        }
+
+    client = TestClient(agent.build_app())
+    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
+        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+
+    assert events[-1]["error_code"] == "stream_heartbeat_timeout"
+    assert events[-1]["error"] == "Platform LLM stream became unresponsive."
+    assert "unsafe provider detail" not in json.dumps(events)
+
+
+def test_stream_invocation_lease_renewal_is_time_based(monkeypatch):
+    from fastapi.testclient import TestClient
+    from novie_agent_sdk.runtime import StreamContext
+
+    class RecordingStore(InMemoryOneShotInvocationStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.touch_count = 0
+
+        async def touch(self, idempotency_key: str, mode: str) -> None:
+            self.touch_count += 1
+            await super().touch(idempotency_key, mode)
+
+    store = RecordingStore()
+    monkeypatch.setattr(
+        runtime_module,
+        "invocation_lease_renewal_seconds",
+        lambda _lease_seconds: 0.0,
+    )
+    agent = Agent(
+        _stream_manifest("stream-time-based-lease"),
+        invocation_store=store,
+    )
+
+    @agent.stream
+    async def handle(ctx: StreamContext):
+        yield {"kind": "content", "content": "one event is enough"}
+
+    client = TestClient(agent.build_app())
+    with client.stream(
+        "POST",
+        "/stream",
+        headers={"Idempotency-Key": "lease-by-time"},
+        json={"input": {"q": "x"}},
+    ) as resp:
+        list(resp.iter_lines())
+
+    assert store.touch_count >= 1
 
 
 def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():

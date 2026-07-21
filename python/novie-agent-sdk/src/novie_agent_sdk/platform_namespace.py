@@ -72,6 +72,7 @@ from .llm_contract import (
     normalise_stream_event,
 )
 from .runtime import RequestHeaders
+from .timeout_policy import DEFAULT_SDK_TIMEOUTS
 
 
 _log = logging.getLogger(__name__)
@@ -89,22 +90,6 @@ DegradationKind = Literal[
     "unconfigured",
 ]
 
-
-_DEFAULT_TIMEOUT_SECONDS = 8.0
-# LLM capability invocations go through the platform → provider (OpenRouter,
-# Anthropic, OpenAI) round-trip; ``platform.llm.structured`` against a
-# Pydantic schema with required fields routinely takes 10–30 s and can spike
-# higher under provider contention.  Reusing the 8 s default for short
-# capabilities (knowledge / checkpoints) here used to silently turn every
-# slow LLM call into ``httpx.ReadTimeout`` → ``_unwrap`` → ``{}`` → upstream
-# ``ProductBriefArtifact summary Field required`` validation error, which
-# read on the platform side as ``RemoteProtocolError`` once the analyst's
-# stream collapsed.  Treat LLM as its own latency tier so callers don't have
-# to second-guess the SDK default.
-_DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
-_DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS = 60.0
-_DEFAULT_STATE_TIMEOUT_SECONDS = 30.0
-_DEFAULT_ARTIFACT_TIMEOUT_SECONDS = 60.0
 
 _KNOWLEDGE_SEARCH_CAP = "platform.knowledge.search"
 _WEB_SEARCH_CAP = "platform.web.search"
@@ -205,7 +190,7 @@ class _CapabilityCaller:
         forward_headers: Mapping[str, str],
         *,
         agent_id: str,
-        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: float = DEFAULT_SDK_TIMEOUTS.capability_request_seconds,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -365,7 +350,7 @@ class _CapabilityCaller:
         capability_id: str,
         arguments: Mapping[str, Any],
         *,
-        heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
+        read_idle_timeout_seconds: float = DEFAULT_SDK_TIMEOUTS.llm_stream_read_idle_seconds,
     ) -> CapabilityCallDiagnostics:
         path = _CHAT_COMPLETIONS_PATH
         headers = sign_platform_callback_headers(
@@ -409,12 +394,12 @@ class _CapabilityCaller:
                 )
 
         try:
-            heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
+            read_idle_timeout = max(float(read_idle_timeout_seconds), 1.0)
             if self._client is not None:
                 return await consume(self._client)
             timeout = httpx.Timeout(
                 timeout=float(self._timeout),
-                read=heartbeat_timeout,
+                read=read_idle_timeout,
             )
             async with httpx.AsyncClient(
                 base_url=self._base_url,
@@ -452,7 +437,7 @@ class _CapabilityCaller:
         capability_id: str,
         arguments: Mapping[str, Any],
         *,
-        heartbeat_timeout_seconds: float = _DEFAULT_LLM_HEARTBEAT_TIMEOUT_SECONDS,
+        read_idle_timeout_seconds: float = DEFAULT_SDK_TIMEOUTS.llm_stream_read_idle_seconds,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield platform LLM chat stream events.
 
@@ -474,7 +459,7 @@ class _CapabilityCaller:
                     yield event
 
         try:
-            heartbeat_timeout = max(float(heartbeat_timeout_seconds), 1.0)
+            read_idle_timeout = max(float(read_idle_timeout_seconds), 1.0)
             stream_state: dict[Any, Any] = {}
             if self._client is not None:
                 async for event in consume(self._client):
@@ -482,7 +467,7 @@ class _CapabilityCaller:
                 return
             timeout = httpx.Timeout(
                 timeout=float(self._timeout),
-                read=heartbeat_timeout,
+                read=read_idle_timeout,
             )
             async with httpx.AsyncClient(
                 base_url=self._base_url,
@@ -1266,7 +1251,7 @@ class ArtifactsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _ARTIFACT_CREATE_CAP,
             payload,
-            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.artifact_request_seconds,
         )
         if not diagnostics.ok:
             return {
@@ -1347,7 +1332,7 @@ class ArtifactsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _ARTIFACT_READ_CAP,
             payload,
-            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.artifact_request_seconds,
         )
         if not diagnostics.ok:
             return {
@@ -1422,7 +1407,7 @@ class ArtifactsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _ARTIFACT_SEARCH_CAP,
             {key: value for key, value in payload.items() if value not in (None, "")},
-            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.artifact_request_seconds,
         )
         if not diagnostics.ok:
             return []
@@ -1460,7 +1445,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_SNAPSHOT_CAP,
             {key: value for key, value in payload.items() if value not in (None, "")},
-            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.state_request_seconds,
         )
         if not diagnostics.ok:
             return {
@@ -1503,7 +1488,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_RECORD_ENTRY_CAP,
             payload,
-            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.state_request_seconds,
         )
         if not diagnostics.ok:
             return {
@@ -1532,7 +1517,7 @@ class WorkpadsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _WORKPAD_SET_FINAL_DELIVERABLE_CAP,
             payload,
-            timeout_seconds=_DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.artifact_request_seconds,
         )
         if not diagnostics.ok:
             return {
@@ -1595,7 +1580,7 @@ class CheckpointsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _CHECKPOINT_PUT_CAP,
             args,
-            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.state_request_seconds,
         )
         if not diagnostics.ok:
             raise ExternalAgentCheckpointPutError(
@@ -1624,7 +1609,7 @@ class CheckpointsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _CHECKPOINT_GET_CAP,
             args,
-            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.state_request_seconds,
         )
         if not diagnostics.ok:
             return None
@@ -1647,7 +1632,7 @@ class CheckpointsNamespace:
         diagnostics = await self._parent.invoke_capability(
             _CHECKPOINT_LIST_CAP,
             args,
-            timeout_seconds=_DEFAULT_STATE_TIMEOUT_SECONDS,
+            timeout_seconds=DEFAULT_SDK_TIMEOUTS.state_request_seconds,
         )
         if not diagnostics.ok:
             return []
@@ -2208,8 +2193,8 @@ def build_platform_namespace(
     *,
     agent_id: str,
     base_url: str | None = None,
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
-    llm_timeout_seconds: float = _DEFAULT_LLM_TIMEOUT_SECONDS,
+    timeout_seconds: float = DEFAULT_SDK_TIMEOUTS.capability_request_seconds,
+    llm_timeout_seconds: float = DEFAULT_SDK_TIMEOUTS.llm_request_seconds,
     client: httpx.AsyncClient | None = None,
 ) -> PlatformNamespace | _UnavailablePlatformNamespace:
     """Construct a per-request ``ctx.platform`` from incoming A2A

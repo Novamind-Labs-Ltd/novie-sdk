@@ -93,6 +93,7 @@ from .public_errors import (
     public_error_fields_from_envelope,
 )
 from .tenant_scoping import validate_tenant_context
+from .timeout_policy import DEFAULT_SDK_TIMEOUTS, invocation_lease_renewal_seconds
 
 
 def _build_ctx_platform_and_llm(
@@ -648,15 +649,14 @@ class TaskRecord:
 #      record is ``in_progress`` past its lease, it's recycled into a fresh
 #      record so a new request can proceed (covers the agent-process-crash
 #      case where Tier A's finally never ran). The stream handler renews the
-#      lease via ``touch`` every ``NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS``.
+#      lease via ``touch`` from elapsed monotonic time, independent of event rate.
 _DEFAULT_INVOCATION_LEASE_SECONDS = _env_int(
-    "NOVIE_AGENT_INVOCATION_LEASE_SECONDS", default=300,
-)
-_DEFAULT_INVOCATION_HEARTBEAT_EVENTS = _env_int(
-    "NOVIE_AGENT_INVOCATION_HEARTBEAT_EVENTS", default=10,
+    "NOVIE_AGENT_INVOCATION_LEASE_SECONDS",
+    default=DEFAULT_SDK_TIMEOUTS.invocation_lease_seconds,
 )
 _DEFAULT_STREAM_KEEPALIVE_SECONDS = _env_float(
-    "NOVIE_AGENT_STREAM_KEEPALIVE_SECONDS", default=25.0,
+    "NOVIE_AGENT_STREAM_KEEPALIVE_SECONDS",
+    default=DEFAULT_SDK_TIMEOUTS.stream_keepalive_seconds,
 )
 
 
@@ -2391,11 +2391,13 @@ class Agent:
                 )
                 validate_tenant_context(hdrs)
                 started_invocation = False
+                invocation_lease_seconds = _DEFAULT_INVOCATION_LEASE_SECONDS
                 if hdrs.idempotency_key:
                     started_invocation, invocation = await self._invocation_store.start_or_get(
                         hdrs.idempotency_key,
                         "stream",
                     )
+                    invocation_lease_seconds = invocation.lease_seconds
                     if not started_invocation:
                         if invocation.status == "completed" and invocation.events is not None:
                             async def _replay() -> AsyncIterator[bytes]:
@@ -2444,24 +2446,26 @@ class Agent:
                     emitted_events: list[dict[str, Any]] = []
                     terminal_error_emitted = False
                     invocation_resolved = False
-                    events_since_touch = 0
                     last_event_at = time.monotonic()
+                    last_lease_touch_at = last_event_at
 
                     async def _maybe_heartbeat() -> None:
                         # Tier B: renew the in_progress lease so a long-running
-                        # handler isn't recycled by ``_is_lease_stale`` while
-                        # it's still actively producing.
-                        nonlocal events_since_touch
-                        events_since_touch += 1
-                        if events_since_touch < _DEFAULT_INVOCATION_HEARTBEAT_EVENTS:
-                            return
-                        events_since_touch = 0
+                        # handler isn't recycled while active. Elapsed time,
+                        # not output volume, decides renewal.
+                        nonlocal last_lease_touch_at
                         if not (started_invocation and hdrs.idempotency_key):
+                            return
+                        now = time.monotonic()
+                        if now - last_lease_touch_at < invocation_lease_renewal_seconds(
+                            invocation_lease_seconds
+                        ):
                             return
                         try:
                             await self._invocation_store.touch(
                                 hdrs.idempotency_key, "stream",
                             )
+                            last_lease_touch_at = now
                         except Exception:  # noqa: BLE001
                             # Heartbeat failure is non-fatal; the lease will
                             # just expire normally if downstream really did die.
