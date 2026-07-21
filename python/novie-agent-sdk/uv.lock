@@ -101,6 +101,19 @@ wheels = [
 ]
 
 [[package]]
+name = "fakeredis"
+version = "2.36.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "redis" },
+    { name = "sortedcontainers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0a/ed/86ed74d8829c3bc565025c1c9efaf8518c9165fbf8c9cc2c026c8ed21bd9/fakeredis-2.36.2.tar.gz", hash = "sha256:c37a0b307fae3f27ec7c19e59519e57b8c52782e00303df9075361b5ba441be6", size = 213336, upload-time = "2026-06-17T13:25:38.934Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/4d/e6e40f93031adbf654d34e542bd396e9f3bc1c6209b40c920d58c9e1317a/fakeredis-2.36.2-py3-none-any.whl", hash = "sha256:84cbb9c74ca8946c0d2499daadf3a5d0bfe3cfbac71e3398316d1a1eab3421c4", size = 141039, upload-time = "2026-06-17T13:25:36.638Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.136.1"
 source = { registry = "https://pypi.org/simple" }
@@ -289,12 +302,13 @@ wheels = [
 
 [[package]]
 name = "novie-agent-sdk"
-version = "0.3.59"
+version = "0.3.60"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "novie-protocol" },
     { name = "pyyaml" },
+    { name = "redis" },
 ]
 
 [package.optional-dependencies]
@@ -312,6 +326,15 @@ server = [
     { name = "fastapi" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "fakeredis" },
+    { name = "fastapi" },
+    { name = "langchain-core" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
@@ -324,8 +347,18 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "redis", specifier = ">=5,<6" },
 ]
 provides-extras = ["server", "observability", "dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "fakeredis", specifier = ">=2.36.2" },
+    { name = "fastapi", specifier = ">=0.136.1" },
+    { name = "langchain-core", specifier = ">=1.4.0" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+]
 
 [[package]]
 name = "novie-protocol"
@@ -540,6 +573,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyjwt"
+version = "2.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -594,6 +636,18 @@ wheels = [
 ]
 
 [[package]]
+name = "redis"
+version = "5.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyjwt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6a/cf/128b1b6d7086200c9f387bd4be9b2572a30b90745ef078bd8b235042dc9f/redis-5.3.1.tar.gz", hash = "sha256:ca49577a531ea64039b5a36db3d6cd1a0c7a60c34124d46924a45b956e8cf14c", size = 4626200, upload-time = "2025-07-25T08:06:27.778Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/26/5c5fa0e83c3621db835cfc1f1d789b37e7fa99ed54423b5f519beb931aa7/redis-5.3.1-py3-none-any.whl", hash = "sha256:dc1909bd24669cc31b5f67a039700b16ec30571096c5f1f0d9d2324bff31af97", size = 272833, upload-time = "2025-07-25T08:06:26.317Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.34.0"
 source = { registry = "https://pypi.org/simple" }
@@ -618,6 +672,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f3/61/d7545dafb7ac2230c70d38d31cbfe4cc64f7144dc41f6e4e4b78ecd9f5bb/requests-toolbelt-1.0.0.tar.gz", hash = "sha256:7681a0a3d047012b5bdc0ee37d7f8f07ebe76ab08caeccfc3921ce23c88d5bc6", size = 206888, upload-time = "2023-05-01T04:11:33.229Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/51/d4db610ef29373b879047326cbf6fa98b6c1969d6f6dc423279de2b1be2c/requests_toolbelt-1.0.0-py2.py3-none-any.whl", hash = "sha256:cccfdd665f0a24fcf4726e690f65639d272bb0637b9b92dfd91a5568ccf6bd06", size = 54481, upload-time = "2023-05-01T04:11:28.427Z" },
+]
+
+[[package]]
+name = "sortedcontainers"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/c4/ba2f8066cceb6f23394729afe52f3bf7adec04bf9ed2c820b39e19299111/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88", size = 30594, upload-time = "2021-05-16T22:03:42.897Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/46/9cb0e58b2deb7f82b84065f37f3bffeb12413f947f9388e4cac22c4621ce/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0", size = 29575, upload-time = "2021-05-16T22:03:41.177Z" },
 ]
 
 [[package]]
