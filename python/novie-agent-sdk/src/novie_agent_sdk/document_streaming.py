@@ -9,10 +9,11 @@ from typing import Any
 
 from novie_protocol.agents import AgentStreamEvent
 
+from .timeout_policy import DEFAULT_SDK_TIMEOUTS
 from .workpad import workpad_checkpoint_event
 
-DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 25.0
-DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS = 120.0
+DEFAULT_KEEPALIVE_INTERVAL_SECONDS = DEFAULT_SDK_TIMEOUTS.stream_keepalive_seconds
+DEFAULT_SUBTASK_IDLE_TIMEOUT_SECONDS = DEFAULT_SDK_TIMEOUTS.subtask_idle_seconds
 KEEPALIVE_DONE = object()
 DEFAULT_MIN_SUBTASK_RESULT_CHARS = 900
 DEFAULT_SUBTASK_EVIDENCE_MAX_CHARS = 1_000_000

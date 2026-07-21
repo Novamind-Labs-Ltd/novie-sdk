@@ -40,13 +40,8 @@ from novie_agent_sdk import (
     build_platform_namespace,
     classify_envelope_error,
 )
-from novie_agent_sdk.platform_namespace import (
-    _DEFAULT_ARTIFACT_TIMEOUT_SECONDS,
-    _DEFAULT_LLM_TIMEOUT_SECONDS,
-    _DEFAULT_STATE_TIMEOUT_SECONDS,
-    _DEFAULT_TIMEOUT_SECONDS,
-    _UnavailablePlatformNamespace,
-)
+from novie_agent_sdk.platform_namespace import _UnavailablePlatformNamespace
+from novie_agent_sdk.timeout_policy import DEFAULT_SDK_TIMEOUTS
 
 
 def _incoming_headers(**overrides: str) -> dict[str, str]:
@@ -565,13 +560,13 @@ async def test_artifact_writes_use_dedicated_long_timeout() -> None:
     await ns.knowledge.search("still short")
 
     assert captured == [
-        ("platform.artifacts.create", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
-        ("platform.artifacts.read", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
-        ("platform.artifacts.search", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
-        ("platform.workpads.snapshot", _DEFAULT_STATE_TIMEOUT_SECONDS),
-        ("platform.workpads.record_entry", _DEFAULT_STATE_TIMEOUT_SECONDS),
-        ("platform.workpads.set_final_deliverable", _DEFAULT_ARTIFACT_TIMEOUT_SECONDS),
-        ("platform.external_agent_checkpoint.put", _DEFAULT_STATE_TIMEOUT_SECONDS),
+        ("platform.artifacts.create", DEFAULT_SDK_TIMEOUTS.artifact_request_seconds),
+        ("platform.artifacts.read", DEFAULT_SDK_TIMEOUTS.artifact_request_seconds),
+        ("platform.artifacts.search", DEFAULT_SDK_TIMEOUTS.artifact_request_seconds),
+        ("platform.workpads.snapshot", DEFAULT_SDK_TIMEOUTS.state_request_seconds),
+        ("platform.workpads.record_entry", DEFAULT_SDK_TIMEOUTS.state_request_seconds),
+        ("platform.workpads.set_final_deliverable", DEFAULT_SDK_TIMEOUTS.artifact_request_seconds),
+        ("platform.external_agent_checkpoint.put", DEFAULT_SDK_TIMEOUTS.state_request_seconds),
         ("platform.knowledge.search", None),
     ]
 
@@ -1351,9 +1346,9 @@ async def test_llm_namespace_uses_dedicated_long_timeout_caller() -> None:
     assert isinstance(ns, PlatformNamespace)
 
     # Default caller (knowledge / checkpoints) keeps the short timeout.
-    assert ns._caller._timeout == _DEFAULT_TIMEOUT_SECONDS  # noqa: SLF001
+    assert ns._caller._timeout == DEFAULT_SDK_TIMEOUTS.capability_request_seconds  # noqa: SLF001
     # LLM caller gets the long-form timeout.
-    assert ns._llm_caller._timeout == _DEFAULT_LLM_TIMEOUT_SECONDS  # noqa: SLF001
+    assert ns._llm_caller._timeout == DEFAULT_SDK_TIMEOUTS.llm_request_seconds  # noqa: SLF001
     assert ns._llm_caller is not ns._caller  # noqa: SLF001
 
     await ns.llm.structured(
