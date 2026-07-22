@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import types
 import uuid
 from pathlib import Path
 from typing import Any
@@ -25,10 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent / "novie-platform" / "protocol" / "src"))
 
 import novie_agent_sdk.runtime as runtime_module
+import novie_agent_sdk.redis_invocation_store as redis_store_module
+from novie_agent_sdk.redis_invocation_store import RedisOneShotInvocationStore
 from novie_agent_sdk.runtime import (
     Agent,
     AskBudgetExceeded,
     AskTimedOut,
+    FailOpenOneShotInvocationStore,
     InMemoryOneShotInvocationStore,
     InMemoryTaskStore,
     InvokeContext,
@@ -99,6 +103,82 @@ def _tasks_manifest(agent_id: str = "test-tasks") -> AgentManifestV2:
         endpoint="http://localhost:8001",
         execution=ExecutionHints(supports_cancel=True, emits_events=True),
     )
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.eval_calls: list[str] = []
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> list[Any] | int:
+        self.eval_calls.append(script)
+        keys = [str(arg) for arg in args[:numkeys]]
+        argv = list(args[numkeys:])
+        if script == redis_store_module._START_OR_GET_SCRIPT:  # noqa: SLF001
+            raw = self.values.get(keys[0])
+            if raw is not None:
+                existing = json.loads(raw)
+                stale = (
+                    existing.get("status") == "in_progress"
+                    and float(argv[2]) - float(existing.get("updated_epoch") or 0)
+                    > max(float(existing.get("lease_seconds") or argv[3]), 1)
+                )
+                if not stale:
+                    return [0, raw]
+            self.values[keys[0]] = str(argv[0])
+            self.values[keys[1]] = keys[0]
+            return [1, argv[0]]
+        if script == redis_store_module._COMPLETE_SCRIPT:  # noqa: SLF001
+            raw = self.values.get(keys[0])
+            if raw is None:
+                return 0
+            record = json.loads(raw)
+            record["status"] = "completed"
+            record["updated_at"] = str(argv[0])
+            record["updated_epoch"] = float(argv[1])
+            record["response"] = json.loads(str(argv[2]))
+            record["events"] = json.loads(str(argv[3]))
+            record["error"] = None
+            self.values[keys[0]] = json.dumps(record)
+            self.values[str(argv[5]) + record["invocation_id"]] = keys[0]
+            return 1
+        if script == redis_store_module._FAIL_SCRIPT:  # noqa: SLF001
+            raw = self.values.get(keys[0])
+            if raw is None:
+                return 0
+            record = json.loads(raw)
+            record["status"] = "failed"
+            record["updated_at"] = str(argv[0])
+            record["updated_epoch"] = float(argv[1])
+            record["error"] = str(argv[2])
+            self.values[keys[0]] = json.dumps(record)
+            self.values[str(argv[4]) + record["invocation_id"]] = keys[0]
+            return 1
+        if script == redis_store_module._TOUCH_SCRIPT:  # noqa: SLF001
+            raw = self.values.get(keys[0])
+            if raw is None:
+                return 0
+            record = json.loads(raw)
+            if record.get("status") != "in_progress":
+                return 0
+            record["updated_at"] = str(argv[0])
+            record["updated_epoch"] = float(argv[1])
+            self.values[keys[0]] = json.dumps(record)
+            self.values[str(argv[3]) + record["invocation_id"]] = keys[0]
+            return 1
+        raise AssertionError("unexpected Lua script")
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(str(key))
+
+
+@pytest.fixture(autouse=True)
+def _reset_invocation_tenant_scope():
+    token = runtime_module._set_invocation_tenant_id("")
+    try:
+        yield
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token)  # noqa: SLF001
 
 
 class _FakeHttpResponse:
@@ -636,7 +716,7 @@ async def test_inmemory_invocation_store_touch_noop_on_terminal_records():
     await store.start_or_get("idem-done", "invoke")
     await store.complete("idem-done", "invoke", response={"status": "completed"})
 
-    completed_record = store._records[("invoke", "idem-done")]  # noqa: SLF001
+    completed_record = store._records[("_tenantless", "invoke", "idem-done")]  # noqa: SLF001
     locked_updated_at = completed_record.updated_at
     await asyncio.sleep(0.01)
     await store.touch("idem-done", "invoke")
@@ -713,6 +793,135 @@ async def test_sqlite_invocation_store_lookup_by_invocation_id(tmp_path: Path):
     assert found.invocation_id == record.invocation_id
 
 
+@pytest.mark.asyncio
+async def test_inmemory_invocation_store_isolates_same_key_by_tenant():
+    store = InMemoryOneShotInvocationStore()
+    token_a = runtime_module._set_invocation_tenant_id("tenant-a")
+    try:
+        started_a, record_a = await store.start_or_get("same-key", "invoke")
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_a)  # noqa: SLF001
+
+    token_b = runtime_module._set_invocation_tenant_id("tenant-b")
+    try:
+        started_b, record_b = await store.start_or_get("same-key", "invoke")
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_b)  # noqa: SLF001
+
+    assert started_a is True
+    assert started_b is True
+    assert record_a.tenant_id == "tenant-a"
+    assert record_b.tenant_id == "tenant-b"
+    assert record_a.invocation_id != record_b.invocation_id
+
+
+@pytest.mark.asyncio
+async def test_sqlite_invocation_store_isolates_same_key_by_tenant(tmp_path: Path):
+    store = SqliteOneShotInvocationStore(str(tmp_path / "invocations.db"))
+    token_a = runtime_module._set_invocation_tenant_id("tenant-a")
+    try:
+        started_a, record_a = await store.start_or_get("same-key", "invoke")
+        await store.complete("same-key", "invoke", response={"tenant": "a"})
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_a)  # noqa: SLF001
+
+    token_b = runtime_module._set_invocation_tenant_id("tenant-b")
+    try:
+        started_b, record_b = await store.start_or_get("same-key", "invoke")
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_b)  # noqa: SLF001
+
+    token_a = runtime_module._set_invocation_tenant_id("tenant-a")
+    try:
+        started_again, replay = await store.start_or_get("same-key", "invoke")
+        found_a = await store.get_by_invocation_id(record_a.invocation_id)
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_a)  # noqa: SLF001
+
+    assert started_a is True
+    assert started_b is True
+    assert record_b.tenant_id == "tenant-b"
+    assert record_a.invocation_id != record_b.invocation_id
+    assert started_again is False
+    assert replay.status == "completed"
+    assert replay.response == {"tenant": "a"}
+    assert found_a is not None
+    assert found_a.tenant_id == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_redis_invocation_store_uses_lua_and_isolates_tenants():
+    fake = _FakeRedis()
+    store = RedisOneShotInvocationStore(fake, prefix="test", ttl_seconds=120)
+
+    token_a = runtime_module._set_invocation_tenant_id("tenant-a")
+    try:
+        started_a, record_a = await store.start_or_get("same-key", "stream")
+        await store.complete(
+            "same-key",
+            "stream",
+            events=[{"kind": "done", "tenant": "a"}],
+        )
+        replay_started, replay = await store.start_or_get("same-key", "stream")
+        found_a = await store.get_by_invocation_id(record_a.invocation_id)
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_a)  # noqa: SLF001
+
+    token_b = runtime_module._set_invocation_tenant_id("tenant-b")
+    try:
+        started_b, record_b = await store.start_or_get("same-key", "stream")
+        found_b_for_a_id = await store.get_by_invocation_id(record_a.invocation_id)
+    finally:
+        runtime_module._INVOCATION_TENANT_ID.reset(token_b)  # noqa: SLF001
+
+    assert started_a is True
+    assert replay_started is False
+    assert replay.status == "completed"
+    assert replay.events == [{"kind": "done", "tenant": "a"}]
+    assert found_a is not None
+    assert found_a.invocation_id == record_a.invocation_id
+    assert found_a.tenant_id == "tenant-a"
+    assert started_b is True
+    assert record_b.tenant_id == "tenant-b"
+    assert record_b.invocation_id != record_a.invocation_id
+    assert found_b_for_a_id is None
+    assert fake.eval_calls.count(redis_store_module._START_OR_GET_SCRIPT) == 3  # noqa: SLF001
+    assert redis_store_module._COMPLETE_SCRIPT in fake.eval_calls  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_redis_invocation_store_touch_and_fail_are_lua_writes():
+    fake = _FakeRedis()
+    store = RedisOneShotInvocationStore(fake, prefix="test", ttl_seconds=120)
+
+    await store.start_or_get("idem-touch", "invoke")
+    await store.touch("idem-touch", "invoke")
+    await store.fail("idem-touch", "invoke", "boom")
+    _, failed = await store.start_or_get("idem-touch", "invoke")
+
+    assert failed.status == "failed"
+    assert failed.error == "boom"
+    assert redis_store_module._TOUCH_SCRIPT in fake.eval_calls  # noqa: SLF001
+    assert redis_store_module._FAIL_SCRIPT in fake.eval_calls  # noqa: SLF001
+
+
+def test_default_invocation_store_prefers_redis_when_url_set(monkeypatch):
+    fake = _FakeRedis()
+    redis_pkg = types.ModuleType("redis")
+    redis_asyncio = types.ModuleType("redis.asyncio")
+    redis_asyncio.from_url = lambda url, decode_responses: fake
+    redis_pkg.asyncio = redis_asyncio
+    monkeypatch.setitem(sys.modules, "redis", redis_pkg)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", redis_asyncio)
+    monkeypatch.setenv("NOVIE_REDIS_URL", "redis://redis:6379/0")
+
+    store = runtime_module._default_invocation_store(_result_cache_manifest("redis-default"))
+
+    assert isinstance(store, FailOpenOneShotInvocationStore)
+    assert store._primary.__class__.__name__ == "RedisOneShotInvocationStore"  # noqa: SLF001
+    assert isinstance(store._fallback, SqliteOneShotInvocationStore)  # noqa: SLF001
+
+
 # ── Tier A: stream/invoke handlers must transition record on abort ────────────
 
 
@@ -752,7 +961,9 @@ async def test_invoke_handler_cancelled_transitions_record_to_failed():
             )
             invocation_resolved = True
 
-    record: OneShotInvocationRecord = store._records[("invoke", "idem-cancel")]  # noqa: SLF001
+    record: OneShotInvocationRecord = store._records[  # noqa: SLF001
+        ("_tenantless", "invoke", "idem-cancel")
+    ]
     assert record.status == "failed"
     assert record.error == "invoke_aborted_before_terminal"
 
@@ -796,7 +1007,7 @@ async def test_invoke_handler_exception_still_transitions_via_inner_handler():
             )
 
     assert fail_call_count == 1  # only the inner handler called fail
-    record = store._records[("invoke", "idem-error")]  # noqa: SLF001
+    record = store._records[("_tenantless", "invoke", "idem-error")]  # noqa: SLF001
     assert record.status == "failed"
     assert record.error == "handler died"
 
@@ -923,7 +1134,9 @@ def test_simple_agent_sanitizes_explicit_failed_envelope_and_store() -> None:
         "error_code": "agent_internal_error",
         "output": {},
     }
-    record = store._records[("invoke", "explicit-failure-key")]  # noqa: SLF001
+    record = store._records[  # noqa: SLF001
+        ("_tenantless", "invoke", "explicit-failure-key")
+    ]
     assert record.status == "failed"
     assert record.error == "Agent execution failed."
     assert "RAW_SECRET_USER_PROMPT" not in json.dumps(record.__dict__)
@@ -1430,7 +1643,9 @@ def test_stream_endpoint_sanitizes_explicit_terminal_error_and_marks_store_faile
     assert events[-1]["error"] == "Agent execution failed."
     assert events[-1]["error_code"] == "agent_internal_error"
     assert "RAW_SECRET_USER_PROMPT" not in json.dumps(events)
-    record = store._records[("stream", "explicit-stream-failure-key")]  # noqa: SLF001
+    record = store._records[  # noqa: SLF001
+        ("_tenantless", "stream", "explicit-stream-failure-key")
+    ]
     assert record.status == "failed"
     assert record.error == "Agent execution failed."
 
@@ -1584,7 +1799,9 @@ def test_invoke_handler_failure_stores_only_safe_error():
     )
     assert response.status_code == 500
 
-    record = store._records[("invoke", "invoke-safe-error-key")]  # noqa: SLF001
+    record = store._records[  # noqa: SLF001
+        ("_tenantless", "invoke", "invoke-safe-error-key")
+    ]
     assert record.error == "Agent execution failed."
     assert "SECRET_USER_OR_SKILL_PROMPT_MARKER" not in json.dumps(record.__dict__)
 

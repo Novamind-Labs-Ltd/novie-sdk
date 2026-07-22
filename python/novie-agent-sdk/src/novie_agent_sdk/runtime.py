@@ -42,6 +42,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +52,10 @@ from typing import Protocol
 _log = logging.getLogger(__name__)
 _SAFE_AGENT_ID_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MidRunAskTimeoutAction = Literal["skip", "auto_recommended", "fail_implementation"]
+_INVOCATION_TENANT_ID: ContextVar[str] = ContextVar(
+    "novie_agent_sdk_invocation_tenant_id",
+    default="",
+)
 
 # FastAPI is an optional dependency. Import at module level so that FastAPI's
 # type-annotation resolver (get_type_hints) can find Request/BackgroundTasks
@@ -145,6 +150,7 @@ class RequestHeaders:
         h = dict(headers)
         org_id = h.get("x-novie-org-id") or h.get("x-novie-tenant-id", "")
         workspace_id = h.get("x-novie-workspace-id") or org_id
+        _set_invocation_tenant_id(org_id)
         return cls(
             tenant_id=org_id,
             session_id=h.get("x-novie-session-id", ""),
@@ -664,6 +670,7 @@ _DEFAULT_STREAM_KEEPALIVE_SECONDS = _env_float(
 class OneShotInvocationRecord:
     idempotency_key: str
     mode: str
+    tenant_id: str = ""
     invocation_id: str = field(default_factory=lambda: f"inv-{uuid.uuid4().hex}")
     status: str = "in_progress"
     created_at: str = field(default_factory=_now_iso)
@@ -686,6 +693,23 @@ def _is_lease_stale(record: OneShotInvocationRecord) -> bool:
         updated = updated.replace(tzinfo=timezone.utc)
     age_seconds = (datetime.now(timezone.utc) - updated).total_seconds()
     return age_seconds > max(record.lease_seconds, 1)
+
+
+def _normalize_invocation_tenant_id(tenant_id: str | None) -> str:
+    tenant = str(tenant_id or "").strip()
+    return tenant or "_tenantless"
+
+
+def _current_invocation_tenant_id() -> str:
+    return _normalize_invocation_tenant_id(_INVOCATION_TENANT_ID.get())
+
+
+def _set_invocation_tenant_id(tenant_id: str | None):
+    return _INVOCATION_TENANT_ID.set(_normalize_invocation_tenant_id(tenant_id))
+
+
+def _invocation_store_key(idempotency_key: str, mode: str) -> tuple[str, str, str]:
+    return (_current_invocation_tenant_id(), mode, idempotency_key)
 
 
 class OneShotInvocationStore(Protocol):
@@ -722,7 +746,7 @@ class InMemoryOneShotInvocationStore:
     """In-memory one-shot idempotency cache for invoke/stream endpoints."""
 
     def __init__(self) -> None:
-        self._records: dict[tuple[str, str], OneShotInvocationRecord] = {}
+        self._records: dict[tuple[str, str, str], OneShotInvocationRecord] = {}
         self._lock = asyncio.Lock()
 
     async def start_or_get(
@@ -731,7 +755,8 @@ class InMemoryOneShotInvocationStore:
         mode: str,
     ) -> tuple[bool, OneShotInvocationRecord]:
         async with self._lock:
-            key = (mode, idempotency_key)
+            tenant_id = _current_invocation_tenant_id()
+            key = _invocation_store_key(idempotency_key, mode)
             existing = self._records.get(key)
             if existing is not None:
                 if _is_lease_stale(existing):
@@ -755,6 +780,7 @@ class InMemoryOneShotInvocationStore:
             record = OneShotInvocationRecord(
                 idempotency_key=idempotency_key,
                 mode=mode,
+                tenant_id=tenant_id,
             )
             self._records[key] = record
             return True, record
@@ -768,7 +794,7 @@ class InMemoryOneShotInvocationStore:
         events: list[dict[str, Any]] | None = None,
     ) -> None:
         async with self._lock:
-            record = self._records.get((mode, idempotency_key))
+            record = self._records.get(_invocation_store_key(idempotency_key, mode))
             if record is None:
                 return
             record.status = "completed"
@@ -779,7 +805,7 @@ class InMemoryOneShotInvocationStore:
 
     async def fail(self, idempotency_key: str, mode: str, error: str) -> None:
         async with self._lock:
-            record = self._records.get((mode, idempotency_key))
+            record = self._records.get(_invocation_store_key(idempotency_key, mode))
             if record is None:
                 return
             record.status = "failed"
@@ -791,8 +817,9 @@ class InMemoryOneShotInvocationStore:
         invocation_id: str,
     ) -> OneShotInvocationRecord | None:
         async with self._lock:
+            tenant_id = _current_invocation_tenant_id()
             for record in self._records.values():
-                if record.invocation_id == invocation_id:
+                if record.tenant_id == tenant_id and record.invocation_id == invocation_id:
                     return record
         return None
 
@@ -800,7 +827,7 @@ class InMemoryOneShotInvocationStore:
         """Renew the lease on an ``in_progress`` record. Silent no-op for
         absent records or those already in a terminal state."""
         async with self._lock:
-            record = self._records.get((mode, idempotency_key))
+            record = self._records.get(_invocation_store_key(idempotency_key, mode))
             if record is None or record.status != "in_progress":
                 return
             record.updated_at = _now_iso()
@@ -828,14 +855,15 @@ class SqliteOneShotInvocationStore:
         idempotency_key: str,
         mode: str,
     ) -> tuple[bool, OneShotInvocationRecord]:
+        tenant_id = _current_invocation_tenant_id()
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
                 SELECT * FROM sdk_one_shot_invocations
-                WHERE mode = ? AND idempotency_key = ?
+                WHERE tenant_id = ? AND mode = ? AND idempotency_key = ?
                 """,
-                (mode, idempotency_key),
+                (tenant_id, mode, idempotency_key),
             ).fetchone()
             if row is not None:
                 existing = self._row_to_record(row)
@@ -864,17 +892,25 @@ class SqliteOneShotInvocationStore:
                             events_json = NULL,
                             error = NULL
                         WHERE mode = ? AND idempotency_key = ?
+                          AND tenant_id = ?
                         """,
-                        (f"inv-{uuid.uuid4().hex}", now, now, mode, idempotency_key),
+                        (
+                            f"inv-{uuid.uuid4().hex}",
+                            now,
+                            now,
+                            mode,
+                            idempotency_key,
+                            tenant_id,
+                        ),
                     )
                     conn.commit()
                     refreshed = self._row_to_record(
                         conn.execute(
                             """
                             SELECT * FROM sdk_one_shot_invocations
-                            WHERE mode = ? AND idempotency_key = ?
+                            WHERE tenant_id = ? AND mode = ? AND idempotency_key = ?
                             """,
-                            (mode, idempotency_key),
+                            (tenant_id, mode, idempotency_key),
                         ).fetchone()
                     )
                     return True, refreshed
@@ -882,15 +918,17 @@ class SqliteOneShotInvocationStore:
             record = OneShotInvocationRecord(
                 idempotency_key=idempotency_key,
                 mode=mode,
+                tenant_id=tenant_id,
             )
             conn.execute(
                 """
                 INSERT INTO sdk_one_shot_invocations (
-                    mode, idempotency_key, invocation_id, status, created_at, updated_at,
-                    response_json, events_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    tenant_id, mode, idempotency_key, invocation_id, status,
+                    created_at, updated_at, response_json, events_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
+                    tenant_id,
                     mode,
                     idempotency_key,
                     record.invocation_id,
@@ -925,6 +963,7 @@ class SqliteOneShotInvocationStore:
         response: dict[str, Any] | None,
         events: list[dict[str, Any]],
     ) -> None:
+        tenant_id = _current_invocation_tenant_id()
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """
@@ -934,12 +973,13 @@ class SqliteOneShotInvocationStore:
                     response_json = ?,
                     events_json = ?,
                     error = NULL
-                WHERE mode = ? AND idempotency_key = ?
+                WHERE tenant_id = ? AND mode = ? AND idempotency_key = ?
                 """,
                 (
                     _now_iso(),
                     json.dumps(response) if response is not None else None,
                     json.dumps(events),
+                    tenant_id,
                     mode,
                     idempotency_key,
                 ),
@@ -950,14 +990,15 @@ class SqliteOneShotInvocationStore:
         await asyncio.to_thread(self._fail_sync, idempotency_key, mode, error)
 
     def _fail_sync(self, idempotency_key: str, mode: str, error: str) -> None:
+        tenant_id = _current_invocation_tenant_id()
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """
                 UPDATE sdk_one_shot_invocations
                 SET status = 'failed', updated_at = ?, error = ?
-                WHERE mode = ? AND idempotency_key = ?
+                WHERE tenant_id = ? AND mode = ? AND idempotency_key = ?
                 """,
-                (_now_iso(), error, mode, idempotency_key),
+                (_now_iso(), error, tenant_id, mode, idempotency_key),
             )
             conn.commit()
 
@@ -971,14 +1012,15 @@ class SqliteOneShotInvocationStore:
         self,
         invocation_id: str,
     ) -> OneShotInvocationRecord | None:
+        tenant_id = _current_invocation_tenant_id()
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
                 SELECT * FROM sdk_one_shot_invocations
-                WHERE invocation_id = ?
+                WHERE tenant_id = ? AND invocation_id = ?
                 """,
-                (invocation_id,),
+                (tenant_id, invocation_id),
             ).fetchone()
             return self._row_to_record(row) if row is not None else None
 
@@ -986,15 +1028,16 @@ class SqliteOneShotInvocationStore:
         await asyncio.to_thread(self._touch_sync, idempotency_key, mode)
 
     def _touch_sync(self, idempotency_key: str, mode: str) -> None:
+        tenant_id = _current_invocation_tenant_id()
         with self._lock, sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 """
                 UPDATE sdk_one_shot_invocations
                 SET updated_at = ?
-                WHERE mode = ? AND idempotency_key = ?
+                WHERE tenant_id = ? AND mode = ? AND idempotency_key = ?
                   AND status = 'in_progress'
                 """,
-                (_now_iso(), mode, idempotency_key),
+                (_now_iso(), tenant_id, mode, idempotency_key),
             )
             conn.commit()
 
@@ -1004,6 +1047,7 @@ class SqliteOneShotInvocationStore:
         return OneShotInvocationRecord(
             idempotency_key=str(row["idempotency_key"]),
             mode=str(row["mode"]),
+            tenant_id=str(row["tenant_id"] or "_tenantless"),
             invocation_id=str(row["invocation_id"] or f"inv-{uuid.uuid4().hex}"),
             status=str(row["status"]),
             created_at=str(row["created_at"]),
@@ -1015,27 +1059,16 @@ class SqliteOneShotInvocationStore:
 
     def _ensure_schema(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sdk_one_shot_invocations (
-                    mode TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    invocation_id TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    response_json TEXT,
-                    events_json TEXT,
-                    error TEXT,
-                    PRIMARY KEY (mode, idempotency_key)
-                )
-                """,
-            )
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(sdk_one_shot_invocations)")
-            }
-            if "invocation_id" not in columns:
+            if not self._table_exists(conn):
+                self._create_schema(conn)
+            columns = self._columns(conn)
+            pk_columns = self._primary_key_columns(conn)
+            if (
+                "tenant_id" not in columns
+                or pk_columns != ["tenant_id", "mode", "idempotency_key"]
+            ):
+                self._rebuild_schema_with_tenant(conn, columns)
+            elif "invocation_id" not in columns:
                 conn.execute(
                     "ALTER TABLE sdk_one_shot_invocations "
                     "ADD COLUMN invocation_id TEXT"
@@ -1048,6 +1081,197 @@ class SqliteOneShotInvocationStore:
                 """
             )
             conn.commit()
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'sdk_one_shot_invocations'
+            """
+        ).fetchone() is not None
+
+    @staticmethod
+    def _columns(conn: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(sdk_one_shot_invocations)")
+        }
+
+    @staticmethod
+    def _primary_key_columns(conn: sqlite3.Connection) -> list[str]:
+        rows = conn.execute("PRAGMA table_info(sdk_one_shot_invocations)").fetchall()
+        keyed = sorted(
+            ((int(row[5]), str(row[1])) for row in rows if int(row[5]) > 0),
+            key=lambda item: item[0],
+        )
+        return [name for _, name in keyed]
+
+    @staticmethod
+    def _create_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sdk_one_shot_invocations (
+                tenant_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                invocation_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                response_json TEXT,
+                events_json TEXT,
+                error TEXT,
+                PRIMARY KEY (tenant_id, mode, idempotency_key)
+            )
+            """,
+        )
+
+    def _rebuild_schema_with_tenant(
+        self,
+        conn: sqlite3.Connection,
+        columns: set[str],
+    ) -> None:
+        conn.execute(
+            "ALTER TABLE sdk_one_shot_invocations "
+            "RENAME TO sdk_one_shot_invocations_legacy"
+        )
+        self._create_schema(conn)
+        invocation_expr = "invocation_id" if "invocation_id" in columns else "NULL"
+        tenant_expr = "tenant_id" if "tenant_id" in columns else "'_tenantless'"
+        conn.execute(
+            f"""
+            INSERT OR IGNORE INTO sdk_one_shot_invocations (
+                tenant_id, mode, idempotency_key, invocation_id, status,
+                created_at, updated_at, response_json, events_json, error
+            )
+            SELECT
+                COALESCE(NULLIF({tenant_expr}, ''), '_tenantless'),
+                mode,
+                idempotency_key,
+                {invocation_expr},
+                status,
+                created_at,
+                updated_at,
+                response_json,
+                events_json,
+                error
+            FROM sdk_one_shot_invocations_legacy
+            """
+        )
+        conn.execute("DROP TABLE sdk_one_shot_invocations_legacy")
+
+
+class FailOpenOneShotInvocationStore:
+    """Prefer a shared store, but keep serving if it becomes unavailable."""
+
+    def __init__(
+        self,
+        primary: OneShotInvocationStore,
+        fallback: OneShotInvocationStore,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_disabled = False
+
+    async def start_or_get(
+        self,
+        idempotency_key: str,
+        mode: str,
+    ) -> tuple[bool, OneShotInvocationRecord]:
+        if self._primary_disabled:
+            return await self._fallback.start_or_get(idempotency_key, mode)
+        try:
+            return await self._primary.start_or_get(idempotency_key, mode)
+        except Exception:  # noqa: BLE001
+            self._primary_disabled = True
+            _log.exception(
+                "shared invocation store unavailable; failing open to %s",
+                self._fallback.__class__.__name__,
+            )
+            return await self._fallback.start_or_get(idempotency_key, mode)
+
+    async def complete(
+        self,
+        idempotency_key: str,
+        mode: str,
+        *,
+        response: dict[str, Any] | None = None,
+        events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if self._primary_disabled:
+            await self._fallback.complete(
+                idempotency_key,
+                mode,
+                response=response,
+                events=events,
+            )
+            return
+        try:
+            await self._primary.complete(
+                idempotency_key,
+                mode,
+                response=response,
+                events=events,
+            )
+        except Exception:  # noqa: BLE001
+            self._primary_disabled = True
+            _log.exception(
+                "shared invocation store completion failed; failing open to %s",
+                self._fallback.__class__.__name__,
+            )
+            await self._fallback.complete(
+                idempotency_key,
+                mode,
+                response=response,
+                events=events,
+            )
+
+    async def fail(self, idempotency_key: str, mode: str, error: str) -> None:
+        if self._primary_disabled:
+            await self._fallback.fail(idempotency_key, mode, error)
+            return
+        try:
+            await self._primary.fail(idempotency_key, mode, error)
+        except Exception:  # noqa: BLE001
+            self._primary_disabled = True
+            _log.exception(
+                "shared invocation store failure transition failed; "
+                "failing open to %s",
+                self._fallback.__class__.__name__,
+            )
+            await self._fallback.fail(idempotency_key, mode, error)
+
+    async def get_by_invocation_id(
+        self,
+        invocation_id: str,
+    ) -> OneShotInvocationRecord | None:
+        if self._primary_disabled:
+            return await self._fallback.get_by_invocation_id(invocation_id)
+        try:
+            return await self._primary.get_by_invocation_id(invocation_id)
+        except Exception:  # noqa: BLE001
+            self._primary_disabled = True
+            _log.exception(
+                "shared invocation lookup failed; failing open to %s",
+                self._fallback.__class__.__name__,
+            )
+            return await self._fallback.get_by_invocation_id(invocation_id)
+
+    async def touch(self, idempotency_key: str, mode: str) -> None:
+        if self._primary_disabled:
+            await self._fallback.touch(idempotency_key, mode)
+            return
+        try:
+            await self._primary.touch(idempotency_key, mode)
+        except Exception:  # noqa: BLE001
+            self._primary_disabled = True
+            _log.exception(
+                "shared invocation lease touch failed; failing open to %s",
+                self._fallback.__class__.__name__,
+            )
+            await self._fallback.touch(idempotency_key, mode)
 
 
 def _duplicate_one_shot_response(record: OneShotInvocationRecord) -> Any:
@@ -1063,6 +1287,7 @@ def _duplicate_one_shot_response(record: OneShotInvocationRecord) -> Any:
                 "retryable": True,
                 "classification": "state",
                 "details": {
+                    "tenant_id": record.tenant_id,
                     "idempotency_key": record.idempotency_key,
                     "mode": record.mode,
                     "status": record.status,
@@ -1089,6 +1314,7 @@ def _one_shot_invocation_view(record: OneShotInvocationRecord) -> dict[str, Any]
     )
     return {
         "invocation_id": record.invocation_id,
+        "tenant_id": record.tenant_id,
         "idempotency_key": record.idempotency_key,
         "mode": record.mode,
         "status": record.status,
@@ -1262,12 +1488,35 @@ def _coerce_invoke_response(result: dict[str, Any]) -> dict[str, Any]:
     return {"output": result, "status": "completed"}
 
 
-def _default_invocation_store(manifest: AgentManifestV2) -> OneShotInvocationStore:
+def _local_invocation_store(manifest: AgentManifestV2) -> OneShotInvocationStore:
     if getattr(manifest.execution, "durability", "none") == "result_cache":
         return SqliteOneShotInvocationStore(
             str(_default_invocation_sqlite_path(manifest.agent_id)),
         )
     return InMemoryOneShotInvocationStore()
+
+
+def _default_invocation_store(manifest: AgentManifestV2) -> OneShotInvocationStore:
+    fallback = _local_invocation_store(manifest)
+    redis_url = os.getenv("NOVIE_REDIS_URL", "").strip()
+    if not redis_url:
+        return fallback
+    try:
+        import redis.asyncio as aioredis
+
+        from .redis_invocation_store import RedisOneShotInvocationStore
+    except Exception:  # noqa: BLE001
+        _log.exception(
+            "NOVIE_REDIS_URL is set but Redis invocation store could not be "
+            "constructed; failing open to %s",
+            fallback.__class__.__name__,
+        )
+        return fallback
+    redis = aioredis.from_url(redis_url, decode_responses=False)
+    return FailOpenOneShotInvocationStore(
+        RedisOneShotInvocationStore(redis),
+        fallback,
+    )
 
 
 def _default_invocation_sqlite_path(agent_id: str) -> Path:

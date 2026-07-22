@@ -1,6 +1,6 @@
 [project]
 name = "novie-agent-sdk"
-version = "0.3.59"
+version = "0.3.61"
 description = "Novie Agent SDK: A2A task runtime (FastAPI), observability helpers, and protocol-aligned prompt utilities."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 server = [
     "fastapi>=0.110",
+    "redis>=5",
 ]
 observability = [
     "langchain-core>=0.3",
