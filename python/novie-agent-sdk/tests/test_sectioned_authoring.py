@@ -7,6 +7,7 @@ import pytest
 
 from novie_agent_sdk import (
     DocumentAuthoringDeadlineExceeded,
+    DocumentAuthoringRequest,
     PlatformLlmCallError,
     SectionDraft,
     SectionedLongformAuthor,
@@ -557,23 +558,26 @@ metadata:
     llm.platform_ns = _FakePlatform()
 
     result = await run_sectioned_document_finalization(
-        llm_facade=llm,
-        skill_contract=contract,
-        artifact_type="example_document",
-        step_id="s2",
-        capability_id="agent.example.write_document",
-        context_budget={},
-        brief={"title": "Example document"},
-        upstream={},
-        workflow_id="workflow-1",
-        thread_id="thread-1",
-        agent_id="writer",
-        mode_metadata={"example_mode": "write", "example_phase": "default"},
-        draft_narrative="Draft narrative.",
-        draft_narrative_key="_draft_narrative",
-        draft_narrative_artifact_type="draft_narrative",
-        draft_narrative_summary="Draft before final authoring.",
-        document_input={"artifact_access": "summary_then_fetch"},
+        request=DocumentAuthoringRequest(
+            llm_facade=llm,
+            skill_contract=contract,
+            artifact_type="example_document",
+            step_id="s2",
+            capability_id="agent.example.write_document",
+            context_budget={},
+            brief={"title": "Example document"},
+            upstream={},
+            authoring_instructions="Follow the selected report skill.",
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+            mode_metadata={"example_mode": "write", "example_phase": "default"},
+            draft_narrative="Draft narrative.",
+            draft_narrative_key="_draft_narrative",
+            draft_narrative_artifact_type="draft_narrative",
+            draft_narrative_summary="Draft before final authoring.",
+            document_input={"artifact_access": "summary_then_fetch"},
+        ),
     )
 
     assert "## Context" in result.authoring_result.markdown
@@ -591,14 +595,17 @@ metadata:
 async def test_run_sectioned_document_finalization_requires_sectioned_contract() -> None:
     with pytest.raises(RuntimeError, match="skill runtime contract"):
         await run_sectioned_document_finalization(
-            llm_facade=_FakeLlm(),
-            skill_contract=None,
-            artifact_type="example_document",
-            step_id="s2",
-            capability_id="agent.example.write_document",
-            context_budget={},
-            brief={"title": "Example document"},
-            upstream={},
+            request=DocumentAuthoringRequest(
+                llm_facade=_FakeLlm(),
+                skill_contract=None,
+                artifact_type="example_document",
+                step_id="s2",
+                capability_id="agent.example.write_document",
+                context_budget={},
+                brief={"title": "Example document"},
+                upstream={},
+                authoring_instructions="Follow the selected report skill.",
+            ),
         )
 
 
@@ -639,15 +646,18 @@ metadata:
 
     with pytest.raises(DocumentAuthoringDeadlineExceeded) as exc_info:
         async for event in astream_sectioned_document_finalization(
-            llm_facade=llm,
-            skill_contract=contract,
-            artifact_type="example_document",
-            step_id="s2",
-            capability_id="agent.example.write_document",
-            context_budget={},
-            brief={"title": "Example document"},
-            upstream={},
-            wall_clock_deadline=asyncio.get_running_loop().time() + 0.01,
+            request=DocumentAuthoringRequest(
+                llm_facade=llm,
+                skill_contract=contract,
+                artifact_type="example_document",
+                step_id="s2",
+                capability_id="agent.example.write_document",
+                context_budget={},
+                brief={"title": "Example document"},
+                upstream={},
+                authoring_instructions="Follow the selected report skill.",
+                wall_clock_deadline=asyncio.get_running_loop().time() + 0.01,
+            ),
         ):
             events.append(event)
 
@@ -657,6 +667,30 @@ metadata:
         for event in events
         if hasattr(event, "metadata")
     )
+
+
+def test_document_authoring_request_freezes_skill_resolved_inputs() -> None:
+    brief = {"title": "Original title"}
+    request = DocumentAuthoringRequest(
+        llm_facade=None,
+        skill_contract=None,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        context_budget={"max_output_tokens": 1000},
+        brief=brief,
+        upstream={},
+        authoring_instructions="Use the selected skill instructions.",
+    )
+
+    brief["title"] = "Mutated title"
+
+    assert request.brief["title"] == "Original title"
+    assert request.to_metadata()["document_authoring_request"][
+        "skill_instructions_loaded"
+    ] is True
+    with pytest.raises(TypeError):
+        request.brief["title"] = "Blocked mutation"  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -1143,6 +1177,45 @@ async def test_deferred_intermediate_artifacts_keep_successful_final_in_memory()
     assert result.ledger["artifact_refs"] == []
     assert platform.artifacts.created == []
     assert platform.workpads.entries == []
+    assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_final_keeps_resume_sections_without_committing_final() -> None:
+    """Persist resumable drafts while leaving final rendering to the agent."""
+    platform = _FakePlatform()
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+        },
+        defer_final_artifact=True,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert [item["artifact_type"] for item in platform.artifacts.created] == [
+        "example_document.outline",
+        "example_document.section",
+        "example_document.section",
+    ]
+    assert result.ledger["final_ref"] == {}
     assert platform.workpads.final_refs == []
 
 
