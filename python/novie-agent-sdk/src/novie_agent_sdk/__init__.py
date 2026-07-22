@@ -59,6 +59,7 @@ from .runtime import (
     Agent,
     AskBudgetExceeded,
     AskTimedOut,
+    FailOpenOneShotInvocationStore,
     InMemoryTaskStore,
     InvokeContext,
     RegistrationClient,
@@ -70,6 +71,7 @@ from .runtime import (
     TaskContext,
     TaskRecord,
 )
+from .redis_invocation_store import RedisOneShotInvocationStore
 from .platform_callback import (
     PlatformCallbackClient,
     build_platform_callback_headers,
@@ -515,12 +517,14 @@ __all__ = [
     "Agent",
     "AskBudgetExceeded",
     "AskTimedOut",
+    "FailOpenOneShotInvocationStore",
     "InMemoryTaskStore",
     "InvokeContext",
     "RegistrationClient",
     "RequestHeaders",
     "SqliteOneShotInvocationStore",
     "SqliteTaskStore",
+    "RedisOneShotInvocationStore",
     "StreamContext",
     "TaskStore",
     "TaskContext",
