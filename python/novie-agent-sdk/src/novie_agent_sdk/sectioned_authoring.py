@@ -9,6 +9,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from novie_protocol.agents import AgentStreamEvent
@@ -355,33 +356,95 @@ def platform_namespace_from_llm_facade(llm_facade: Any | None) -> Any | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentAuthoringRequest:
+    """One skill-resolved request for a terminal document-authoring pass.
+
+    Agents retain ownership of capability selection, graph work, and final
+    artifact rendering.  They pass the already-resolved skill contract and its
+    bounded authoring instructions here, so the shared SDK author never has to
+    infer document intent from an artifact type or a generic template.
+    """
+
+    llm_facade: Any | None
+    skill_contract: SkillRuntimeContract | None
+    artifact_type: str
+    step_id: str
+    capability_id: str
+    context_budget: Mapping[str, Any]
+    brief: Mapping[str, Any]
+    upstream: Mapping[str, Any]
+    authoring_instructions: str
+    workflow_id: str | None = None
+    thread_id: str | None = None
+    agent_id: str | None = None
+    mode_metadata: Mapping[str, Any] | None = None
+    draft_narrative: str = ""
+    draft_narrative_key: str = ""
+    draft_narrative_artifact_type: str = ""
+    draft_narrative_summary: str = ""
+    document_input: Mapping[str, Any] | None = None
+    agent_disabled_env_var: str | None = None
+    agent_enabled_env_var: str | None = None
+    required_strategy: str = "sectioned_longform"
+    quality_reason: str = "sectioned_authoring_quality_gates"
+    quality_metadata: Mapping[str, Any] | None = None
+    defer_intermediate_artifacts: bool = False
+    defer_final_artifact: bool = False
+    length_profile: str | None = None
+    profile_source: str = "skill_default"
+    profile_confidence: str = "confirmed"
+    resume_state: Mapping[str, Any] | None = None
+    phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None
+    rebase_artifact_types_to_runtime: bool = False
+    wall_clock_deadline: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.artifact_type.strip():
+            raise ValueError("document_authoring_request artifact_type is required")
+        if not self.capability_id.strip():
+            raise ValueError("document_authoring_request capability_id is required")
+        if not self.authoring_instructions.strip():
+            raise ValueError(
+                "document_authoring_request skill authoring instructions are required"
+            )
+        for field_name in ("context_budget", "brief", "upstream"):
+            object.__setattr__(
+                self,
+                field_name,
+                MappingProxyType(dict(getattr(self, field_name))),
+            )
+        for field_name in (
+            "mode_metadata",
+            "document_input",
+            "quality_metadata",
+            "resume_state",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    MappingProxyType(dict(value)),
+                )
+
+    def to_metadata(self) -> dict[str, Any]:
+        contract = self.skill_contract
+        return {
+            "document_authoring_request": {
+                "artifact_type": self.artifact_type,
+                "capability_id": self.capability_id,
+                "skill_sources": list(contract.sources) if contract is not None else [],
+                "skill_instructions_loaded": True,
+                "resuming_sectioned_state": self.resume_state is not None,
+                "defer_final_artifact": self.defer_final_artifact,
+            }
+        }
+
+
 async def run_sectioned_document_finalization(
     *,
-    llm_facade: Any | None,
-    skill_contract: SkillRuntimeContract | None,
-    artifact_type: str,
-    step_id: str,
-    capability_id: str,
-    context_budget: Mapping[str, Any],
-    brief: Mapping[str, Any],
-    upstream: Mapping[str, Any],
-    workflow_id: str | None = None,
-    thread_id: str | None = None,
-    agent_id: str | None = None,
-    mode_metadata: Mapping[str, Any] | None = None,
-    draft_narrative: str = "",
-    draft_narrative_key: str = "",
-    draft_narrative_artifact_type: str = "",
-    draft_narrative_summary: str = "",
-    document_input: Mapping[str, Any] | None = None,
-    authoring_instructions: str = "",
-    agent_disabled_env_var: str | None = None,
-    agent_enabled_env_var: str | None = None,
-    required_strategy: str = "sectioned_longform",
-    quality_reason: str = "sectioned_authoring_quality_gates",
-    quality_metadata: Mapping[str, Any] | None = None,
-    defer_intermediate_artifacts: bool = False,
-    wall_clock_deadline: float | None = None,
+    request: DocumentAuthoringRequest,
 ) -> SectionedDocumentFinalizationResult:
     """Run sectioned longform finalization for document agents.
 
@@ -390,6 +453,32 @@ async def run_sectioned_document_finalization(
     the repeated sectioned-authoring checks, author construction, trace
     metadata, and skipped-quality result wiring.
     """
+    llm_facade = request.llm_facade
+    skill_contract = request.skill_contract
+    artifact_type = request.artifact_type
+    step_id = request.step_id
+    capability_id = request.capability_id
+    context_budget = request.context_budget
+    brief = request.brief
+    upstream = request.upstream
+    workflow_id = request.workflow_id
+    thread_id = request.thread_id
+    agent_id = request.agent_id
+    mode_metadata = request.mode_metadata
+    draft_narrative = request.draft_narrative
+    draft_narrative_key = request.draft_narrative_key
+    draft_narrative_artifact_type = request.draft_narrative_artifact_type
+    draft_narrative_summary = request.draft_narrative_summary
+    document_input = request.document_input
+    authoring_instructions = request.authoring_instructions
+    agent_disabled_env_var = request.agent_disabled_env_var
+    agent_enabled_env_var = request.agent_enabled_env_var
+    required_strategy = request.required_strategy
+    quality_reason = request.quality_reason
+    quality_metadata = request.quality_metadata
+    defer_intermediate_artifacts = request.defer_intermediate_artifacts
+    defer_final_artifact = request.defer_final_artifact
+    wall_clock_deadline = request.wall_clock_deadline
     if skill_contract is None or skill_contract.is_empty:
         raise RuntimeError(
             "sectioned_authoring_required: document finalization requires "
@@ -419,6 +508,7 @@ async def run_sectioned_document_finalization(
             "runtime_phase": "sectioned_authoring",
             "semantic_phase": "finalizing_output",
             **mode_meta,
+            **request.to_metadata(),
             "capability_id": capability_id,
             "authoring_strategy": required_strategy,
             "skill_contract": skill_contract.to_metadata(),
@@ -437,6 +527,7 @@ async def run_sectioned_document_finalization(
         ),
         authoring_instructions=authoring_instructions,
         defer_intermediate_artifacts=defer_intermediate_artifacts,
+        defer_final_artifact=defer_final_artifact,
     )
     authoring_upstream: dict[str, Any] = dict(upstream)
     if draft_narrative_key:
@@ -508,37 +599,7 @@ async def run_sectioned_document_finalization(
 
 async def astream_sectioned_document_finalization(
     *,
-    llm_facade: Any | None,
-    skill_contract: SkillRuntimeContract | None,
-    artifact_type: str,
-    step_id: str,
-    capability_id: str,
-    context_budget: Mapping[str, Any],
-    brief: Mapping[str, Any],
-    upstream: Mapping[str, Any],
-    workflow_id: str | None = None,
-    thread_id: str | None = None,
-    agent_id: str | None = None,
-    mode_metadata: Mapping[str, Any] | None = None,
-    draft_narrative: str = "",
-    draft_narrative_key: str = "",
-    draft_narrative_artifact_type: str = "",
-    draft_narrative_summary: str = "",
-    document_input: Mapping[str, Any] | None = None,
-    authoring_instructions: str = "",
-    agent_disabled_env_var: str | None = None,
-    agent_enabled_env_var: str | None = None,
-    required_strategy: str = "sectioned_longform",
-    quality_reason: str = "sectioned_authoring_quality_gates",
-    quality_metadata: Mapping[str, Any] | None = None,
-    defer_intermediate_artifacts: bool = False,
-    length_profile: str | None = None,
-    profile_source: str = "skill_default",
-    profile_confidence: str = "confirmed",
-    resume_state: Mapping[str, Any] | None = None,
-    phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
-    rebase_artifact_types_to_runtime: bool = False,
-    wall_clock_deadline: float | None = None,
+    request: DocumentAuthoringRequest,
 ) -> AsyncIterator[AgentStreamEvent | SectionedDocumentFinalizationResult]:
     """Gold-path sectioned finalize used by report_synthesis-style document agents.
 
@@ -546,6 +607,38 @@ async def astream_sectioned_document_finalization(
     yields a terminal ``SectionedDocumentFinalizationResult``. Callers own the
     typed artifact envelope and final event.
     """
+    llm_facade = request.llm_facade
+    skill_contract = request.skill_contract
+    artifact_type = request.artifact_type
+    step_id = request.step_id
+    capability_id = request.capability_id
+    context_budget = request.context_budget
+    brief = request.brief
+    upstream = request.upstream
+    workflow_id = request.workflow_id
+    thread_id = request.thread_id
+    agent_id = request.agent_id
+    mode_metadata = request.mode_metadata
+    draft_narrative = request.draft_narrative
+    draft_narrative_key = request.draft_narrative_key
+    draft_narrative_artifact_type = request.draft_narrative_artifact_type
+    draft_narrative_summary = request.draft_narrative_summary
+    document_input = request.document_input
+    authoring_instructions = request.authoring_instructions
+    agent_disabled_env_var = request.agent_disabled_env_var
+    agent_enabled_env_var = request.agent_enabled_env_var
+    required_strategy = request.required_strategy
+    quality_reason = request.quality_reason
+    quality_metadata = request.quality_metadata
+    defer_intermediate_artifacts = request.defer_intermediate_artifacts
+    defer_final_artifact = request.defer_final_artifact
+    length_profile = request.length_profile
+    profile_source = request.profile_source
+    profile_confidence = request.profile_confidence
+    resume_state = request.resume_state
+    phase_checkpoint_sink = request.phase_checkpoint_sink
+    rebase_artifact_types_to_runtime = request.rebase_artifact_types_to_runtime
+    wall_clock_deadline = request.wall_clock_deadline
     if skill_contract is None or skill_contract.is_empty:
         raise RuntimeError(
             "sectioned_authoring_required: document finalization requires "
@@ -598,6 +691,7 @@ async def astream_sectioned_document_finalization(
             "runtime_phase": "sectioned_authoring",
             "semantic_phase": "finalizing_output",
             **mode_meta,
+            **request.to_metadata(),
             "capability_id": capability_id,
             "authoring_strategy": required_strategy,
             "length_profile": resolved_profile["profile"],
@@ -623,6 +717,7 @@ async def astream_sectioned_document_finalization(
         authoring_contract=authoring_contract,
         authoring_instructions=authoring_instructions,
         defer_intermediate_artifacts=defer_intermediate_artifacts,
+        defer_final_artifact=defer_final_artifact,
         phase_event_sink=_collect_sectioned_event,
         phase_checkpoint_sink=phase_checkpoint_sink,
     )
@@ -980,6 +1075,7 @@ class SectionedLongformAuthor:
         phase_event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
         phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None,
         defer_intermediate_artifacts: bool = False,
+        defer_final_artifact: bool = False,
     ) -> None:
         self._llm = llm_facade
         self._platform = platform
@@ -987,6 +1083,7 @@ class SectionedLongformAuthor:
         self._step_id = step_id
         self._capability_id = capability_id
         self._defer_intermediate_artifacts = defer_intermediate_artifacts
+        self._defer_final_artifact = defer_final_artifact
         self._context_budget = dict(context_budget or {})
         self._contract = (
             authoring_contract
@@ -1372,7 +1469,9 @@ class SectionedLongformAuthor:
         # artifact surviving cancellation between authoring and transport
         # success. Legacy callers retain the original ledger behavior.
         final_ref: dict[str, Any] = {}
-        if not self._defer_intermediate_artifacts:
+        if not (
+            self._defer_intermediate_artifacts or self._defer_final_artifact
+        ):
             final_ref = await self._record_final(
                 final_markdown,
                 workflow_id=workflow_id,
@@ -1393,6 +1492,10 @@ class SectionedLongformAuthor:
             "document.final.created",
             status="complete",
             artifact_ref=final_ref,
+            artifact_committed=bool(final_ref),
+            final_commit_deferred=bool(
+                self._defer_intermediate_artifacts or self._defer_final_artifact
+            ),
             section_count=len(drafts),
             length_profile=self._contract.length_profile,
             finalization=self._contract.finalization,

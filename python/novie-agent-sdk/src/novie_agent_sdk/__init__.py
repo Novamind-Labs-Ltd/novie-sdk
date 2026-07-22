@@ -160,6 +160,7 @@ from .platform_langchain_tools import (
 )
 from .sectioned_authoring import (
     DocumentAuthoringDeadlineExceeded,
+    DocumentAuthoringRequest,
     SectionDraft,
     SectionPlan,
     SectionQualityGateResult,
@@ -693,6 +694,7 @@ __all__ = [
     "ContextBudget",
     "DocumentAuthoringBudgetExceeded",
     "DocumentAuthoringDeadlineExceeded",
+    "DocumentAuthoringRequest",
     "SectionDraft",
     "SectionPlan",
     "SectionQualityGateResult",
