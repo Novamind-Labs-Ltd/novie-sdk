@@ -1345,21 +1345,31 @@ _TERMINAL_KIND_VALUES = frozenset(
 def _failure_envelope(envelope: Any) -> dict[str, Any] | None:
     """Detect a terminal failure envelope without false-positive phase events.
 
-    Stream traces often nest phase outcomes under ``metadata.status`` (for
-    example ``document.section.quality_checked`` with ``status="failed"`` when
-    a soft quality gate did not pass). Those are observability signals, not
-    stream-terminal failures. Only treat nested ``metadata`` ``status`` as
-    terminal when the payload is not a named phase ``event``.
+    Stream traces often nest phase outcomes under ``metadata`` — for example
+    ``document.section.quality_checked`` with ``status="failed"`` when a soft
+    quality gate did not pass, or ``agent.llm_call.retrying`` carrying the
+    retried call's ``error`` details while the retry is still in flight.
+    Those are observability signals, not stream-terminal failures:
+
+    - Named phase events are exempt from ``status``-based detection.
+    - Named phase events whose own ``status`` declares an in-flight, non
+      terminal outcome (``retrying``, ``running``, …) are also exempt from
+      ``error``-field detection; a named event with a terminal or missing
+      ``status`` still fails closed on an explicit ``error``
+      (``agent.llm_call.failed`` stays terminal).
     """
     if not isinstance(envelope, dict):
         return None
-    return _failure_envelope_dict(envelope, allow_status_terminal=True)
+    return _failure_envelope_dict(
+        envelope, allow_status_terminal=True, allow_error_terminal=True
+    )
 
 
 def _failure_envelope_dict(
     envelope: dict[str, Any],
     *,
     allow_status_terminal: bool,
+    allow_error_terminal: bool,
 ) -> dict[str, Any] | None:
     status = str(envelope.get("status") or "").strip().lower()
     kind = str(envelope.get("kind") or envelope.get("type") or "").strip().lower()
@@ -1367,18 +1377,29 @@ def _failure_envelope_dict(
     if (
         (allow_status_terminal and status in _TERMINAL_STATUS_VALUES)
         or terminal_kind
-        or _has_nonempty_error(envelope.get("error"))
+        or (allow_error_terminal and _has_nonempty_error(envelope.get("error")))
     ):
         return envelope
     for key in ("output", "payload", "metadata"):
         child = envelope.get(key)
         if not isinstance(child, dict):
             continue
-        # Named phase events encode local outcomes in metadata.status.
-        nested_allow_status = key != "metadata" or not str(child.get("event") or "").strip()
+        # Named phase events encode local outcomes in metadata.status; an
+        # in-flight status additionally marks any error details as
+        # observability, not a stream terminal.
+        named_event = key == "metadata" and bool(
+            str(child.get("event") or "").strip()
+        )
+        child_status = str(child.get("status") or "").strip().lower()
+        in_flight = (
+            named_event
+            and bool(child_status)
+            and child_status not in _TERMINAL_STATUS_VALUES
+        )
         nested = _failure_envelope_dict(
             child,
-            allow_status_terminal=nested_allow_status,
+            allow_status_terminal=not named_event,
+            allow_error_terminal=not in_flight,
         )
         if nested is not None:
             return nested
@@ -1389,6 +1410,23 @@ def _failure_envelope_dict(
                 if nested is not None:
                     return nested
     return None
+
+
+def _log_terminal_guard(source: str, payload: Any) -> None:
+    """Keep the pre-sanitization failure visible in the agent's own log.
+
+    The public stream replaces terminal failures with allow-listed copy
+    ("Agent execution failed."), so without this line the real error would
+    survive nowhere — the platform records only the sanitized message.
+    """
+    try:
+        if isinstance(payload, BaseException):
+            _log.warning("a2a stream terminal (%s)", source, exc_info=payload)
+            return
+        raw = json.dumps(payload, default=repr, ensure_ascii=False)
+        _log.warning("a2a stream terminal (%s): %s", source, raw[:4000])
+    except Exception:  # pragma: no cover - logging must never break the stream
+        _log.warning("a2a stream terminal (%s): <unserializable payload>", source)
 
 
 def _failure_status(envelope: dict[str, Any]) -> str:
@@ -2768,6 +2806,7 @@ class Agent:
                                 break
                             if kind == "error":
                                 terminal_error_emitted = True
+                                _log_terminal_guard("sdk_exception_guard", payload)
                                 public_error = public_error_fields(payload)
                                 error_event = {
                                     "kind": "terminal_error",
@@ -2801,6 +2840,9 @@ class Agent:
                                 failure_envelope = _failure_envelope(payload)
                                 if failure_envelope is not None:
                                     terminal_error_emitted = True
+                                    _log_terminal_guard(
+                                        "sdk_observability_guard", payload
+                                    )
                                     public_error = public_error_fields_from_envelope(
                                         failure_envelope
                                     )
@@ -2840,6 +2882,7 @@ class Agent:
                             event_failure_envelope = _failure_envelope(event)
                             if event_failure_envelope is not None:
                                 terminal_error_emitted = True
+                                _log_terminal_guard("sdk_envelope_guard", event)
                                 # A terminal envelope may carry the failure at the
                                 # top level (with no mapping-valued ``output``).
                                 # Always sanitize the mapping that actually owns
