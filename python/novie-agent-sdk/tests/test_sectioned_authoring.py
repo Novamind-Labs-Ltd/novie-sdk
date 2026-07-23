@@ -18,6 +18,7 @@ from novie_agent_sdk import (
 )
 from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
+    _compact_markdown_to_utf8_limit,
     _llm_stream_event_delta,
     _llm_stream_event_result,
 )
@@ -172,6 +173,28 @@ class _LongFakeLlm(_FakeLlm):
                     )
                 }
         return {"content": "## Section 1\n\nalpha beta gamma delta epsilon zeta"}
+
+
+class _WholeDocumentDraftLlm(_FakeLlm):
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.chat_kwargs.append(dict(kwargs))
+        prompt = messages[0]["content"]
+        self.chat_prompts.append(prompt)
+        return {
+            "content": (
+                "# Example Document\n\n"
+                "## Context\n\n"
+                "alpha beta gamma delta epsilon zeta\n\n"
+                "## Recommendation\n\n"
+                "eta theta iota kappa lambda mu"
+            )
+        }
 
 
 class _HangingLlm(_FakeLlm):
@@ -703,7 +726,10 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         artifact_type="example_document",
         step_id="s2",
         capability_id="agent.example.write_document",
-        context_budget={"max_output_tokens": 64000},
+        context_budget={
+            "max_output_tokens": 64000,
+            "max_document_output_tokens": 64000,
+        },
         authoring_contract={
             "coverage_model": "example_document",
             "min_outline_sections": 2,
@@ -929,6 +955,43 @@ async def test_sectioned_author_repairs_missing_planned_heading_before_quality_g
     assert result.drafts[0].markdown.startswith("## Context\n\n## Wrong Heading")
     assert result.drafts[0].quality["passed"] is True
     assert result.drafts[0].quality["failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_isolates_the_requested_section_from_a_whole_document_draft() -> None:
+    llm = _WholeDocumentDraftLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        context_budget={"max_output_tokens": 2000},
+        authoring_contract={
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "require_evidence_refs": False,
+        },
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    assert result.drafts[0].markdown == "## Context\n\nalpha beta gamma delta epsilon zeta"
+    assert result.drafts[1].markdown == "## Recommendation\n\neta theta iota kappa lambda mu"
+    assert result.markdown.count("## Context") == 1
+    assert result.markdown.count("## Recommendation") == 1
+    draft_prompts = [prompt for prompt in llm.chat_prompts if "Section plan:" in prompt]
+    assert len(draft_prompts) == 2
+    assert all("Return only the requested section" in prompt for prompt in draft_prompts)
 
 
 def test_unique_sources_gate_caps_requirement_by_available_evidence() -> None:
@@ -1430,6 +1493,40 @@ async def test_boundary_stitch_shares_remaining_budget_across_all_seams() -> Non
 
 
 @pytest.mark.asyncio
+async def test_boundary_stitch_degrades_when_budget_exhausts_mid_finalize() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _BridgeLlm(bridge="Optional bridge.")
+    author = _stitch_author(
+        llm,
+        phase_events=phase_events,
+        contract_extra={"max_document_output_tokens": 1},
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id=f"s{index}", title=f"Section {index}"),
+            markdown=f"## Section {index}\n\nBody {index}.",
+        )
+        for index in range(1, 4)
+    ]
+
+    result = await author._boundary_stitch_final(
+        brief={"title": "Doc"},
+        drafts=drafts,
+        combined="\n\n".join(draft.markdown for draft in drafts),
+    )
+
+    assert all(draft.markdown in result for draft in drafts)
+    assert len(llm.chat_kwargs) == 1
+    exhausted = [
+        event
+        for event in phase_events
+        if event["event"] == "document.final.output_budget_exhausted"
+    ]
+    assert exhausted
+    assert all(event["phase"] == "boundary_stitch" for event in exhausted)
+
+
+@pytest.mark.asyncio
 async def test_boundary_stitch_single_section_skips_llm() -> None:
     phase_events: list[dict[str, Any]] = []
     llm = _BridgeLlm()
@@ -1859,6 +1956,137 @@ async def test_single_polish_truncated_output_returns_combined() -> None:
     assert len(warnings) == 1
     assert warnings[0]["phase"] == "single_polish_output"
     assert warnings[0]["finish_reason"] == "max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_fixed_shape_outline_uses_canonical_section_titles_without_llm() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="requirements_analysis",
+        step_id="s1",
+        capability_id="agent.analyst.requirements_analysis",
+        authoring_contract={
+            "length_profile": "short",
+            "default_section_words": 20,
+            "canonical_section_titles": (
+                "Summary",
+                "Personas",
+                "Goals",
+            ),
+        },
+        phase_event_sink=phase_events.append,
+    )
+
+    _profile, outline = await author._build_outline(
+        brief={"title": "Support triage"},
+        upstream={},
+    )
+
+    assert [plan.title for plan in outline] == ["Summary", "Personas", "Goals"]
+    assert llm.structured_prompts == []
+    assert any(event["event"] == "document.outline.fixed_shape" for event in phase_events)
+
+
+@pytest.mark.asyncio
+async def test_single_polish_with_glued_heading_returns_validated_drafts() -> None:
+    phase_events: list[dict[str, Any]] = []
+    polished = (
+        "## Context\n\n"
+        + "alpha beta gamma delta epsilon zeta " * 8
+        + ".## Findings\n\n"
+        + "iota kappa lambda mu nu xi omicron pi " * 8
+    )
+    author = SectionedLongformAuthor(
+        llm_facade=_BridgeLlm(bridge=polished),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        authoring_contract={"finalization": "single_polish"},
+        phase_event_sink=phase_events.append,
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="s1", title="Context"),
+            markdown="## Context\n\nalpha beta gamma.",
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="s2", title="Findings"),
+            markdown="## Findings\n\ndelta epsilon zeta.",
+        ),
+    ]
+
+    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
+
+    assert result == "## Context\n\nalpha beta gamma.\n\n## Findings\n\ndelta epsilon zeta."
+    fallback = [
+        event for event in phase_events
+        if event["event"] == "document.final.structure_fallback"
+    ]
+    assert len(fallback) == 1
+    assert fallback[0]["expected_section_titles"] == ["Context", "Findings"]
+
+
+@pytest.mark.asyncio
+async def test_final_output_byte_contract_compacts_before_polish() -> None:
+    phase_events: list[dict[str, Any]] = []
+    compacted = "## Context\n\nConcise evidence.\n\n## Findings\n\nConcise recommendation."
+    author = SectionedLongformAuthor(
+        llm_facade=_BridgeLlm(bridge=compacted),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s1",
+        capability_id="agent.example.write_document",
+        context_budget={
+            "max_output_tokens": 1000,
+            "max_document_output_bytes": 128,
+        },
+        authoring_contract={"finalization": "single_polish"},
+        phase_event_sink=phase_events.append,
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="context", title="Context"),
+            markdown="## Context\n\n" + "Evidence detail. " * 20,
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="findings", title="Findings"),
+            markdown="## Findings\n\n" + "Recommendation detail. " * 20,
+        ),
+    ]
+
+    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
+
+    assert result == compacted
+    assert len(result.encode("utf-8")) <= 128
+    assert any(
+        "hard delivery contract" in prompt for prompt in author._llm.chat_prompts
+    )
+    assert [event["event"] for event in phase_events] == [
+        "document.final.output_byte_limit_exceeded",
+        "agent.llm_call.started",
+        "agent.llm_call.delta",
+        "agent.llm_call.completed",
+        "document.final.output_byte_compacted",
+    ]
+
+
+def test_deterministic_final_byte_compaction_preserves_headings_and_limit() -> None:
+    text = (
+        "## Context\n\n"
+        + "x" * 200
+        + "\n\n## Findings\n\n"
+        + "y" * 200
+    )
+
+    compacted = _compact_markdown_to_utf8_limit(text, 64)
+
+    assert len(compacted.encode("utf-8")) <= 64
+    assert "## Context" in compacted
+    assert "## Findings" in compacted
 
 
 @pytest.mark.asyncio

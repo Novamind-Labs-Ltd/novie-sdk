@@ -17,6 +17,7 @@ from novie_protocol.agents import AgentStreamEvent
 from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
 from .context_budget import wall_clock_deadline as context_wall_clock_deadline
 from .document_authoring_budget import (
+    DocumentAuthoringBudgetExceeded,
     DocumentAuthoringDeadlineExceeded,
     DocumentOutputBudget,
 )
@@ -150,6 +151,7 @@ class SectionedAuthoringContract:
     evidence_depth: str = "standard"
     min_outline_sections: int = 2
     max_outline_sections: int = 9
+    canonical_section_titles: tuple[str, ...] = ()
     min_section_words: int = 90
     default_section_words: int = 180
     max_section_words: int = 280
@@ -193,6 +195,11 @@ class SectionedAuthoringContract:
             evidence_depth=str(raw.get("evidence_depth") or "standard"),
             min_outline_sections=_positive_int(raw.get("min_outline_sections"), 2),
             max_outline_sections=_positive_int(raw.get("max_outline_sections"), 9),
+            canonical_section_titles=tuple(
+                str(title).strip()
+                for title in (raw.get("canonical_section_titles") or [])
+                if str(title).strip()
+            ),
             min_section_words=_positive_int(raw.get("min_section_words"), 90),
             default_section_words=_positive_int(raw.get("default_section_words"), 180),
             max_section_words=_positive_int(raw.get("max_section_words"), 280),
@@ -391,6 +398,10 @@ class DocumentAuthoringRequest:
     quality_metadata: Mapping[str, Any] | None = None
     defer_intermediate_artifacts: bool = False
     defer_final_artifact: bool = False
+    # Capability runtimes may require a structural assembly strategy even when
+    # their shared skill contract uses a different default.
+    finalization_override: str | None = None
+    canonical_section_titles: tuple[str, ...] = ()
     length_profile: str | None = None
     profile_source: str = "skill_default"
     profile_confidence: str = "confirmed"
@@ -438,6 +449,8 @@ class DocumentAuthoringRequest:
                 "skill_instructions_loaded": True,
                 "resuming_sectioned_state": self.resume_state is not None,
                 "defer_final_artifact": self.defer_final_artifact,
+                "finalization_override": self.finalization_override,
+                "canonical_section_titles": list(self.canonical_section_titles),
             }
         }
 
@@ -524,6 +537,8 @@ async def run_sectioned_document_finalization(
         authoring_contract=sectioned_authoring_contract_from_skill(
             skill_contract,
             artifact_type=artifact_type,
+            finalization_override=request.finalization_override,
+            canonical_section_titles=request.canonical_section_titles,
         ),
         authoring_instructions=authoring_instructions,
         defer_intermediate_artifacts=defer_intermediate_artifacts,
@@ -672,6 +687,8 @@ async def astream_sectioned_document_finalization(
         length_profile=resolved_profile["profile"],
         profile_source=resolved_profile["source"],
         profile_confidence=resolved_profile["confidence"],
+        finalization_override=request.finalization_override,
+        canonical_section_titles=request.canonical_section_titles,
     )
     if rebase_artifact_types_to_runtime and isinstance(authoring_contract, dict):
         declared_final = authoring_contract.get("final_artifact_type")
@@ -949,6 +966,8 @@ def sectioned_authoring_contract_from_skill(
     length_profile: str | None = None,
     profile_source: str = "",
     profile_confidence: str = "",
+    finalization_override: str | None = None,
+    canonical_section_titles: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Map a generic skill runtime contract to sectioned authoring settings."""
     document = contract.document
@@ -962,7 +981,12 @@ def sectioned_authoring_contract_from_skill(
     )
     profile = document.length_profiles.get(base_length_profile)
     if profile is not None:
-        finalization = profile.finalization or contract.runtime.finalization or "single_polish"
+        finalization = (
+            finalization_override
+            or profile.finalization
+            or contract.runtime.finalization
+            or "single_polish"
+        )
         evidence_depth = profile.evidence_depth or "standard"
         min_outline_sections = profile.min_sections or document.outline.min_sections or 2
         max_outline_sections = profile.max_sections or document.outline.max_sections or 9
@@ -982,7 +1006,7 @@ def sectioned_authoring_contract_from_skill(
             or 0.8
         )
     else:
-        finalization = contract.runtime.finalization or "single_polish"
+        finalization = finalization_override or contract.runtime.finalization or "single_polish"
         evidence_depth = str(raw_document.get("evidence_depth") or "standard")
         min_outline_sections = document.outline.min_sections or 2
         max_outline_sections = document.outline.max_sections or 9
@@ -1009,6 +1033,9 @@ def sectioned_authoring_contract_from_skill(
         "evidence_depth": evidence_depth,
         "min_outline_sections": min_outline_sections,
         "max_outline_sections": max_outline_sections,
+        "canonical_section_titles": tuple(
+            title.strip() for title in canonical_section_titles if title.strip()
+        ),
         "min_section_words": min_section_words,
         "default_section_words": default_section_words,
         "max_section_words": max_section_words,
@@ -1116,6 +1143,10 @@ class SectionedLongformAuthor:
         self._document_output_budget = DocumentOutputBudget.from_limits(
             self._context_budget,
             contract_limit=self._contract.max_document_output_tokens,
+        )
+        self._document_output_byte_limit = (
+            _positive_int(self._context_budget.get("max_document_output_bytes"), 0)
+            or None
         )
         self._max_llm_stream_attempts = _positive_int(
             self._context_budget.get("llm_stream_max_attempts")
@@ -1785,6 +1816,31 @@ class SectionedLongformAuthor:
         brief: Mapping[str, Any],
         upstream: Mapping[str, Any],
     ) -> tuple[str, tuple[SectionPlan, ...]]:
+        if self._contract.canonical_section_titles:
+            # Fixed-shape artifacts own their reader-facing section order. The
+            # model still writes each body, but it must not invent headings or
+            # change the number of sections.
+            plans = tuple(
+                SectionPlan(
+                    section_id=_slug(title, fallback=f"section-{index}"),
+                    title=title,
+                    objective=f"Cover the {title.lower()} required by the artifact contract.",
+                    evidence_query=title,
+                    min_words=self._contract.default_section_words,
+                )
+                for index, title in enumerate(
+                    self._contract.canonical_section_titles,
+                    start=1,
+                )
+            )
+            if plans:
+                await self._emit(
+                    "document.outline.fixed_shape",
+                    status="complete",
+                    section_count=len(plans),
+                    section_titles=[plan.title for plan in plans],
+                )
+                return self._contract.length_profile or "medium", plans
         prompt = (
             "Design a longform document outline for the selected length profile.\n"
             f"Coverage model: {self._contract.coverage_model}.\n"
@@ -1998,6 +2054,12 @@ class SectionedLongformAuthor:
             )
         prompt = (
             "Write exactly this document section in Markdown.\n"
+            "Return only the requested section: do not write a document title or "
+            "any other level-one or level-two heading. The response must start "
+            f"with `## {plan.title}` and may use level-three-or-deeper headings "
+            "inside that section. Treat any whole-document instructions below as "
+            "global requirements, but satisfy only the current section in this "
+            "response.\n"
             "Use the original task, the document-so-far context, the prior section "
             "ledger, and the bounded evidence pack. Continue naturally from what "
             "earlier sections established and avoid repeating their content. "
@@ -2041,7 +2103,7 @@ class SectionedLongformAuthor:
         content = streamed.text.strip()
         if not content:
             return "", streamed.truncated
-        return _ensure_section_heading(content, plan.title), streamed.truncated
+        return _isolate_requested_section(content, plan.title), streamed.truncated
 
     async def _bounded_for_final_prompt(
         self,
@@ -2078,33 +2140,145 @@ class SectionedLongformAuthor:
         drafts: list[SectionDraft],
     ) -> str:
         combined = _join_markdown(draft.markdown for draft in drafts)
+        if self._exceeds_final_output_byte_limit(combined):
+            return await self._compact_final_to_output_byte_limit(
+                brief=brief,
+                drafts=drafts,
+                markdown=combined,
+            )
         if self._contract.finalization == "boundary_stitch":
-            return await self._boundary_stitch_final(
+            finalized = await self._boundary_stitch_final(
                 brief=brief,
                 drafts=drafts,
                 combined=combined,
             )
-        if self._contract.finalization == "progressive_section_merge":
-            return await self._progressive_merge_final(
+        elif self._contract.finalization == "progressive_section_merge":
+            finalized = await self._progressive_merge_final(
                 brief=brief,
                 drafts=drafts,
                 combined=combined,
             )
-        if self._contract.finalization != "single_polish":
-            # Contracts built via from_mapping cannot reach here; this guards
-            # direct dataclass construction so an unknown mode is at least
-            # loud before the single_polish fallback runs.
+        else:
+            if self._contract.finalization != "single_polish":
+                # Contracts built via from_mapping cannot reach here; this guards
+                # direct dataclass construction so an unknown mode is at least
+                # loud before the single_polish fallback runs.
+                await self._emit(
+                    "document.finalize.mode_fallback",
+                    status="degraded",
+                    requested_mode=self._contract.finalization,
+                    effective_mode="single_polish",
+                )
+            finalized = await self._single_polish_final(
+                brief=brief,
+                drafts=drafts,
+                combined=combined,
+            )
+        if not _preserves_section_structure(finalized, drafts):
             await self._emit(
-                "document.finalize.mode_fallback",
+                "document.final.structure_fallback",
                 status="degraded",
-                requested_mode=self._contract.finalization,
-                effective_mode="single_polish",
+                reason="finalized_markdown_missing_or_reordered_section_headings",
+                expected_section_titles=[draft.plan.title for draft in drafts],
             )
-        return await self._single_polish_final(
+            finalized = combined
+        if not self._exceeds_final_output_byte_limit(finalized):
+            return finalized
+        return await self._compact_final_to_output_byte_limit(
             brief=brief,
             drafts=drafts,
-            combined=combined,
+            markdown=finalized,
         )
+
+    def _exceeds_final_output_byte_limit(self, markdown: str) -> bool:
+        return bool(
+            self._document_output_byte_limit is not None
+            and len(markdown.encode("utf-8")) > self._document_output_byte_limit
+        )
+
+    async def _compact_final_to_output_byte_limit(
+        self,
+        *,
+        brief: Mapping[str, Any],
+        drafts: list[SectionDraft],
+        markdown: str,
+    ) -> str:
+        """Return a complete, bounded final document for a frozen byte contract."""
+        max_bytes = self._document_output_byte_limit
+        if max_bytes is None:
+            return markdown
+        input_bytes = len(markdown.encode("utf-8"))
+        await self._emit(
+            "document.final.output_byte_limit_exceeded",
+            status="degraded",
+            input_bytes=input_bytes,
+            max_document_output_bytes=max_bytes,
+        )
+        refs = [
+            {
+                "section_id": draft.plan.section_id,
+                "title": draft.plan.title,
+                "artifact_ref": draft.artifact_ref.get("artifact_ref"),
+            }
+            for draft in drafts
+        ]
+        source = await self._bounded_for_final_prompt(
+            markdown,
+            limit=48000,
+            phase="output_byte_compaction",
+        )
+        # Four bytes per Unicode code point is a conservative UTF-8 target.  The
+        # postcondition below remains authoritative because Markdown/tokenization
+        # is not a byte-accounting protocol.
+        safe_character_limit = max(128, max_bytes // 4)
+        prompt = (
+            "Rewrite these Markdown sections as one concise, complete final document. "
+            "Preserve every top-level section heading, essential facts, source refs, "
+            "and required document structure. Return only the document, with no process "
+            "commentary. This is a hard delivery contract: the UTF-8 result must be no "
+            f"more than {max_bytes} bytes; stay within {safe_character_limit} Unicode "
+            "characters to leave a safety margin. Prefer concise paragraphs and remove "
+            "secondary detail before removing required structure.\n\n"
+            f"{self._skill_instruction_block()}"
+            f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
+            f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
+            f"Draft sections:\n{source}"
+        )
+        compacted = ""
+        strategy = "deterministic_structure"
+        if self._document_output_budget.remaining_tokens != 0:
+            streamed = await self._stream_llm_text(
+                purpose="output_byte_compaction",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_output_tokens=self._output_token_ceiling,
+                model=self._contract.finalize_model or None,
+                extra_metadata={
+                    "input_bytes": input_bytes,
+                    "max_document_output_bytes": max_bytes,
+                    "safe_character_limit": safe_character_limit,
+                },
+            )
+            candidate = streamed.text.strip()
+            if (
+                candidate
+                and not streamed.truncated
+                and not self._exceeds_final_output_byte_limit(candidate)
+                and _preserves_section_structure(candidate, drafts)
+            ):
+                compacted = candidate
+                strategy = "llm"
+        if not compacted:
+            compacted = _compact_markdown_to_utf8_limit(markdown, max_bytes)
+        await self._emit(
+            "document.final.output_byte_compacted",
+            status="degraded",
+            input_bytes=input_bytes,
+            output_bytes=len(compacted.encode("utf-8")),
+            max_document_output_bytes=max_bytes,
+            strategy=strategy,
+        )
+        return compacted
 
     async def _boundary_stitch_final(
         self,
@@ -2154,15 +2328,28 @@ class SectionedLongformAuthor:
                 f"End of preceding section:\n{before[-limit:]}\n\n"
                 f"Start of following section:\n{after[:limit]}"
             )
-            streamed = await self._stream_llm_text(
-                purpose="seam_stitch",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_output_tokens=200,
-                output_slots_remaining=len(bodies) - seam_index - 1,
-                model=finalize_model,
-                extra_metadata={"seam_index": seam_index + 1},
-            )
+            try:
+                streamed = await self._stream_llm_text(
+                    purpose="seam_stitch",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_output_tokens=200,
+                    output_slots_remaining=len(bodies) - seam_index - 1,
+                    model=finalize_model,
+                    extra_metadata={"seam_index": seam_index + 1},
+                )
+            except DocumentAuthoringBudgetExceeded:
+                # Seam bridges are optional polish. The section bodies are the
+                # durable deliverable, so an exhausted shared budget degrades
+                # to a plain join instead of failing the whole agent run.
+                await self._emit(
+                    "document.final.output_budget_exhausted",
+                    status="degraded",
+                    phase="boundary_stitch",
+                    seam_index=seam_index + 1,
+                    **self._document_output_budget.metadata(),
+                )
+                return ""
             bridge = streamed.text.strip()
             if streamed.truncated:
                 # A cut-off transition reads worse than a plain join; sections
@@ -2225,14 +2412,23 @@ class SectionedLongformAuthor:
                 **self._document_output_budget.metadata(),
             )
             return combined
-        streamed = await self._stream_llm_text(
-            purpose="final_polish",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_output_tokens=self._output_token_ceiling,
-            model=self._contract.finalize_model or None,
-            extra_metadata={"section_count": len(drafts)},
-        )
+        try:
+            streamed = await self._stream_llm_text(
+                purpose="final_polish",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_output_tokens=self._output_token_ceiling,
+                model=self._contract.finalize_model or None,
+                extra_metadata={"section_count": len(drafts)},
+            )
+        except DocumentAuthoringBudgetExceeded:
+            await self._emit(
+                "document.final.output_budget_exhausted",
+                status="degraded",
+                phase="single_polish",
+                **self._document_output_budget.metadata(),
+            )
+            return combined
         if streamed.truncated:
             # A rewrite cut at the output limit ends mid-document. The combined
             # sections are complete, so they always beat a truncated polish.
@@ -2317,17 +2513,30 @@ class SectionedLongformAuthor:
                 f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
                 f"Cluster draft sections:\n{cluster_sections}"
             )
-            streamed = await self._stream_llm_text(
-                purpose="merge_cluster",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_output_tokens=self._output_token_ceiling,
-                model=self._contract.finalize_model or None,
-                extra_metadata={
-                    "cluster_index": cluster_index,
-                    "section_count": len(cluster),
-                },
-            )
+            try:
+                streamed = await self._stream_llm_text(
+                    purpose="merge_cluster",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_output_tokens=self._output_token_ceiling,
+                    model=self._contract.finalize_model or None,
+                    extra_metadata={
+                        "cluster_index": cluster_index,
+                        "section_count": len(cluster),
+                    },
+                )
+            except DocumentAuthoringBudgetExceeded:
+                await self._emit(
+                    "document.final.output_budget_exhausted",
+                    status="degraded",
+                    phase="merge_cluster",
+                    cluster_index=cluster_index,
+                    **self._document_output_budget.metadata(),
+                )
+                merged_clusters.extend(
+                    draft.markdown.strip() for draft in drafts[start:]
+                )
+                return _join_markdown(merged_clusters)
             if streamed.truncated:
                 # Same rule as single_polish: complete originals beat a
                 # merge that was cut mid-cluster.
@@ -2712,6 +2921,105 @@ def _ensure_section_heading(markdown: str, title: str) -> str:
     return f"## {title}\n\n{text}" if text else f"## {title}"
 
 
+def _compact_markdown_to_utf8_limit(markdown: str, max_bytes: int) -> str:
+    """Deterministically retain Markdown structure when final compaction fails.
+
+    This is an explicitly signalled last resort, not a text-prefix truncation:
+    preserve every heading that fits and add only complete body lines.  A model
+    compaction is always attempted first, so this path keeps a terminal result
+    structurally valid if the model has exhausted its output allocation.
+    """
+    text = str(markdown or "").strip()
+    if max_bytes <= 0 or len(text.encode("utf-8")) <= max_bytes:
+        return text
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#") and current:
+            blocks.append(current)
+            current = []
+        current.append(line)
+    if current:
+        blocks.append(current)
+    if not blocks:
+        return ""
+
+    heading_blocks = [
+        block
+        for block in blocks
+        if block and block[0].lstrip().startswith("#")
+    ]
+    if not heading_blocks:
+        return _complete_lines_within_utf8_limit(text.splitlines(), max_bytes)
+
+    skeleton = "\n\n".join(block[0].strip() for block in heading_blocks).strip()
+    if len(skeleton.encode("utf-8")) > max_bytes:
+        return _complete_lines_within_utf8_limit(
+            [block[0].strip() for block in heading_blocks],
+            max_bytes,
+        )
+
+    remaining = max_bytes - len(skeleton.encode("utf-8"))
+    rendered: list[str] = []
+    for index, block in enumerate(heading_blocks):
+        heading = block[0].strip()
+        body_lines = [line.strip() for line in block[1:] if line.strip()]
+        blocks_remaining = len(heading_blocks) - index
+        allowance = remaining // max(1, blocks_remaining)
+        body = _complete_lines_within_utf8_limit(body_lines, allowance)
+        rendered.append(f"{heading}\n\n{body}".strip() if body else heading)
+        remaining -= len(body.encode("utf-8"))
+    result = "\n\n".join(rendered).strip()
+    # Separators between headings and body lines add a few bytes that are not
+    # represented in the per-block body allowances.  Fall back to the heading
+    # skeleton rather than ever returning an over-contract payload.
+    return result if len(result.encode("utf-8")) <= max_bytes else skeleton
+
+
+def _complete_lines_within_utf8_limit(lines: list[str], max_bytes: int) -> str:
+    selected: list[str] = []
+    used = 0
+    for line in lines:
+        candidate = str(line or "").strip()
+        if not candidate:
+            continue
+        separator = "\n" if selected else ""
+        candidate_bytes = len((separator + candidate).encode("utf-8"))
+        if used + candidate_bytes > max_bytes:
+            continue
+        selected.append(candidate)
+        used += candidate_bytes
+    return "\n".join(selected)
+
+
+def _isolate_requested_section(markdown: str, title: str) -> str:
+    """Keep only the planned level-two section from an over-broad LLM draft.
+
+    The final document contract is intentionally available to every section
+    writer. Models occasionally follow it too literally and emit the entire
+    document for a single section. Preserving that response would duplicate
+    headings when the drafts are joined, so retain the requested level-two
+    section and drop sibling document sections deterministically.
+    """
+    text = str(markdown or "").strip()
+    wanted = _normalise_heading(title)
+    headings = list(_HEADING_RE.finditer(text))
+    for index, heading in enumerate(headings):
+        raw_heading = heading.group(0)
+        level = len(raw_heading) - len(raw_heading.lstrip("#"))
+        if level != 2 or _normalise_heading(heading.group(1)) != wanted:
+            continue
+        end = len(text)
+        for sibling in headings[index + 1 :]:
+            sibling_raw = sibling.group(0)
+            sibling_level = len(sibling_raw) - len(sibling_raw.lstrip("#"))
+            if sibling_level <= 2:
+                end = sibling.start()
+                break
+        return text[heading.start() : end].strip()
+    return _ensure_section_heading(text, title)
+
+
 def _normalise_heading(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
 
@@ -2797,6 +3105,26 @@ def _has_confidence_layer(markdown: str) -> bool:
 
 def _join_markdown(items: Any) -> str:
     return "\n\n".join(str(item or "").strip() for item in items if str(item or "").strip())
+
+
+def _preserves_section_structure(markdown: str, drafts: list[SectionDraft]) -> bool:
+    """Require a final rewrite to retain every planned level-two heading.
+
+    A final LLM polish can retain all the words while serializing the document
+    with a heading glued to the preceding paragraph. Downstream fixed-shape
+    artifact validation then (correctly) rejects that text. The original
+    section drafts are already validated and joined with explicit separators,
+    so use them whenever the rewrite no longer preserves their exact outline.
+    """
+    expected = [_normalise_heading(draft.plan.title) for draft in drafts]
+    if not expected:
+        return bool(str(markdown or "").strip())
+    actual = [
+        _normalise_heading(match.group(1))
+        for match in _HEADING_RE.finditer(str(markdown or ""))
+        if len(match.group(0)) - len(match.group(0).lstrip("#")) == 2
+    ]
+    return actual == expected
 
 
 def _llm_stream_event_delta(event: Any) -> str:
