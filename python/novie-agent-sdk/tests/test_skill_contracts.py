@@ -304,6 +304,35 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
     assert typed.running_context is True
 
 
+def test_sectioned_contract_accepts_explicit_finalization_override() -> None:
+    raw = {
+        "version": 1,
+        "name": "fixed-shape",
+        "runtime": {
+            "strategy": "sectioned_longform",
+            "finalization": "progressive_section_merge",
+        },
+        "document": {
+            "length_profiles": {
+                "long": {
+                    "finalization": "progressive_section_merge",
+                    "max_sections": 8,
+                },
+            },
+        },
+    }
+    contract = _contract_from_mapping(raw, sources=(), warnings=())
+
+    settings = sectioned_authoring_contract_from_skill(
+        contract,
+        artifact_type="requirements_analysis",
+        length_profile="long",
+        finalization_override="boundary_stitch",
+    )
+
+    assert settings["finalization"] == "boundary_stitch"
+
+
 def test_sectioned_contract_omits_tuning_knobs_when_unspecified() -> None:
     raw = {
         "version": 1,

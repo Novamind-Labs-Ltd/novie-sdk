@@ -2270,7 +2270,10 @@ class RegistrationClient:
         last_exc: Exception | None = None
         for attempt in range(1, self._register_max_attempts + 1):
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                # Registration persists the manifest, rebuilds the effective
+                # catalog, and runs contract admission; it can exceed the
+                # normal request timeout on a cold platform replica.
+                async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
                         f"{self._platform_url}/agents/register",
                         json=self._manifest.to_dict(),
@@ -2805,6 +2808,20 @@ class Agent:
                             if kind == "done":
                                 break
                             if kind == "error":
+                                if isinstance(payload, BaseException):
+                                    # The wire contract must not disclose an
+                                    # implementation exception, but operators
+                                    # need the original traceback to repair a
+                                    # terminal stream failure.
+                                    _log.error(
+                                        "agent stream handler raised agent_id=%s",
+                                        m.agent_id,
+                                        exc_info=(
+                                            type(payload),
+                                            payload,
+                                            payload.__traceback__,
+                                        ),
+                                    )
                                 terminal_error_emitted = True
                                 _log_terminal_guard("sdk_exception_guard", payload)
                                 public_error = public_error_fields(payload)

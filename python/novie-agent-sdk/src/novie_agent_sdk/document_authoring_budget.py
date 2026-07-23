@@ -39,7 +39,11 @@ class DocumentOutputBudget:
     ) -> "DocumentOutputBudget":
         per_call = _positive_int(context_budget.get("max_output_tokens"))
         context_limit = _positive_int(context_budget.get("max_document_output_tokens"))
-        limits = [value for value in (context_limit, contract_limit, per_call) if value]
+        # ``max_output_tokens`` is the provider limit for one call.  It must not
+        # become the cumulative document limit: sectioned authoring deliberately
+        # makes several calls (outline, sections, summaries, and finalization).
+        # Only an explicit document limit participates in the run-wide ceiling.
+        limits = [value for value in (context_limit, contract_limit) if value]
         total = min(limits) if limits else None
         return cls(
             total_tokens=total,
