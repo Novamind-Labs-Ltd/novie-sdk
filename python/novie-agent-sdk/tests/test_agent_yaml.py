@@ -272,6 +272,100 @@ def test_invalid_governance_risk_rejected() -> None:
         AgentYamlConfig.model_validate(payload)
 
 
+def test_capability_gate_rejects_unbound_content_path() -> None:
+    payload = _minimal_payload()
+    payload["advanced"] = {
+        "capability_overrides": {
+            "agent.analyst.requirement_extraction": {
+                "gates": [
+                    {
+                        "gate_key": "output_review",
+                        "timing": "post_step",
+                        "title": "Review output",
+                        "content": [
+                            {
+                                "kind": "artifact_preview",
+                                "binding": "https://example.com/plan",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    with pytest.raises(ValidationError, match="binding must be a dotted"):
+        AgentYamlConfig.model_validate(payload)
+
+
+def test_capability_gate_rejects_required_false() -> None:
+    payload = _minimal_payload()
+    payload["advanced"] = {
+        "capability_overrides": {
+            "agent.analyst.requirement_extraction": {
+                "gates": [
+                    {
+                        "gate_key": "output_review",
+                        "timing": "post_step",
+                        "title": "Review output",
+                        "required": False,
+                    }
+                ]
+            }
+        }
+    }
+
+    with pytest.raises(ValidationError, match="required=false"):
+        AgentYamlConfig.model_validate(payload)
+
+
+def test_capability_gate_accepts_pre_side_effect() -> None:
+    payload = _minimal_payload()
+    payload["advanced"] = {
+        "capability_overrides": {
+            "agent.analyst.requirement_extraction": {
+                "side_effect_boundaries": ["agent_invocation"],
+                "gates": [
+                    {
+                        "gate_key": "before_publish",
+                        "timing": "pre_side_effect",
+                        "boundary_id": "agent_invocation",
+                        "title": "Review side effect",
+                    }
+                ]
+            }
+        }
+    }
+
+    config = AgentYamlConfig.model_validate(payload)
+    gate = config.advanced.capability_overrides[
+        "agent.analyst.requirement_extraction"
+    ].gates[0]
+    assert gate.timing == "pre_side_effect"
+    assert gate.boundary_id == "agent_invocation"
+
+
+def test_capability_gate_rejects_undeclared_side_effect_boundary() -> None:
+    payload = _minimal_payload()
+    payload["advanced"] = {
+        "capability_overrides": {
+            "agent.analyst.requirement_extraction": {
+                "gates": [
+                    {
+                        "gate_key": "before_publish",
+                        "timing": "pre_side_effect",
+                        "boundary_id": "agent_invocation",
+                        "title": "Review side effect",
+                    }
+                ]
+            }
+        }
+    }
+
+    with pytest.raises(ValidationError, match="side_effect_boundaries"):
+        AgentYamlConfig.model_validate(payload)
+
+
 # ── capability id format + uniqueness ────────────────────────────────────────
 
 

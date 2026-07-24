@@ -259,8 +259,8 @@ def test_capability_entry_carries_per_entry_projection() -> None:
     assert entry["side_effect"] == "session"
     assert entry["consumes"] == ["project_document"]
     assert entry["provides"] == ["analysis_artifact"]
-    assert entry["requires_tracker_issue"] is True
-    assert entry["requires_human_gate"] is False
+    assert entry["governance"]["requires_tracker_issue"] is True
+    assert entry["governance"]["requires_human_gate"] is False
     assert entry["exec_kind"] == "stream"  # artifact_agent default
 
 
@@ -346,6 +346,65 @@ def test_capability_overrides_replace_per_entry_contract() -> None:
     assert edit["input_contracts"][0]["artifact"] == "prd_document"
     assert edit["caller_types"] == ["planner"]
     assert edit["metadata"]["disambiguation_policy"] == "branch_by_consumes"
+
+
+def test_capability_override_emits_post_step_gate_on_matching_entry() -> None:
+    payload = _minimal_config().model_dump()
+    payload["capabilities"] = [
+        "agent.architect.create_implementation_plan",
+        "agent.architect.review_code",
+    ]
+    payload["advanced"] = {
+        "capability_overrides": {
+            "agent.architect.create_implementation_plan": {
+                "gates": [
+                    {
+                        "gate_key": "output_review",
+                        "timing": "post_step",
+                        "title": "Review implementation plan",
+                        "description": "Approve before ticket splitting.",
+                        "allowed_actions": [
+                            "allow",
+                            "request_changes",
+                            "reject",
+                        ],
+                        "content": [
+                            {
+                                "kind": "artifact_preview",
+                                "binding": "output.implementation_plan_document",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+    config = AgentYamlConfig.model_validate(payload)
+
+    entries = {
+        entry["capability_id"]: entry
+        for entry in generate_agent_manifest(config)["capability_manifest"]
+    }
+
+    plan_entry = entries["agent.architect.create_implementation_plan"]
+    assert plan_entry["gates"][0]["timing"] == "post_step"
+    assert plan_entry["gates"][0]["content"] == [
+        {
+            "kind": "artifact_preview",
+            "binding": "output.implementation_plan_document",
+            "block_id": "",
+            "title": "",
+        }
+    ]
+    assert plan_entry["governance"]["requires_human_gate"] is True
+    assert plan_entry["requires_confirmation"] is False
+    assert entries["agent.architect.review_code"]["gates"] == []
+    assert (
+        entries["agent.architect.review_code"]["governance"][
+            "requires_human_gate"
+        ]
+        is False
+    )
 
 
 def test_capability_suffix_consumes_map_projects_per_entry_contract() -> None:
@@ -477,7 +536,12 @@ def test_human_gate_appears_on_declared_gates_and_entries() -> None:
     config = AgentYamlConfig.model_validate(payload)
     manifest = generate_agent_manifest(config)
     assert manifest["declared_gates"] == ["analyst.human_review"]
-    assert manifest["capability_manifest"][0]["requires_human_gate"] is True
+    assert (
+        manifest["capability_manifest"][0]["governance"][
+            "requires_human_gate"
+        ]
+        is True
+    )
 
 
 def test_no_human_gate_keeps_declared_gates_empty() -> None:

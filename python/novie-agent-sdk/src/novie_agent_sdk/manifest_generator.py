@@ -45,8 +45,11 @@ Projection rules
   ``governance.side_effect``                →  every capability entry's
                                                 ``risk`` / ``side_effect``
 - ``governance.requires_tracker_issue`` /
-  ``governance.requires_human_gate``        →  each capability entry +
+  ``governance.requires_human_gate``        →  each capability entry's
+                                                nested ``governance`` +
                                                 ``declared_gates``
+- ``advanced.capability_overrides.*.gates`` →  the matching capability entry
+                                                only
 - ``advanced.manifest_overrides``           →  applied last as a top-level
                                                 ``dict.update`` so power users
                                                 emit any manifest-v2 field by
@@ -191,6 +194,19 @@ def _generate_capability_entry(
         ]
     else:
         input_contracts = _input_contracts_for_consumes(consumes)
+    gates = (
+        [
+            {
+                key: value
+                for key, value in gate.model_dump(exclude_none=True).items()
+                if key != "boundary_id" or value
+            }
+            for gate in override.gates
+        ]
+        if override is not None
+        else []
+    )
+    has_required_gate = any(gate.required for gate in override.gates) if override else False
     entry = {
         "capability_id": capability_id,
         "version": config.agent.version,
@@ -218,6 +234,10 @@ def _generate_capability_entry(
         "requires_confirmation": (
             config.governance.requires_human_gate
             or config.governance.risk in ("write", "dangerous")
+            or any(
+                gate.required and gate.timing != "post_step"
+                for gate in (override.gates if override else ())
+            )
         ),
         "requires": [],
         "conflicts": [],
@@ -226,11 +246,20 @@ def _generate_capability_entry(
         "input_contracts": input_contracts,
         "execution_lane": "direct",
         "risk_class": _risk_class_from_governance(config),
-        "requires_plan_review": False,
-        "requires_tracker_issue": config.governance.requires_tracker_issue,
-        "requires_human_gate": config.governance.requires_human_gate,
+        "governance": {
+            "requires_plan_review": False,
+            "requires_tracker_issue": config.governance.requires_tracker_issue,
+            "requires_human_gate": (
+                config.governance.requires_human_gate or has_required_gate
+            ),
+        },
+        "gates": gates,
     }
     if override is not None:
+        if override.side_effect_boundaries:
+            entry["side_effect_boundaries"] = list(
+                override.side_effect_boundaries
+            )
         if override.caller_types is not None:
             entry["caller_types"] = list(override.caller_types)
         if override.metadata:

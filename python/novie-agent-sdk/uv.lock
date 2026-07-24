@@ -289,7 +289,7 @@ wheels = [
 
 [[package]]
 name = "novie-agent-sdk"
-version = "0.3.62"
+version = "0.3.63"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -321,7 +321,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'dev'", specifier = ">=0.3" },
     { name = "langchain-core", marker = "extra == 'observability'", specifier = ">=0.3" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=2" },
-    { name = "novie-protocol", git = "https://github.com/Novamind-Labs-Ltd/novie-protocol.git?rev=v0.1.5" },
+    { name = "novie-protocol", git = "https://github.com/Novamind-Labs-Ltd/novie-protocol.git?rev=v0.1.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -331,8 +331,8 @@ provides-extras = ["server", "observability", "dev"]
 
 [[package]]
 name = "novie-protocol"
-version = "0.1.5"
-source = { git = "https://github.com/Novamind-Labs-Ltd/novie-protocol.git?rev=v0.1.5#4e2e4e0b619e78dcc3419a4287412b2a9bc7e8d0" }
+version = "0.1.6"
+source = { git = "https://github.com/Novamind-Labs-Ltd/novie-protocol.git?rev=v0.1.6#b35e784f7f43720b4ae5a2ad4dcbe68ce2253130" }
 dependencies = [
     { name = "pydantic" },
     { name = "typing-extensions" },

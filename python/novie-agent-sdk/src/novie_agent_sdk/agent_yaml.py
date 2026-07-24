@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Platform-aligned literals: keep these in sync with
 # ``novie_protocol.contracts.capability``. Re-declared locally so a
@@ -62,6 +62,23 @@ InputContractSource = Literal[
     "runtime_context",
     "platform_projection",
 ]
+GateTiming = Literal["pre_step", "post_step", "pre_side_effect"]
+GateAction = Literal[
+    "approve",
+    "allow",
+    "allow_local",
+    "request_changes",
+    "reject",
+]
+GateContentKind = Literal[
+    "artifact_preview",
+    "markdown",
+    "facts",
+    "table",
+    "diff",
+    "dependency_graph",
+    "warning",
+]
 
 
 _AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_\-\.]{1,63}$")
@@ -69,6 +86,10 @@ _SEMVER_PATTERN = re.compile(
     r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z\-\.]+)?(?:\+[0-9A-Za-z\-\.]+)?$"
 )
 _CAPABILITY_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_\-\.]{1,127}$")
+_GATE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_\-]{1,63}$")
+_GATE_BINDING_PATTERN = re.compile(
+    r"^(?:input|output|context)(?:\.[A-Za-z_][A-Za-z0-9_\-]*)+$"
+)
 
 
 class _StrictModel(BaseModel):
@@ -276,6 +297,77 @@ class AgentYamlGovernance(_StrictModel):
     )
 
 
+class AgentYamlGateContent(_StrictModel):
+    """One safe display block resolved from capability/runtime data."""
+
+    kind: GateContentKind
+    binding: str
+    block_id: str = ""
+    title: str = ""
+
+    @field_validator("binding")
+    @classmethod
+    def _binding_format(cls, value: str) -> str:
+        if not _GATE_BINDING_PATTERN.match(value):
+            raise ValueError(
+                "binding must be a dotted input.*, output.*, or context.* path"
+            )
+        return value
+
+
+class AgentYamlCapabilityGate(_StrictModel):
+    """A gate attached to one capability instead of the whole agent."""
+
+    gate_key: str
+    timing: GateTiming = "pre_step"
+    title: str
+    description: str = ""
+    required: bool = True
+    boundary_id: str = ""
+    allowed_actions: list[GateAction] = Field(
+        default_factory=lambda: ["approve", "request_changes", "reject"]
+    )
+    required_approver_roles: list[str] = Field(default_factory=list)
+    timeout_seconds: int | None = None
+    content: list[AgentYamlGateContent] = Field(default_factory=list)
+    payload_schema: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("gate_key")
+    @classmethod
+    def _gate_key_format(cls, value: str) -> str:
+        if not _GATE_KEY_PATTERN.match(value):
+            raise ValueError(
+                "gate_key must use lowercase letters, digits, underscores, "
+                "or hyphens"
+            )
+        return value
+
+    @field_validator("required")
+    @classmethod
+    def _required_supported(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError(
+                "required=false gates are not supported for active capability "
+                "declarations yet"
+            )
+        return value
+
+    @field_validator("allowed_actions")
+    @classmethod
+    def _allowed_actions_not_empty(cls, value: list[GateAction]) -> list[GateAction]:
+        if not value:
+            raise ValueError("allowed_actions must contain at least one action")
+        if len(value) != len(set(value)):
+            raise ValueError("allowed_actions must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def _pre_side_effect_has_boundary(self) -> AgentYamlCapabilityGate:
+        if self.timing == "pre_side_effect" and not self.boundary_id.strip():
+            raise ValueError("pre_side_effect gate requires boundary_id")
+        return self
+
+
 class AgentYamlCapabilityOverride(_StrictModel):
     """Per-capability contract overrides for multi-capability agents."""
 
@@ -283,7 +375,23 @@ class AgentYamlCapabilityOverride(_StrictModel):
     provides: list[str] | None = None
     input_contracts: list[AgentYamlInputContract] | None = None
     caller_types: list[str] | None = None
+    side_effect_boundaries: list[str] = Field(default_factory=list)
+    gates: list[AgentYamlCapabilityGate] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _gate_boundaries_are_declared(self) -> AgentYamlCapabilityOverride:
+        declared = set(self.side_effect_boundaries)
+        for gate in self.gates:
+            if (
+                gate.timing == "pre_side_effect"
+                and gate.boundary_id not in declared
+            ):
+                raise ValueError(
+                    "pre_side_effect gate boundary_id must be declared in "
+                    "side_effect_boundaries"
+                )
+        return self
 
 
 class AgentYamlAdvanced(_StrictModel):
@@ -311,8 +419,8 @@ class AgentYamlAdvanced(_StrictModel):
         description=(
             "Optional per-capability contract overrides. Keys are "
             "capability ids. Values can override consumes, provides, "
-            "input_contracts, caller_types, and metadata for that one "
-            "capability entry."
+            "input_contracts, caller_types, gates, and metadata for "
+            "that one capability entry."
         ),
     )
 
@@ -398,6 +506,8 @@ __all__ = [
     "AgentYamlAdvanced",
     "AgentYamlConfig",
     "AgentYamlCapabilityOverride",
+    "AgentYamlCapabilityGate",
+    "AgentYamlGateContent",
     "AgentYamlGovernance",
     "AgentYamlIdentity",
     "AgentYamlInputContract",
@@ -407,6 +517,9 @@ __all__ = [
     "AgentYamlRuntime",
     "GovernanceRisk",
     "GovernanceSideEffect",
+    "GateAction",
+    "GateContentKind",
+    "GateTiming",
     "RuntimeDuration",
     "RuntimeDurability",
 ]
