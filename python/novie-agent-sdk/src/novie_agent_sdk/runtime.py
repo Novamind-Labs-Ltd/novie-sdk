@@ -2247,6 +2247,7 @@ class RegistrationClient:
         registration_token: str = "",
         register_max_attempts: int = 5,
         register_backoff_seconds: float = 2.0,
+        instance_id: str = "",
     ) -> None:
         self._platform_url = platform_url.rstrip("/")
         self._manifest = manifest
@@ -2256,11 +2257,22 @@ class RegistrationClient:
         self._register_max_attempts = max(1, int(register_max_attempts))
         self._register_backoff_seconds = max(0.0, float(register_backoff_seconds))
         self._heartbeat_task: asyncio.Task | None = None
+        # Stable per-process identity (pod hostname in k8s). The platform only
+        # honours a deregister whose instance matches the live registration, so
+        # a superseded pod's shutdown DELETE cannot wipe its replacement
+        # (rolling-update race).
+        self._instance_id = (
+            instance_id.strip()
+            or os.getenv("HOSTNAME", "").strip()
+            or uuid.uuid4().hex
+        )
 
     def _auth_headers(self) -> dict[str, str]:
+        headers = {"Agent-Instance": self._instance_id}
         if not self._registration_token:
-            return {}
+            return headers
         return {
+            **headers,
             "Agent-Secret": self._registration_token,
             "Authorization": f"Bearer {self._registration_token}",
         }
@@ -2325,10 +2337,18 @@ class RegistrationClient:
         import httpx
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.delete(
+                resp = await client.delete(
                     f"{self._platform_url}/agents/{self._manifest.agent_id}",
                     headers=self._auth_headers(),
                 )
+                if resp.status_code == 409:
+                    _log.info(
+                        "Deregister skipped; registration superseded by a newer "
+                        "instance agent_id=%s instance_id=%s",
+                        self._manifest.agent_id,
+                        self._instance_id,
+                    )
+                    return
                 _log.info("Deregistered from Platform agent_id=%s", self._manifest.agent_id)
         except Exception:
             _log.debug("Deregister failed (non-fatal)", exc_info=True)
