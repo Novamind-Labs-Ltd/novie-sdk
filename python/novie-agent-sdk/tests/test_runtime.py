@@ -236,6 +236,56 @@ async def test_registration_client_reregisters_after_heartbeat_404(monkeypatch):
     assert "http://platform/agents/register" in calls
 
 
+@pytest.mark.asyncio
+async def test_registration_client_sends_instance_identity_and_skips_superseded_409(monkeypatch):
+    """Rolling-update race: every register/deregister carries Agent-Instance,
+    and a 409 (registration superseded by a newer pod) is a graceful skip."""
+    import httpx
+
+    seen: list[tuple[str, str, dict]] = []
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):
+            seen.append(("POST", url, dict(kwargs.get("headers") or {})))
+            return _FakeHttpResponse(201)
+
+        async def delete(self, url: str, **kwargs):
+            seen.append(("DELETE", url, dict(kwargs.get("headers") or {})))
+            return _FakeHttpResponse(409)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    client = RegistrationClient(
+        "http://platform",
+        _simple_manifest("identity"),
+        instance_id="pod-1",
+        register_max_attempts=1,
+    )
+
+    await client.register()
+    await client.deregister()  # 409 must not raise
+
+    assert [(method, url) for method, url, _headers in seen] == [
+        ("POST", "http://platform/agents/register"),
+        ("DELETE", "http://platform/agents/identity"),
+    ]
+    assert all(headers.get("Agent-Instance") == "pod-1" for _m, _u, headers in seen)
+
+
+def test_registration_client_derives_instance_from_hostname(monkeypatch):
+    monkeypatch.setenv("HOSTNAME", "agent-pod-abc123")
+    client = RegistrationClient("http://platform", _simple_manifest("identity"))
+    assert client._auth_headers()["Agent-Instance"] == "agent-pod-abc123"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. InMemoryTaskStore
 # ─────────────────────────────────────────────────────────────────────────────

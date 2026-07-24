@@ -8,7 +8,7 @@ use std::{
 };
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, method, path},
+    matchers::{body_json, header, method, path},
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -85,6 +85,46 @@ async fn registration_lifecycle_calls_expected_routes() {
 
     client.register(&manifest).await.unwrap();
     client.heartbeat().await.unwrap();
+    client.deregister().await.unwrap();
+}
+
+#[tokio::test]
+async fn registration_requests_carry_instance_identity_and_tolerate_superseded_409() {
+    let server = MockServer::start().await;
+    let manifest = manifest();
+
+    // Instance identity is captured from HOSTNAME at construction time.
+    let client = {
+        let _guard = env_lock();
+        clear_registration_env();
+        unsafe {
+            std::env::set_var("HOSTNAME", "pod-rust-1");
+        }
+        let client = RegistrationClient::new(server.uri(), "registration-test");
+        unsafe {
+            std::env::remove_var("HOSTNAME");
+        }
+        client
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/agents/register"))
+        .and(header("Agent-Instance", "pod-rust-1"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Superseded pod's late DELETE: the platform answers 409 and the SDK
+    // treats it as "nothing to remove" instead of an error.
+    Mock::given(method("DELETE"))
+        .and(path("/agents/registration-test"))
+        .and(header("Agent-Instance", "pod-rust-1"))
+        .respond_with(ResponseTemplate::new(409))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.register(&manifest).await.unwrap();
     client.deregister().await.unwrap();
 }
 

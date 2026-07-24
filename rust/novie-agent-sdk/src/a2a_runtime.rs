@@ -991,12 +991,31 @@ impl OneShotInvocationStore for SqliteOneShotInvocationStore {
 // Registration client
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Stable per-process registration identity (pod hostname in k8s). The
+/// platform only honours a deregister whose instance matches the live
+/// registration, so a superseded pod's shutdown DELETE cannot wipe its
+/// replacement (rolling-update race).
+fn default_instance_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("pid{}-{}", std::process::id(), nanos)
+        })
+}
+
 /// Client for registering this agent with the Platform's Manifest Registry.
 #[derive(Clone, Debug)]
 pub struct RegistrationClient {
     registry_url: String,
     agent_id: String,
     registration_token: Option<String>,
+    instance_id: String,
     http: reqwest::Client,
 }
 
@@ -1009,6 +1028,7 @@ impl RegistrationClient {
                 .ok()
                 .or_else(|| std::env::var("NOVIE_AGENT_SECRET").ok())
                 .filter(|v| !v.trim().is_empty()),
+            instance_id: default_instance_id(),
             http: reqwest::Client::new(),
         }
     }
@@ -1022,11 +1042,13 @@ impl RegistrationClient {
             registry_url: registry_url.into(),
             agent_id: agent_id.into(),
             registration_token: registration_token.filter(|v| !v.trim().is_empty()),
+            instance_id: default_instance_id(),
             http: reqwest::Client::new(),
         }
     }
 
     fn request_with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = req.header("Agent-Instance", &self.instance_id);
         match &self.registration_token {
             Some(token) => req.header("Agent-Secret", token).bearer_auth(token),
             None => req,
@@ -1065,12 +1087,16 @@ impl RegistrationClient {
 
     pub async fn deregister(&self) -> Result<(), String> {
         let url = format!("{}/agents/{}", self.registry_url, self.agent_id);
-        self.request_with_auth(self.http.delete(&url))
+        let response = self
+            .request_with_auth(self.http.delete(&url))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
             .map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            // Registration superseded by a newer instance; nothing to remove.
+            return Ok(());
+        }
+        response.error_for_status().map_err(|e| e.to_string())?;
         Ok(())
     }
 }
