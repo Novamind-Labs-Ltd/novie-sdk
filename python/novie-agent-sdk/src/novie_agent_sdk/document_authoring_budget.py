@@ -1,4 +1,4 @@
-"""Run-level output and wall-clock guards for sectioned document authoring."""
+"""Per-call output and wall-clock guards for sectioned document authoring."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +6,11 @@ from typing import Any, Mapping
 
 
 class DocumentAuthoringBudgetExceeded(RuntimeError):
-    """Raised before a document would exceed its cumulative output allocation."""
+    """Raised when a call cannot be allocated any output tokens.
+
+    Kept for call-site compatibility. Sectioned authoring no longer maintains a
+    document-wide cumulative token pool, so this is unused on the happy path.
+    """
 
     code = "document_authoring_output_budget_exceeded"
 
@@ -19,11 +23,12 @@ class DocumentAuthoringDeadlineExceeded(TimeoutError):
 
 @dataclass(slots=True)
 class DocumentOutputBudget:
-    """Allocate a document's output ceiling across its LLM calls.
+    """Resolve the per-call completion ceiling for sectioned authoring.
 
-    ``max_output_tokens`` remains a provider call cap. This object makes the
-    effective document cap cumulative and uses the caller's remaining planned
-    slots to avoid giving the first section the whole document allowance.
+    Each LLM call should receive the current model's output top
+    (``max_output_tokens``). Skill ``max_document_output_tokens`` is a profile
+    length hint for prompts/units — not a run-wide token pool to fair-share.
+    Hard delivery size stays on ``max_document_output_bytes``.
     """
 
     total_tokens: int | None
@@ -37,23 +42,23 @@ class DocumentOutputBudget:
         *,
         contract_limit: int = 0,
     ) -> "DocumentOutputBudget":
-        per_call = _positive_int(context_budget.get("max_output_tokens"))
-        context_limit = _positive_int(context_budget.get("max_document_output_tokens"))
-        # ``max_output_tokens`` is the provider limit for one call.  It must not
-        # become the cumulative document limit: sectioned authoring deliberately
-        # makes several calls (outline, sections, summaries, and finalization).
-        # Only an explicit document limit participates in the run-wide ceiling.
-        limits = [value for value in (context_limit, contract_limit) if value]
-        total = min(limits) if limits else None
+        per_call = _positive_int(context_budget.get("max_output_tokens")) or None
+        # ponytail: ignore profile/contract token caps for reservation. They used
+        # to become a cumulative fair-share pool (medium=10k across outline +
+        # N×draft/revise/summary), which starved later sections. Upgrade path if
+        # a true document-wide ceiling returns: track actual usage, not reserved
+        # max_tokens, and enforce only at finalize.
+        _ = contract_limit
+        _ = _positive_int(context_budget.get("max_document_output_tokens"))
         return cls(
-            total_tokens=total,
+            total_tokens=None,
             per_call_tokens=per_call,
-            remaining_tokens=total,
+            remaining_tokens=None,
         )
 
     @property
     def enabled(self) -> bool:
-        return self.remaining_tokens is not None
+        return self.per_call_tokens is not None
 
     def reserve(
         self,
@@ -61,24 +66,29 @@ class DocumentOutputBudget:
         *,
         slots_remaining: int = 1,
     ) -> int | None:
-        """Reserve a bounded completion allowance for one provider call."""
-        if self.remaining_tokens is None:
-            return requested_tokens or self.per_call_tokens or None
-        if self.remaining_tokens <= 0:
-            raise DocumentAuthoringBudgetExceeded(
-                "document_authoring_output_budget_exceeded: sectioned authoring "
-                "exhausted its cumulative output-token budget"
-            )
-        requested = requested_tokens or self.per_call_tokens or self.remaining_tokens
-        fair_share = max(1, self.remaining_tokens // max(1, slots_remaining))
-        allocated = min(requested, fair_share, self.remaining_tokens)
-        self.remaining_tokens -= allocated
-        return allocated
+        """Return the completion allowance for one provider call.
+
+        ``slots_remaining`` is retained for call-site compatibility and ignored:
+        later sections must not be starved to save room for planned siblings.
+        """
+        _ = slots_remaining
+        if requested_tokens is not None:
+            requested = _positive_int(requested_tokens)
+            if requested <= 0:
+                raise DocumentAuthoringBudgetExceeded(
+                    "document_authoring_output_budget_exceeded: requested "
+                    "output-token allowance is empty"
+                )
+            if self.per_call_tokens is None:
+                return requested
+            return min(requested, self.per_call_tokens)
+        return self.per_call_tokens
 
     def metadata(self) -> dict[str, int | None]:
         return {
             "document_output_tokens_total": self.total_tokens,
             "document_output_tokens_remaining": self.remaining_tokens,
+            "per_call_output_tokens": self.per_call_tokens,
         }
 
 
