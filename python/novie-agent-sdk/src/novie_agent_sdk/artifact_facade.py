@@ -74,8 +74,12 @@ class ArtifactResult:
         }
 
     def to_stream_event(self) -> dict[str, Any]:
-        """Shape yielded as the final stream event before the SDK
-        appends ``{"kind": "done", "output": {}}``."""
+        """Shape yielded before the SDK appends ``kind=done``.
+
+        The runtime copies this artifact into ``done.output`` so platform
+        stream consumers (which only merge the terminal done/final output)
+        receive the same payload as ``/invoke``.
+        """
         return self.to_invoke_output()
 
 

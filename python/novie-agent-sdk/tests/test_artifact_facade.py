@@ -515,6 +515,13 @@ async def test_stream_endpoint_emits_progress_then_artifact_then_done() -> None:
     assert artifact_event["artifact_type"] == "market_report"
     assert artifact_event["summary"] == "Market report complete"
     assert artifact_event["metadata"] == {"confidence": "medium"}
+    # Platform stream consumers only merge done.output — sentinel must carry
+    # the artifact payload (empty done.output previously dropped products).
+    done_event = events[done_idx]
+    assert done_event["output"]["kind"] == "artifact"
+    assert done_event["output"]["artifact_type"] == "market_report"
+    assert done_event["output"]["content"] == "hello"
+    assert done_event["output"]["summary"] == "Market report complete"
 
 
 @pytest.mark.asyncio
