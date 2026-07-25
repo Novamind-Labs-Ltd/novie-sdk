@@ -1466,9 +1466,34 @@ def _sanitized_replay_events(events: list[Any]) -> list[dict[str, Any]]:
     return safe_events
 
 
+def _terminal_output_from_stream_events(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pick the structured result the platform reads from ``done.output``.
+
+    ArtifactAgent emits ``kind=artifact`` then the runtime appends an empty
+    ``kind=done`` sentinel. Platform stream consumers only merge
+    ``last_event["output"]`` from the terminal done/final event, so the
+    sentinel must carry the last artifact (or an earlier non-empty output).
+    """
+    artifact_output: dict[str, Any] = {}
+    final_output: dict[str, Any] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("kind") or event.get("type") or "").strip().lower()
+        if kind == "artifact":
+            artifact_output = dict(event)
+            continue
+        if kind in {"done", "final", "task_completed"}:
+            output = event.get("output")
+            if isinstance(output, dict) and output:
+                final_output = dict(output)
+    return final_output or artifact_output
+
+
 def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     chunks: list[str] = []
-    final_output: dict[str, Any] = {}
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -1480,11 +1505,8 @@ def _stream_response_from_events(events: list[dict[str, Any]]) -> dict[str, Any]
             text = str(event.get("content") or event.get("text") or "")
             if text:
                 chunks.append(text)
-        if kind in {"done", "final", "task_completed"}:
-            output = event.get("output")
-            if isinstance(output, dict) and output:
-                final_output = dict(output)
     transcript = "".join(chunks)
+    final_output = _terminal_output_from_stream_events(events)
     return {
         "status": "completed",
         "output": {
@@ -2953,9 +2975,14 @@ class Agent:
                             yield (json.dumps(event) + "\n").encode()
                             await _maybe_heartbeat()
                         if not terminal_error_emitted:
+                            # Platform A2A stream only reads done/final.output.
+                            # Lift ArtifactAgent's kind=artifact into the sentinel
+                            # so structured products are not dropped.
                             done_event = {
                                 "kind": "done",
-                                "output": {},
+                                "output": _terminal_output_from_stream_events(
+                                    emitted_events
+                                ),
                                 "metadata": {"terminal_source": "sdk_sentinel"},
                             }
                             emitted_events.append(done_event)
