@@ -594,9 +594,11 @@ Purpose:
 - Builds bounded evidence packs from upstream/workpad refs for each section.
 - Applies a generic section quality gate before recording drafts, including exact planned-heading presence, minimum information units, process-language rejection, and evidence-ref checks.
 - Repairs missing planned Markdown headings before the quality gate so an otherwise valid section is not failed because the model used a different heading.
-- Treats the effective output allowance as one document-wide cumulative budget,
-  shared fairly by section drafts, summaries, and finalization; a skill length
-  profile can declare a stricter `max_document_output_tokens` cap.
+- Allocates each section/summary/finalize LLM call at the current model output
+  top (`context_budget.max_output_tokens`). Skill `max_document_output_tokens`
+  is a length-profile hint for prompts/units, not a run-wide token pool to
+  fair-share across calls. Hard delivery size stays on
+  `max_document_output_bytes`.
 - Accepts an absolute `wall_clock_deadline` in both finalization runners and
   surfaces `document_authoring_deadline_exceeded` without converting it into a
   generic agent-runtime crash. When the final polish has no budget left, it

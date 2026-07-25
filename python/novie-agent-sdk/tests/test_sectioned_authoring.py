@@ -728,7 +728,8 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         capability_id="agent.example.write_document",
         context_budget={
             "max_output_tokens": 64000,
-            "max_document_output_tokens": 64000,
+            # Profile document caps must not fair-share or shrink per-call tops.
+            "max_document_output_tokens": 10000,
         },
         authoring_contract={
             "coverage_model": "example_document",
@@ -738,6 +739,7 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
             "default_section_words": 5,
             "max_section_words": 20,
             "final_retention_ratio": 0.8,
+            "max_document_output_tokens": 10000,
         },
     )
 
@@ -749,13 +751,11 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         agent_id="writer",
     )
 
-    # Two section drafts and final polish share one document allocation. The
-    # first two calls receive an equal share, preserving the last share for
-    # finalization instead of multiplying the run budget three times.
+    # Two section drafts and final polish each get the model output top.
     assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        21333,
-        21333,
-        21334,
+        64000,
+        64000,
+        64000,
     ]
 
 
@@ -1406,6 +1406,7 @@ def _stitch_author(
     *,
     phase_events: list[dict[str, Any]],
     contract_extra: dict[str, Any] | None = None,
+    context_budget: dict[str, Any] | None = None,
 ) -> SectionedLongformAuthor:
     contract: dict[str, Any] = {
         "coverage_model": "example_document",
@@ -1419,6 +1420,7 @@ def _stitch_author(
         artifact_type="example_document",
         step_id="s1",
         capability_id="agent.example.write_document",
+        context_budget=context_budget,
         authoring_contract=contract,
         phase_event_sink=phase_events.append,
     )
@@ -1465,13 +1467,14 @@ async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
 
 
 @pytest.mark.asyncio
-async def test_boundary_stitch_shares_remaining_budget_across_all_seams() -> None:
+async def test_boundary_stitch_keeps_full_per_call_allowance_for_each_seam() -> None:
     phase_events: list[dict[str, Any]] = []
     llm = _BridgeLlm(bridge="Next.")
     author = _stitch_author(
         llm,
         phase_events=phase_events,
         contract_extra={"max_document_output_tokens": 400},
+        context_budget={"max_output_tokens": 64000},
     )
     drafts = [
         SectionDraft(
@@ -1489,41 +1492,13 @@ async def test_boundary_stitch_shares_remaining_budget_across_all_seams() -> Non
 
     assert all(draft.markdown in result for draft in drafts)
     assert len(llm.chat_kwargs) == 3
-    assert sum(item["max_output_tokens"] for item in llm.chat_kwargs) == 400
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_degrades_when_budget_exhausts_mid_finalize() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm(bridge="Optional bridge.")
-    author = _stitch_author(
-        llm,
-        phase_events=phase_events,
-        contract_extra={"max_document_output_tokens": 1},
-    )
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id=f"s{index}", title=f"Section {index}"),
-            markdown=f"## Section {index}\n\nBody {index}.",
-        )
-        for index in range(1, 4)
-    ]
-
-    result = await author._boundary_stitch_final(
-        brief={"title": "Doc"},
-        drafts=drafts,
-        combined="\n\n".join(draft.markdown for draft in drafts),
-    )
-
-    assert all(draft.markdown in result for draft in drafts)
-    assert len(llm.chat_kwargs) == 1
-    exhausted = [
-        event
+    # Seam bridges request 200 tokens each; profile document caps must not
+    # fair-share or starve later seams.
+    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [200, 200, 200]
+    assert not any(
+        event["event"] == "document.final.output_budget_exhausted"
         for event in phase_events
-        if event["event"] == "document.final.output_budget_exhausted"
-    ]
-    assert exhausted
-    assert all(event["phase"] == "boundary_stitch" for event in exhausted)
+    )
 
 
 @pytest.mark.asyncio
