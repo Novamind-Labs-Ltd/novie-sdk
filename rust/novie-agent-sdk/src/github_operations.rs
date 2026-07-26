@@ -6,6 +6,10 @@
 use crate::error::{Error, Result};
 use serde_json::{Map, Value, json};
 
+const GITHUB_OPERATION_MAX_ATTEMPTS: usize = 3;
+const GITHUB_OPERATION_BASE_BACKOFF_MS: u64 = 200;
+const GITHUB_OPERATION_MAX_BACKOFF_MS: u64 = 1_000;
+
 #[derive(Debug)]
 pub struct GitHubOperationsClient {
     base_url: String,
@@ -384,15 +388,31 @@ impl GitHubOperationsClient {
             self.agent_run_id, operation
         );
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.runtime_token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&compact(payload))
-            .send()
-            .await?;
-        parse_gateway_response(response).await
+        let payload = compact(payload);
+        for attempt in 0..GITHUB_OPERATION_MAX_ATTEMPTS {
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.runtime_token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&payload)
+                .send()
+                .await;
+            let result = match response {
+                Ok(response) => parse_gateway_response(response).await,
+                Err(err) => Err(Error::from(err)),
+            };
+            match result {
+                Err(err) if err.is_retryable() && attempt + 1 < GITHUB_OPERATION_MAX_ATTEMPTS => {
+                    let backoff_ms = err
+                        .retry_after_ms()
+                        .unwrap_or_else(|| github_operation_backoff_ms(attempt));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+                other => return other,
+            }
+        }
+        unreachable!("github operation retry loop always returns");
     }
 }
 
@@ -447,7 +467,7 @@ fn map_gateway_error(status: u16, envelope: &Value) -> Error {
         503 => Error::Unavailable {
             message,
             code: Some(code),
-            retry_after_ms: None,
+            retry_after_ms: detail.get("retry_after_ms").and_then(Value::as_u64),
             http_status: Some(status),
             callback_id: None,
         },
@@ -458,6 +478,13 @@ fn map_gateway_error(status: u16, envelope: &Value) -> Error {
             callback_id: None,
         },
     }
+}
+
+fn github_operation_backoff_ms(attempt: usize) -> u64 {
+    let multiplier = 1_u64 << attempt.min(3);
+    GITHUB_OPERATION_BASE_BACKOFF_MS
+        .saturating_mul(multiplier)
+        .min(GITHUB_OPERATION_MAX_BACKOFF_MS)
 }
 
 fn compact(value: Value) -> Value {
