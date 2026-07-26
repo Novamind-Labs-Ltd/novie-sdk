@@ -18,9 +18,11 @@ from novie_agent_sdk import (
 )
 from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
+    _HEADING_RE,
     _compact_markdown_to_utf8_limit,
     _llm_stream_event_delta,
     _llm_stream_event_result,
+    _section_structure_violation,
 )
 
 
@@ -2019,6 +2021,13 @@ async def test_single_polish_with_glued_heading_returns_validated_drafts() -> No
     ]
     assert len(fallback) == 1
     assert fallback[0]["expected_section_titles"] == ["Context", "Findings"]
+    # The reason names which check fired, so production tells us whether glued
+    # headings actually occur or the reordering check does all the work. This
+    # case is a glued heading (see the test name); it previously reported
+    # "missing_or_reordered_section_headings" because a glued level-two heading
+    # also breaks the outline comparison — accurate about the fallback, but
+    # misleading about the cause.
+    assert fallback[0]["reason"] == "glued_heading"
 
 
 @pytest.mark.asyncio
@@ -2215,3 +2224,54 @@ async def test_recorded_sections_never_carry_artifact_read_scaffolding() -> None
         assert "[artifact art-906227eab30943de]" not in str(entry.get("content") or "")
         assert "mode=chunks" not in str(entry.get("content") or "")
         assert "[artifact art-906227eab30943de]" not in str(entry.get("summary") or "")
+
+
+def _structure_drafts() -> list[Any]:
+    from types import SimpleNamespace
+
+    return [
+        SimpleNamespace(plan=SimpleNamespace(title="Context"), markdown=""),
+        SimpleNamespace(plan=SimpleNamespace(title="Findings"), markdown=""),
+    ]
+
+
+def test_structure_guard_rejects_a_glued_level_two_heading() -> None:
+    assert _section_structure_violation(
+        "## Context\n\nBody text.## Findings\n\nMore.",
+        _structure_drafts(),
+    ) == "glued_heading"
+
+
+def test_structure_guard_rejects_a_glued_subheading() -> None:
+    """The outline check alone misses this: the level-two list is unchanged.
+
+    A glued `### Detail` renders as body text, which is exactly the "heading
+    lost its line break" defect readers report.
+    """
+    glued = "## Context\n\nBody text.### Detail\n\n## Findings\n\nMore."
+
+    # The level-two outline still looks perfect, which is why the outline
+    # comparison on its own cannot catch this.
+    assert [
+        m.group(1)
+        for m in _HEADING_RE.finditer(glued)
+        if len(m.group(0)) - len(m.group(0).lstrip("#")) == 2
+    ] == ["Context", "Findings"]
+
+    assert _section_structure_violation(glued, _structure_drafts()) == "glued_heading"
+
+
+def test_structure_guard_accepts_well_formed_markdown() -> None:
+    assert _section_structure_violation(
+        "## Context\n\nBody text.\n\n### Detail\n\nMore.\n\n## Findings\n\nEnd.",
+        _structure_drafts(),
+    ) is None
+
+
+def test_structure_guard_tolerates_prose_that_mentions_hashes() -> None:
+    """A false positive costs the polish, so the pattern stays conservative."""
+    for body in (
+        "## Context\n\nWe use C# and F# heavily.\n\n## Findings\n\nThe ## marker is syntax.",
+        "## Context\n\n| col | ## odd |\n| --- | --- |\n\n## Findings\n\nSee issue # 42.",
+    ):
+        assert _section_structure_violation(body, _structure_drafts()) is None, body
