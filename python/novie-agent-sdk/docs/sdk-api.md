@@ -467,6 +467,36 @@ Purpose:
 
 - Converts a platform artifact read envelope into a stable string.
 - Useful for tests or custom readers.
+- The header it emits comes from `artifact_read_header`, and is prompt
+  scaffolding — never deliverable prose.
+
+### `scrub_artifact_scaffolding`
+
+Import:
+
+```python
+from novie_agent_sdk import scrub_artifact_scaffolding
+```
+
+Purpose:
+
+- Removes agent-internal artifact-read scaffolding (`[artifact art-x] mode=y`
+  header lines) from text that is about to become a deliverable.
+- Returns `ScrubbedText(text, removed)`; text with no marker is returned
+  unchanged.
+
+You rarely call this directly. The SDK already applies it at two points:
+
+- `SectionedLongformAuthor` scrubs each section as the draft is accepted, so
+  the quality gate, the section summary and the final merge all see clean text.
+- `ArtifactLedger.create_artifact` / `create_and_record` scrub textual content
+  and summaries on write, as the backstop for any other authoring path.
+
+Structured payloads (`application/json` and other non-textual content types)
+are written verbatim.
+
+A removal is logged at WARNING level: a model copying its tool observation into
+a draft is a prompt-hygiene defect, and the scrub is a safety net, not a cure.
 
 ### `ArtifactReadCache`
 

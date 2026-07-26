@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 from novie_protocol.agents import AgentStreamEvent
 
 from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
+from .artifact_text import scrub_artifact_scaffolding
 from .context_budget import wall_clock_deadline as context_wall_clock_deadline
 from .document_authoring_budget import (
     DocumentAuthoringBudgetExceeded,
@@ -1413,9 +1414,17 @@ class SectionedLongformAuthor:
                         + ",".join(quality.failures)
                     )
                 # Graceful degradation: soft, evidence-bound gate failures must
-                # not dead-end the plan. Record the best-effort section with an
-                # explicit gap marker and continue so the deliverable completes.
-                markdown = _append_quality_gap_note(markdown, quality.soft_failures)
+                # not dead-end the plan. Record the best-effort section and
+                # continue so the deliverable completes.
+                #
+                # The degradation is reported structurally only — via the
+                # `document.section.quality_degraded` event, the `degraded` /
+                # `degraded_sections` result metadata below, and
+                # `quality.to_metadata()`. It is deliberately NOT written into
+                # the section markdown: internal gate identifiers
+                # ("artifact_only_citations", "missing_confidence_layer") are
+                # reviewer vocabulary, and the reader of the deliverable is not
+                # the reviewer. Surfacing it in the UI is the consumer's call.
                 quality = SectionQualityGateResult(
                     failures=quality.failures,
                     information_units=quality.information_units,
@@ -2103,7 +2112,17 @@ class SectionedLongformAuthor:
         content = streamed.text.strip()
         if not content:
             return "", streamed.truncated
-        return _isolate_requested_section(content, plan.title), streamed.truncated
+        # Scrub at the point the draft is accepted, not only on the way to
+        # storage: the quality gate, the section preview/summary and the final
+        # merge all derive from this text. `_preview` in particular flattens
+        # newlines, which would turn a copied tool-observation header into an
+        # inline substring that the line-anchored scrub can no longer see.
+        # `ArtifactLedger` still scrubs on write as the universal backstop for
+        # authoring paths that do not come through here.
+        section = scrub_artifact_scaffolding(
+            _isolate_requested_section(content, plan.title)
+        ).text
+        return section, streamed.truncated
 
     async def _bounded_for_final_prompt(
         self,
@@ -3361,22 +3380,3 @@ def _ratio(value: Any, default: float) -> float:
 def _gate_enforcement(value: Any) -> str:
     raw = str(value or "").strip().lower()
     return raw if raw in _GATE_ENFORCEMENT_MODES else _GATE_ENFORCEMENT_DEGRADE
-
-
-def _append_quality_gap_note(markdown: str, soft_failures: tuple[str, ...]) -> str:
-    """Append an explicit, reader-visible gap marker to a degraded section.
-
-    Keeps the deliverable honest: the section is recorded best-effort, but the
-    unmet quality dimensions are surfaced so downstream readers (and the merge
-    step) treat the affected claims as provisional rather than confirmed.
-    """
-    text = str(markdown or "").rstrip()
-    if not soft_failures:
-        return text
-    reasons = ", ".join(soft_failures)
-    note = (
-        "\n\n> **Evidence gap (auto-flagged):** this section did not meet the "
-        f"full quality bar ({reasons}). Treat the affected claims as "
-        "provisional pending stronger evidence."
-    )
-    return f"{text}{note}"

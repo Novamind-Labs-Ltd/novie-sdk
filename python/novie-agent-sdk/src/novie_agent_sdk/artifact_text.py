@@ -3,9 +3,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 
 class ArtifactReadCache:
@@ -239,6 +240,69 @@ def artifact_read_cache_key(
     )
 
 
+def artifact_read_header(artifact_id: str, mode: str) -> str:
+    """Build the prompt-context header that precedes a rendered artifact read.
+
+    The header exists so the model can tell a retrieved excerpt apart from its
+    own reasoning. It is scaffolding for the prompt, never deliverable prose.
+
+    Defined next to :func:`scrub_artifact_scaffolding` on purpose: the emitter
+    and the remover share one definition of the shape, so a change to the
+    header cannot silently outlive the pattern that strips it.
+    """
+    return f"[artifact {artifact_id}] mode={mode}"
+
+
+# Matches exactly what `artifact_read_header` emits, anchored to a whole line.
+# A model that copies its tool observation into a draft reproduces the header
+# on its own line; a stray "[artifact ...]" inside a sentence is left alone.
+_ARTIFACT_READ_HEADER_LINE_RE = re.compile(
+    r"^[ \t]*\[artifact [^\]\r\n]+\][ \t]*mode=[A-Za-z0-9_.-]+[ \t]*(?:\r?\n|\Z)",
+    re.MULTILINE,
+)
+
+
+class ScrubbedText(NamedTuple):
+    """Result of :func:`scrub_artifact_scaffolding`."""
+
+    text: str
+    removed: int
+
+
+def scrub_artifact_scaffolding(value: Any) -> ScrubbedText:
+    """Remove agent-internal artifact-read scaffolding from deliverable text.
+
+    Models sometimes copy their own tool observation into a draft, so the
+    finished document ends up carrying lines like::
+
+        [artifact art-906227eab30943de] mode=chunks
+
+    That is prompt plumbing and must not reach a reader. Prompt wording and
+    drafting instructions reduce the behaviour but cannot guarantee it, so the
+    deliverable write path scrubs deterministically as a last line of defence.
+
+    This is not semantic classification — it removes a marker this package
+    itself emits, in a shape this module defines. Only the unambiguous
+    machine-generated header is stripped. The renderer's other labels
+    ("Summary:", "Metadata:", "Content:") are ordinary English that authors use
+    legitimately, so they are deliberately left in place: a false positive here
+    would corrupt real prose, which is worse than the leak being fixed.
+
+    Returns the cleaned text and how many markers were removed. Text with no
+    marker is returned byte-for-byte unchanged.
+    """
+    text = str(value or "")
+    if not text:
+        return ScrubbedText(text="", removed=0)
+    cleaned, removed = _ARTIFACT_READ_HEADER_LINE_RE.subn("", text)
+    if not removed:
+        return ScrubbedText(text=text, removed=0)
+    # Markdown collapses consecutive blank lines, so the gap a removed header
+    # leaves behind renders identically — no need to re-flow the document and
+    # risk gluing a heading onto the preceding paragraph.
+    return ScrubbedText(text=cleaned.strip(), removed=removed)
+
+
 def format_artifact_read_result(data: dict[str, Any]) -> str:
     """Render platform.artifacts.read output as prompt-safe text.
 
@@ -252,7 +316,7 @@ def format_artifact_read_result(data: dict[str, Any]) -> str:
         message = str(data.get("message") or data.get("error") or "not available")
         return f"Artifact {artifact_id} is unavailable: {message}"
 
-    lines = [f"[artifact {artifact_id}] mode={mode}"]
+    lines = [artifact_read_header(artifact_id, mode)]
     if summary := data.get("summary"):
         lines.append(f"Summary:\n{summary}")
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
@@ -472,10 +536,13 @@ def _extract_nested_artifact_payload(payload: dict[str, Any]) -> Any | None:
 __all__ = [
     "ArtifactReadCache",
     "ArtifactReader",
+    "ScrubbedText",
     "artifact_read_cache_key",
+    "artifact_read_header",
     "decode_artifact_text",
     "format_artifact_read_result",
     "normalize_artifact_id",
     "render_artifact_text",
     "render_json_artifact",
+    "scrub_artifact_scaffolding",
 ]

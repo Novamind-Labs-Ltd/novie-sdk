@@ -1058,8 +1058,9 @@ def test_unique_sources_gate_fails_when_fewer_sources_cited_than_available() -> 
 
 @pytest.mark.asyncio
 async def test_sectioned_author_degrades_soft_gate_failure_instead_of_raising() -> None:
-    """Default ``degrade`` enforcement records a best-effort section with a gap
-    marker for soft failures rather than dead-ending the plan."""
+    """Default ``degrade`` enforcement records a best-effort section for soft
+    failures rather than dead-ending the plan, and reports the degradation
+    through structured metadata only — never in the reader-facing markdown."""
     platform = _FakePlatform()
     phase_events: list[dict[str, Any]] = []
     author = SectionedLongformAuthor(
@@ -1093,7 +1094,17 @@ async def test_sectioned_author_degrades_soft_gate_failure_instead_of_raising() 
     assert result.ledger["degraded"] is True
     assert result.ledger["degraded_sections"]
     assert all(draft.quality["degraded"] is True for draft in result.drafts)
-    assert "Evidence gap (auto-flagged)" in result.drafts[0].markdown
+    # The deliverable stays clean: internal gate vocabulary is reviewer-facing,
+    # not reader-facing.
+    for draft in result.drafts:
+        assert "Evidence gap (auto-flagged)" not in draft.markdown
+        assert "missing_confidence_layer" not in draft.markdown
+
+    # ...but the reason is not lost — it must still reach consumers structurally.
+    assert any(
+        "missing_confidence_layer" in section["failures"]
+        for section in result.ledger["degraded_sections"]
+    )
     assert "document.section.quality_degraded" in [e["event"] for e in phase_events]
     quality_events = [
         event
@@ -1871,8 +1882,13 @@ async def test_truncated_section_draft_fails_gate_retries_then_degrades() -> Non
         "cut off at the output length limit" in prompt
         for prompt in revision_prompts
     )
-    # Degrade enforcement ships the section, but the gap note names the cut.
-    assert "output_truncated" in result.markdown
+    # Degrade enforcement ships the section, and names the cut structurally —
+    # the internal gate identifier must not leak into the reader-facing text.
+    assert "output_truncated" not in result.markdown
+    assert any(
+        "output_truncated" in section["failures"]
+        for section in result.ledger["degraded_sections"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2110,3 +2126,92 @@ async def test_boundary_stitch_drops_truncated_bridge() -> None:
     assert seam_events[0]["truncated"] is True
     assert seam_events[0]["bridged"] is False
     assert seam_events[0]["status"] == "degraded"
+
+
+class _ScaffoldLeakingLlm(_FakeLlm):
+    """A model that copies its artifact-read tool observation into the draft."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.leaked: list[str] = []
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        result = await super().chat(
+            messages=messages, temperature=temperature, **kwargs
+        )
+        content = result.get("content") or ""
+        if content.startswith("## "):
+            heading, _, body = content.partition("\n\n")
+            content = (
+                f"{heading}\n\n"
+                "[artifact art-906227eab30943de] mode=chunks\n\n"
+                f"{body}"
+            )
+            self.leaked.append(content)
+        return {**result, "content": content}
+
+
+@pytest.mark.asyncio
+async def test_recorded_sections_never_carry_artifact_read_scaffolding() -> None:
+    """End-to-end: the egress seam holds through the real authoring path.
+
+    Prompt wording cannot guarantee a model won't echo its tool observation, so
+    what actually protects the deliverable is the scrub on the write path. This
+    drives the full author -> record flow with a model that always leaks.
+    """
+    platform = _FakePlatform()
+    llm = _ScaffoldLeakingLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "final_retention_ratio": 0.8,
+            "outline_artifact_type": "example_document.outline",
+            "section_artifact_type": "example_document.section",
+            "final_artifact_type": "example_document",
+        },
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    # The model really did leak, so this test would pass vacuously otherwise.
+    assert llm.leaked
+    assert all("[artifact art-906227eab30943de]" in text for text in llm.leaked)
+
+    # Scrubbed at acceptance, so the in-memory drafts are clean as well — the
+    # quality gate and the final merge never see the scaffolding.
+    for draft in result.drafts:
+        assert "[artifact art-906227eab30943de]" not in draft.markdown
+    assert "[artifact art-906227eab30943de]" not in result.markdown
+
+    markdown_artifacts = [
+        entry
+        for entry in platform.artifacts.created
+        if str(entry.get("content_type") or "").startswith("text/")
+    ]
+    assert markdown_artifacts
+    for entry in markdown_artifacts:
+        assert "[artifact art-906227eab30943de]" not in str(entry.get("content") or "")
+        assert "mode=chunks" not in str(entry.get("content") or "")
+        assert "[artifact art-906227eab30943de]" not in str(entry.get("summary") or "")

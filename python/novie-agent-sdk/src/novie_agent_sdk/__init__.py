@@ -214,9 +214,12 @@ from .llm_contract import (
 from .artifact_text import (
     ArtifactReadCache,
     ArtifactReader,
+    ScrubbedText,
     artifact_read_cache_key,
+    artifact_read_header,
     format_artifact_read_result,
     normalize_artifact_id,
+    scrub_artifact_scaffolding,
 )
 from .runtime_config import (
     agent_run_id,
@@ -535,8 +538,11 @@ __all__ = [
     "build_github_operations_client",
     "ArtifactReadCache",
     "ArtifactReader",
+    "ScrubbedText",
     "artifact_read_cache_key",
+    "artifact_read_header",
     "format_artifact_read_result",
+    "scrub_artifact_scaffolding",
     "DEFAULT_HANDOFF_MAX_BYTES",
     "TERMINAL_DELIVERABLE",
     "UPSTREAM_HANDOFF",

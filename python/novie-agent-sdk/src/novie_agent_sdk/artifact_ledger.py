@@ -7,9 +7,59 @@ platform write/read loops.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from .artifact_text import scrub_artifact_scaffolding
+
+_log = logging.getLogger(__name__)
+
+# Content types whose payload is prose a human will read. Structured payloads
+# (JSON, YAML, binary) are written verbatim: they are machine data, and a
+# marker-shaped substring inside them would be content, not scaffolding.
+_TEXTUAL_CONTENT_TYPES = ("text/", "application/markdown")
+
+
+def _scrub_deliverable_content(
+    content: Any,
+    *,
+    content_type: str,
+    artifact_type: str,
+) -> Any:
+    """Strip agent-internal scaffolding on the way into durable storage.
+
+    This is the deliverable egress backstop. Every artifact this SDK writes
+    passes through :meth:`ArtifactLedger.create_artifact`, which makes it the
+    last point where "agent working text" becomes "stored deliverable".
+
+    It is a backstop rather than the only defence because scrubbing here alone
+    is not sufficient: callers derive an artifact ``summary`` from the raw draft
+    with a preview helper that flattens newlines, which turns a copied
+    tool-observation header into an inline substring the line-anchored pattern
+    can no longer recognize. Authoring paths therefore scrub as the draft is
+    accepted (see ``SectionedLongformAuthor._draft_section``), and this layer
+    catches whatever reaches storage by another route.
+
+    A removal is logged rather than swallowed: a model copying its tool
+    observation into a draft is a prompt-hygiene defect worth seeing, and a
+    silent scrub would hide the regression it is compensating for.
+    """
+    if not isinstance(content, str) or not content:
+        return content
+    if not str(content_type or "").strip().lower().startswith(_TEXTUAL_CONTENT_TYPES):
+        return content
+    scrubbed = scrub_artifact_scaffolding(content)
+    if not scrubbed.removed:
+        return content
+    _log.warning(
+        "Stripped %d artifact-read scaffolding marker(s) from %s content before "
+        "persisting; the model copied a tool observation into its draft.",
+        scrubbed.removed,
+        artifact_type or "artifact",
+    )
+    return scrubbed.text
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +170,14 @@ class ArtifactLedger:
         create = getattr(self._artifacts, "create", None)
         if not callable(create):
             return {"available": False, "error": "artifact_create_unavailable"}
+        content = _scrub_deliverable_content(
+            content,
+            content_type=content_type,
+            artifact_type=artifact_type,
+        )
+        # The summary is reader-facing too, and callers derive it from the raw
+        # draft, so it can carry the marker even when the body is clean.
+        summary = scrub_artifact_scaffolding(summary).text if summary else summary
         result = await create(
             artifact_type=artifact_type,
             content=content,
@@ -187,6 +245,15 @@ class ArtifactLedger:
         workpad_metadata: Mapping[str, Any] | None = None,
         strict: bool = False,
     ) -> dict[str, Any]:
+        # Scrub before `create_artifact` as well as inside it, so the workpad
+        # preview computed below is derived from the same clean text the
+        # artifact stores. The inner call then finds nothing left to remove.
+        content = _scrub_deliverable_content(
+            content,
+            content_type=content_type,
+            artifact_type=artifact_type,
+        )
+        summary = scrub_artifact_scaffolding(summary).text if summary else summary
         artifact = await self.create_artifact(
             artifact_type=artifact_type,
             content=content,

@@ -334,3 +334,74 @@ async def test_evidence_pack_builder_ignores_empty_wiki_or_artifact_bodies() -> 
 
     assert [item.artifact_id for item in pack.items] == ["art-handoff"]
     assert "empty_evidence_ignored" in pack.warnings
+
+
+@pytest.mark.asyncio
+async def test_create_and_record_strips_artifact_scaffolding_from_deliverable() -> None:
+    """The write path is the egress seam: prompt plumbing must not be stored.
+
+    A model that copies its own tool observation into a draft reproduces the
+    `[artifact ...] mode=...` header the SDK renders for prompt context.
+    """
+    platform = _Platform()
+    ledger = ArtifactLedger(platform)
+
+    draft = (
+        "## Findings\n\n"
+        "[artifact art-906227eab30943de] mode=chunks\n\n"
+        "Revenue grew 12% year over year.\n"
+    )
+
+    await ledger.create_and_record(
+        artifact_type="management_report.section",
+        content=draft,
+        kind="section_draft",
+        title="Findings",
+        summary="[artifact art-906227eab30943de] mode=chunks\n\nFindings summary",
+        workflow_id="wf-1",
+    )
+
+    stored = platform.artifacts.created[0]["content"]
+    assert "[artifact art-906227eab30943de]" not in stored
+    assert "mode=chunks" not in stored
+    # Real content survives untouched on both sides of the removed marker.
+    assert "## Findings" in stored
+    assert "Revenue grew 12% year over year." in stored
+
+    # The summary is reader-facing too and is derived from the raw draft.
+    assert "[artifact" not in platform.artifacts.created[0]["summary"]
+    assert "Findings summary" in platform.artifacts.created[0]["summary"]
+
+    # The workpad preview must come from the same clean text.
+    assert "[artifact" not in platform.workpads.entries[0]["content_preview"]
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_leaves_structured_payloads_untouched() -> None:
+    """JSON payloads are machine data — a marker-shaped substring is content."""
+    platform = _Platform()
+    ledger = ArtifactLedger(platform)
+
+    payload = '{"note": "[artifact art-1] mode=chunks"}'
+    await ledger.create_artifact(
+        artifact_type="analysis.payload",
+        content=payload,
+        content_type="application/json",
+    )
+
+    assert platform.artifacts.created[0]["content"] == payload
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_leaves_clean_markdown_byte_for_byte() -> None:
+    """No marker present means no rewriting at all — not even whitespace."""
+    platform = _Platform()
+    ledger = ArtifactLedger(platform)
+
+    body = "\n## Findings\n\nRevenue grew.\n\n"
+    await ledger.create_artifact(
+        artifact_type="management_report.section",
+        content=body,
+    )
+
+    assert platform.artifacts.created[0]["content"] == body
