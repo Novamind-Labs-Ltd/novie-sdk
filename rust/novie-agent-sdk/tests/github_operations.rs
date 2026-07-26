@@ -103,6 +103,48 @@ async fn ref_calls_run_scoped_gateway() {
 }
 
 #[tokio::test]
+async fn ref_retries_on_platform_unavailable_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agent-runs/run-1/github/operations/ref"))
+        .and(bearer_token("runtime-token"))
+        .and(body_json(json!({
+            "repositoryFullName": "org/repo",
+            "ref": "heads/main"
+        })))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "detail": {
+                "error": "platform_unavailable",
+                "message": "gateway restarting",
+                "retry_after_ms": 1
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/agent-runs/run-1/github/operations/ref"))
+        .and(bearer_token("runtime-token"))
+        .and(body_json(json!({
+            "repositoryFullName": "org/repo",
+            "ref": "heads/main"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "ref": "refs/heads/main",
+                "treeSha": "tree-sha-after-retry"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = GitHubOperationsClient::new(server.uri(), "runtime-token", "run-1").unwrap();
+    let result = client.ref_("org/repo", "heads/main").await.unwrap();
+
+    assert_eq!(result["treeSha"], "tree-sha-after-retry");
+}
+
+#[tokio::test]
 async fn update_pull_request_branch_calls_run_scoped_gateway() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
