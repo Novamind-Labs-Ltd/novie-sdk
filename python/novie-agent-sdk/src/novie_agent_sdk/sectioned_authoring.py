@@ -35,6 +35,17 @@ _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_-]*")
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+# An ATX heading welded directly onto the end of a paragraph line
+# ("...viability.## Findings"), which markdown renders as body text because the
+# hashes are not at a line start.
+#
+# Deliberately narrow. The leading class excludes `#` so a legitimate
+# line-start "### Title" cannot match itself, and excludes whitespace so prose
+# that merely mentions "the ## marker", a table cell "| ## |", or "C# and F#"
+# are all left alone. Requiring the hashes to touch the preceding character
+# matches the failure actually observed from a final polish and keeps the
+# pattern free of false positives on ordinary writing.
+_GLUED_HEADING_RE = re.compile(r"[^#\s]#{2,6}[ \t]+\S")
 _INTERNAL_PROCESS_RE = re.compile(
     r"(compact upstream|compact handoff|evidence pack|tool status|"
     r"now writing|now draft|fetch_artifact|raw json|"
@@ -2193,11 +2204,12 @@ class SectionedLongformAuthor:
                 drafts=drafts,
                 combined=combined,
             )
-        if not _preserves_section_structure(finalized, drafts):
+        violation = _section_structure_violation(finalized, drafts)
+        if violation is not None:
             await self._emit(
                 "document.final.structure_fallback",
                 status="degraded",
-                reason="finalized_markdown_missing_or_reordered_section_headings",
+                reason=violation,
                 expected_section_titles=[draft.plan.title for draft in drafts],
             )
             finalized = combined
@@ -2283,7 +2295,7 @@ class SectionedLongformAuthor:
                 candidate
                 and not streamed.truncated
                 and not self._exceeds_final_output_byte_limit(candidate)
-                and _preserves_section_structure(candidate, drafts)
+                and _section_structure_violation(candidate, drafts) is None
             ):
                 compacted = candidate
                 strategy = "llm"
@@ -3126,24 +3138,47 @@ def _join_markdown(items: Any) -> str:
     return "\n\n".join(str(item or "").strip() for item in items if str(item or "").strip())
 
 
-def _preserves_section_structure(markdown: str, drafts: list[SectionDraft]) -> bool:
-    """Require a final rewrite to retain every planned level-two heading.
+def _section_structure_violation(
+    markdown: str, drafts: list[SectionDraft]
+) -> str | None:
+    """Name the structural defect in a final rewrite, or ``None`` if it is sound.
 
     A final LLM polish can retain all the words while serializing the document
     with a heading glued to the preceding paragraph. Downstream fixed-shape
     artifact validation then (correctly) rejects that text. The original
     section drafts are already validated and joined with explicit separators,
     so use them whenever the rewrite no longer preserves their exact outline.
+
+    Two independent checks, because the outline comparison alone has a blind
+    spot: it only inspects level-two headings, so a glued ``### Subheading``
+    leaves the level-two list identical and slips through. A reader then sees
+    the subheading rendered as body text — the heading is not at a line start,
+    so it is not a heading at all.
+
+    Returns the specific violation rather than a bool so the caller can report
+    *which* defect fired. That distinction is the only way to tell from
+    production whether glued headings actually occur, or whether the reordering
+    check is doing all the work — a bool would collapse both into one
+    indistinguishable fallback event.
+
+    A false positive is cheap and safe: the caller falls back to the joined
+    section drafts, which are already validated. It costs the polish, never
+    correctness.
     """
+    text = str(markdown or "")
+    if _GLUED_HEADING_RE.search(text):
+        return "glued_heading"
     expected = [_normalise_heading(draft.plan.title) for draft in drafts]
     if not expected:
-        return bool(str(markdown or "").strip())
+        return None if text.strip() else "empty_markdown"
     actual = [
         _normalise_heading(match.group(1))
-        for match in _HEADING_RE.finditer(str(markdown or ""))
+        for match in _HEADING_RE.finditer(text)
         if len(match.group(0)) - len(match.group(0).lstrip("#")) == 2
     ]
-    return actual == expected
+    if actual != expected:
+        return "missing_or_reordered_section_headings"
+    return None
 
 
 def _llm_stream_event_delta(event: Any) -> str:
