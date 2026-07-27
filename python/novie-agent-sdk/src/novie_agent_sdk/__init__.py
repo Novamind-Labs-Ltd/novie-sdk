@@ -235,6 +235,13 @@ from .document_final import (
     document_final_output,
     recovery_metadata,
 )
+from .document_finalization import (
+    DOCUMENT_FINALIZATION_KIND,
+    DOCUMENT_FINALIZATION_VERSION,
+    DocumentFinalizationManifestError,
+    authoring_ledger_from_checkpoint,
+    build_document_finalization_manifest,
+)
 from .document_quality import (
     DocumentQualityLoopResult,
     DocumentQualityOutcome,
@@ -558,6 +565,11 @@ __all__ = [
     "document_final_event",
     "document_final_output",
     "recovery_metadata",
+    "DOCUMENT_FINALIZATION_KIND",
+    "DOCUMENT_FINALIZATION_VERSION",
+    "DocumentFinalizationManifestError",
+    "authoring_ledger_from_checkpoint",
+    "build_document_finalization_manifest",
     "DocumentQualityLoopResult",
     "DocumentQualityOutcome",
     "skipped_quality_result",

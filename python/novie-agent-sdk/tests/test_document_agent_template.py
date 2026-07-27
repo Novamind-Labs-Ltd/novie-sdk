@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+)
 from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
@@ -22,23 +27,38 @@ from novie_agent_sdk import (
 
 
 class _FakeGraph:
-    async def astream(self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any):
+    async def astream(
+        self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any
+    ):
         assert stream_mode == ["messages", "values"]
-        yield "values", {
-            "messages": [
-                HumanMessage(content="# Capability navigation\nSECRET SKILL PROMPT")
-            ],
-        }
-        yield "values", {
-            "messages": [SimpleNamespace(type="developer", content="DEVELOPER PROMPT")],
-        }
-        yield "values", {"messages": [SimpleNamespace(role="user", content="USER PROMPT")]}
+        yield (
+            "values",
+            {
+                "messages": [
+                    HumanMessage(content="# Capability navigation\nSECRET SKILL PROMPT")
+                ],
+            },
+        )
+        yield (
+            "values",
+            {
+                "messages": [
+                    SimpleNamespace(type="developer", content="DEVELOPER PROMPT")
+                ],
+            },
+        )
+        yield (
+            "values",
+            {"messages": [SimpleNamespace(role="user", content="USER PROMPT")]},
+        )
         yield "messages", (AIMessageChunk(content="Draft"), {"node": "agent"})
         yield "values", {"messages": [AIMessage(content="Final narrative.")]}
 
 
 class _MessagesOnlyGraph:
-    async def astream(self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any):
+    async def astream(
+        self, _inputs: dict[str, Any], stream_mode: Any = "values", **_kwargs: Any
+    ):
         assert stream_mode == ["messages", "values"]
         yield "messages", (AIMessageChunk(content="Fallback "), {"node": "agent"})
         yield "messages", (AIMessageChunk(content="narrative."), {"node": "agent"})
@@ -121,7 +141,9 @@ Write a concise document.
     assert "Write a concise document." in scope.prompt_hint
 
 
-def test_resolve_document_agent_input_hides_upstream_when_access_is_none(tmp_path: Path) -> None:
+def test_resolve_document_agent_input_hides_upstream_when_access_is_none(
+    tmp_path: Path,
+) -> None:
     spec = DocumentCapabilitySpec(
         capability_id="agent.demo.write",
         skill_sources=[],
@@ -245,20 +267,45 @@ def test_build_document_deliverable_event_builds_common_envelope() -> None:
         degraded_flags=["tool.degraded"],
         checkpoint_id="ckpt-1",
         quality={"quality_status": "skipped"},
-        authoring_ledger={"sections": 3},
+        authoring_ledger={
+            "section_count": 1,
+            "outline_ref": {
+                "artifact_ref": "artifact://outline",
+                "artifact_type": "demo_document.outline",
+                "content_sha256": "outline-sha",
+            },
+            "artifact_refs": [
+                {
+                    "role": "section_draft",
+                    "section_id": "section-1",
+                    "artifact_ref": "artifact://section-1",
+                    "artifact_type": "demo_document.section",
+                    "content_sha256": "section-sha",
+                    "artifact": {
+                        "metadata": {
+                            "section_id": "section-1",
+                            "section_index": 1,
+                            "section_title": "Section 1",
+                            "quality": {"passed": True},
+                        }
+                    },
+                }
+            ],
+        },
         skill_contract={"strategy": "sectioned_longform"},
     )
 
     assert event.kind == "final"
     assert event.output["kind"] == "document_deliverable"
-    assert event.output["analysis"] == "# Demo"
-    assert event.output["final_markdown"] == "# Demo"
+    assert event.output["analysis"].startswith("# Final document")
+    assert event.output["final_markdown"] == event.output["analysis"]
     assert event.output["demo_mode"] == "write"
+    assert event.output["finalization_manifest"]["artifact_type"] == "demo_document"
     payload = event.output["final_payload"]
     assert payload["plan_id"] == "agent.demo.write"
     assert payload["recovery"]["checkpoint_id"] == "ckpt-1"
     assert payload["recovery"]["finalize_attempts"] == 2
-    assert payload["recovery"]["metadata"]["authoring_ledger"] == {"sections": 3}
+    assert payload["recovery"]["metadata"]["authoring_ledger"]["section_count"] == 1
     assert event.metadata["skill_contract"] == {"strategy": "sectioned_longform"}
 
 
@@ -298,7 +345,9 @@ def test_document_agent_template_streams_graph_content_and_result() -> None:
     assert "USER PROMPT" not in events[-1].narrative
 
 
-def test_document_agent_template_falls_back_to_streamed_content_without_final_values() -> None:
+def test_document_agent_template_falls_back_to_streamed_content_without_final_values() -> (
+    None
+):
     template = DocumentAgentTemplate(
         owner_agent_id="demo",
         phase_metadata=_metadata,

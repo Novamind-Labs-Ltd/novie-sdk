@@ -22,8 +22,15 @@ from novie_agent_sdk.sectioned_authoring import (
     _compact_markdown_to_utf8_limit,
     _llm_stream_event_delta,
     _llm_stream_event_result,
+    project_sectioned_phase_event,
     _section_structure_violation,
 )
+
+
+def test_sectioned_llm_deltas_do_not_cross_the_a2a_transport_boundary() -> None:
+    assert project_sectioned_phase_event(
+        {"event": "agent.llm_call.delta", "text_delta": "accepted section body"}
+    ) == []
 
 
 class _FakeLlm:
@@ -1293,6 +1300,10 @@ async def test_deferred_final_keeps_resume_sections_without_committing_final() -
     ]
     assert result.ledger["final_ref"] == {}
     assert platform.workpads.final_refs == []
+    assert not any(
+        "Polish the concatenated sections" in prompt
+        for prompt in author._llm.chat_prompts
+    )
 
 
 @pytest.mark.asyncio
@@ -2031,11 +2042,10 @@ async def test_single_polish_with_glued_heading_returns_validated_drafts() -> No
 
 
 @pytest.mark.asyncio
-async def test_final_output_byte_contract_compacts_before_polish() -> None:
+async def test_terminal_output_byte_contract_does_not_compact_canonical_document() -> None:
     phase_events: list[dict[str, Any]] = []
-    compacted = "## Context\n\nConcise evidence.\n\n## Findings\n\nConcise recommendation."
     author = SectionedLongformAuthor(
-        llm_facade=_BridgeLlm(bridge=compacted),
+        llm_facade=_FakeLlm(),
         platform=_FakePlatform(),
         artifact_type="example_document",
         step_id="s1",
@@ -2060,18 +2070,13 @@ async def test_final_output_byte_contract_compacts_before_polish() -> None:
 
     result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
 
-    assert result == compacted
-    assert len(result.encode("utf-8")) <= 128
-    assert any(
-        "hard delivery contract" in prompt for prompt in author._llm.chat_prompts
+    assert len(result.encode("utf-8")) > 128
+    assert "Evidence detail." in result
+    assert "Recommendation detail." in result
+    assert not any(
+        event["event"].startswith("document.final.output_byte")
+        for event in phase_events
     )
-    assert [event["event"] for event in phase_events] == [
-        "document.final.output_byte_limit_exceeded",
-        "agent.llm_call.started",
-        "agent.llm_call.delta",
-        "agent.llm_call.completed",
-        "document.final.output_byte_compacted",
-    ]
 
 
 def test_deterministic_final_byte_compaction_preserves_headings_and_limit() -> None:

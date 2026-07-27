@@ -6,6 +6,8 @@ from typing import Any
 
 from novie_protocol.agents import AgentCard, AgentStreamEvent
 
+from .document_finalization import build_document_finalization_manifest
+
 
 def capability_provides_artifacts(
     *,
@@ -188,6 +190,25 @@ def build_document_deliverable_event(
     provides_artifacts, metadata, and the final ``AgentStreamEvent``.
     """
     structured_dump = _dump_model(structured)
+    finalization_manifest = (
+        build_document_finalization_manifest(
+            artifact_type=artifact_type,
+            authoring_ledger=authoring_ledger,
+        )
+        if authoring_ledger
+        else None
+    )
+    transported_analysis = (
+        "# Final document\n\nThe platform will assemble this document from accepted section artifacts."
+        if finalization_manifest
+        else analysis
+    )
+    transported_narrative = "" if finalization_manifest else narrative
+    transported_structured = (
+        {"finalization_manifest": finalization_manifest}
+        if finalization_manifest
+        else structured_dump
+    )
     flags = [str(flag) for flag in degraded_flags or () if str(flag)]
     common_metadata: dict[str, Any] = {
         "artifact_type": artifact_type,
@@ -238,7 +259,7 @@ def build_document_deliverable_event(
     )
 
     final_payload_metadata = {
-        "narrative_preview": narrative[:500] if narrative else "",
+        "narrative_preview": transported_narrative[:500] if transported_narrative else "",
         "artifact_type": artifact_type,
         "artifact_family": artifact_family,
         **({mode_key: mode} if mode_key and mode is not None else {}),
@@ -258,8 +279,8 @@ def build_document_deliverable_event(
     }
     final_payload = final_payload_type(
         plan_id=plan_id or capability_id or artifact_type,
-        final_markdown=analysis,
-        structured_output=structured_dump,
+        final_markdown=transported_analysis,
+        structured_output=transported_structured,
         degraded_flags=list(flags),
         recovery=recovery,
         metadata=final_payload_metadata,
@@ -269,9 +290,9 @@ def build_document_deliverable_event(
         artifact_type=artifact_type,
         artifact_family=artifact_family,
         capability_id=capability_id or "",
-        analysis=analysis,
-        narrative=narrative,
-        structured_output=structured_dump,
+        analysis=transported_analysis,
+        narrative=transported_narrative,
+        structured_output=transported_structured,
         final_payload=_dump_model(final_payload),
         card=card,
         mode_key=mode_key,
@@ -294,11 +315,13 @@ def build_document_deliverable_event(
                 or capability_id
                 or "Final Deliverable"
             )[:120],
-            "final_markdown": analysis,
-            "content": analysis,
+            "final_markdown": transported_analysis,
+            "content": transported_analysis,
             "authoring_strategy": authoring_strategy,
         }
     )
+    if finalization_manifest:
+        output["finalization_manifest"] = finalization_manifest
     if authoring_ledger:
         output["authoring_ledger"] = dict(authoring_ledger)
     return document_final_event(output=output, metadata=event_metadata)
