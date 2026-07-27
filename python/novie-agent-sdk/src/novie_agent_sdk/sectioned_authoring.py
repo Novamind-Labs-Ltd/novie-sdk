@@ -409,7 +409,7 @@ class DocumentAuthoringRequest:
     quality_reason: str = "sectioned_authoring_quality_gates"
     quality_metadata: Mapping[str, Any] | None = None
     defer_intermediate_artifacts: bool = False
-    defer_final_artifact: bool = False
+    defer_final_artifact: bool = True
     # Capability runtimes may require a structural assembly strategy even when
     # their shared skill contract uses a different default.
     finalization_override: str | None = None
@@ -871,19 +871,10 @@ def project_sectioned_phase_event(
     event_name = str(metadata.get("event") or "").strip()
     meta = dict(metadata)
     if event_name == "agent.llm_call.delta":
-        delta = str(meta.get("text_delta") or "")
-        if not delta:
-            return []
-        content_metadata = dict(meta)
-        content_metadata["event"] = "agent.stream_content"
-        content_metadata["source_event"] = event_name
-        return [
-            AgentStreamEvent(
-                kind="content",
-                content=delta,
-                metadata=content_metadata,
-            )
-        ]
+        # Accepted section bodies are durable artifacts. Re-emitting their
+        # token deltas would reconstruct the full document in A2A/Temporal
+        # transport and defeat the reference-only finalization contract.
+        return []
     if event_name == "agent.tool_call":
         return [
             AgentStreamEvent(
@@ -2170,12 +2161,8 @@ class SectionedLongformAuthor:
         drafts: list[SectionDraft],
     ) -> str:
         combined = _join_markdown(draft.markdown for draft in drafts)
-        if self._exceeds_final_output_byte_limit(combined):
-            return await self._compact_final_to_output_byte_limit(
-                brief=brief,
-                drafts=drafts,
-                markdown=combined,
-            )
+        if self._defer_final_artifact:
+            return combined
         if self._contract.finalization == "boundary_stitch":
             finalized = await self._boundary_stitch_final(
                 brief=brief,
@@ -2213,13 +2200,7 @@ class SectionedLongformAuthor:
                 expected_section_titles=[draft.plan.title for draft in drafts],
             )
             finalized = combined
-        if not self._exceeds_final_output_byte_limit(finalized):
-            return finalized
-        return await self._compact_final_to_output_byte_limit(
-            brief=brief,
-            drafts=drafts,
-            markdown=finalized,
-        )
+        return finalized
 
     def _exceeds_final_output_byte_limit(self, markdown: str) -> bool:
         return bool(
