@@ -6,7 +6,7 @@ from typing import Any
 
 from novie_protocol.agents import AgentCard, AgentStreamEvent
 
-from .document_finalization import build_document_finalization_manifest
+from .document_finalization import build_typed_document_finalization_manifest
 
 
 def capability_provides_artifacts(
@@ -191,7 +191,7 @@ def build_document_deliverable_event(
     """
     structured_dump = _dump_model(structured)
     finalization_manifest = (
-        build_document_finalization_manifest(
+        build_typed_document_finalization_manifest(
             artifact_type=artifact_type,
             authoring_ledger=authoring_ledger,
         )

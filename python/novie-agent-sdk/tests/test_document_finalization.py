@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
+    PublicAgentError,
     authoring_ledger_from_checkpoint,
     build_document_deliverable_event,
     build_document_finalization_manifest,
@@ -138,3 +140,22 @@ def test_checkpoint_rebuilds_manifest_ready_authoring_ledger() -> None:
         "overview",
         "recommendation",
     ]
+
+
+def test_document_event_maps_invalid_manifest_to_repairable_public_failure() -> None:
+    with pytest.raises(PublicAgentError) as raised:
+        build_document_deliverable_event(
+            card=None,
+            structured={},
+            artifact_type="example_document",
+            artifact_family="document",
+            capability_id="agent.example.write",
+            analysis="",
+            narrative="",
+            final_payload_type=_FinalPayload,
+            recovery_type=_Recovery,
+            authoring_ledger={"enabled": True},
+        )
+
+    assert raised.value.error_code == "document_finalization_manifest_invalid"
+    assert raised.value.repair_eligible is True

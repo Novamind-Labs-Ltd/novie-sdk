@@ -19,7 +19,6 @@ from novie_agent_sdk import (
 from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _HEADING_RE,
-    _compact_markdown_to_utf8_limit,
     _llm_stream_event_delta,
     _llm_stream_event_result,
     project_sectioned_phase_event,
@@ -1307,6 +1306,30 @@ async def test_deferred_final_keeps_resume_sections_without_committing_final() -
 
 
 @pytest.mark.asyncio
+async def test_deferred_final_rejects_glued_heading_in_accepted_section() -> None:
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        defer_final_artifact=True,
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="overview", title="Overview"),
+            markdown="## Overview\n\nBody text.### Glued heading",
+        )
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="document_final_structure_invalid:glued_heading",
+    ):
+        await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
+
+
+@pytest.mark.asyncio
 async def test_deferred_intermediate_artifacts_do_not_persist_on_failure() -> None:
     platform = _FakePlatform()
     author = SectionedLongformAuthor(
@@ -2077,21 +2100,6 @@ async def test_terminal_output_byte_contract_does_not_compact_canonical_document
         event["event"].startswith("document.final.output_byte")
         for event in phase_events
     )
-
-
-def test_deterministic_final_byte_compaction_preserves_headings_and_limit() -> None:
-    text = (
-        "## Context\n\n"
-        + "x" * 200
-        + "\n\n## Findings\n\n"
-        + "y" * 200
-    )
-
-    compacted = _compact_markdown_to_utf8_limit(text, 64)
-
-    assert len(compacted.encode("utf-8")) <= 64
-    assert "## Context" in compacted
-    assert "## Findings" in compacted
 
 
 @pytest.mark.asyncio
