@@ -2878,6 +2878,24 @@ def _isolate_requested_section(markdown: str, title: str) -> str:
                 end = sibling.start()
                 break
         return text[heading.start() : end].strip()
+    # The model may return one otherwise valid section under the wrong H2.
+    # Wrapping that response with the requested heading would preserve the
+    # foreign H2 and produce a structurally invalid final outline. Retitle the
+    # first returned H2 section and discard sibling document sections instead.
+    for index, heading in enumerate(headings):
+        raw_heading = heading.group(0)
+        level = len(raw_heading) - len(raw_heading.lstrip("#"))
+        if level != 2:
+            continue
+        end = len(text)
+        for sibling in headings[index + 1 :]:
+            sibling_raw = sibling.group(0)
+            sibling_level = len(sibling_raw) - len(sibling_raw.lstrip("#"))
+            if sibling_level <= 2:
+                end = sibling.start()
+                break
+        body = text[heading.end() : end].strip()
+        return f"## {title}\n\n{body}".strip()
     return _ensure_section_heading(text, title)
 
 

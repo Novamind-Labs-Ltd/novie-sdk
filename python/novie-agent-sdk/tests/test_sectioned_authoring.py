@@ -19,11 +19,24 @@ from novie_agent_sdk import (
 from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _HEADING_RE,
+    _isolate_requested_section,
     _llm_stream_event_delta,
     _llm_stream_event_result,
     project_sectioned_phase_event,
     _section_structure_violation,
 )
+
+
+def test_isolate_requested_section_retitles_foreign_h2_without_preserving_it() -> None:
+    isolated = _isolate_requested_section(
+        "## Market Evidence\n\nDomain-specific body.\n\n"
+        "## Recommendations\n\nUnrelated sibling.",
+        "Domain Evidence",
+    )
+
+    assert isolated == "## Domain Evidence\n\nDomain-specific body."
+    assert "## Market Evidence" not in isolated
+    assert "## Recommendations" not in isolated
 
 
 def test_sectioned_llm_deltas_do_not_cross_the_a2a_transport_boundary() -> None:
@@ -960,7 +973,10 @@ async def test_sectioned_author_repairs_missing_planned_heading_before_quality_g
         agent_id="writer",
     )
 
-    assert result.drafts[0].markdown.startswith("## Context\n\n## Wrong Heading")
+    assert result.drafts[0].markdown.startswith(
+        "## Context\n\nalpha beta gamma delta epsilon zeta"
+    )
+    assert "## Wrong Heading" not in result.drafts[0].markdown
     assert result.drafts[0].quality["passed"] is True
     assert result.drafts[0].quality["failures"] == []
 
