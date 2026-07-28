@@ -149,10 +149,41 @@ def _dump_model(value: Any) -> dict[str, Any]:
     return {}
 
 
+def task_brief_document_identity(
+    brief: Mapping[str, Any],
+    *,
+    capability_id: str = "",
+    workflow_id: str = "",
+    step_id: str = "",
+) -> tuple[str, str]:
+    """Return the canonical TaskBrief title and durable brief identifier."""
+    document_title = str(brief.get("title") or "").strip()
+    source_brief_id = str(
+        brief.get("brief_id") or brief.get("source_brief_id") or ""
+    ).strip()
+    if document_title:
+        return document_title, source_brief_id
+    context = ", ".join(
+        f"{key}={value}"
+        for key, value in (
+            ("workflow_id", workflow_id),
+            ("step_id", step_id),
+            ("brief_id", source_brief_id),
+            ("capability_id", capability_id),
+        )
+        if value
+    )
+    raise ValueError(
+        "task_brief_document_title_missing"
+        + (f": {context}" if context else "")
+    )
+
+
 def build_document_deliverable_event(
     *,
     card: AgentCard | None,
     structured: Any,
+    document_title: str,
     artifact_type: str,
     artifact_family: str,
     capability_id: str | None,
@@ -180,7 +211,8 @@ def build_document_deliverable_event(
     payload_metadata: Mapping[str, Any] | None = None,
     recovery_metadata_extra: Mapping[str, Any] | None = None,
     output_extra: Mapping[str, Any] | None = None,
-    title: str | None = None,
+    title_source: str = "caller",
+    source_brief_id: str = "",
     authoring_strategy: str = "sectioned_longform",
 ) -> AgentStreamEvent:
     """Build the standard final deliverable event for document agents.
@@ -189,6 +221,13 @@ def build_document_deliverable_event(
     helper owns the repeated envelope: recovery, final_payload,
     provides_artifacts, metadata, and the final ``AgentStreamEvent``.
     """
+    canonical_title = str(document_title or "").strip()
+    if not canonical_title:
+        raise ValueError(
+            "document_title is required for document deliverable finalization"
+        )
+    canonical_title_source = str(title_source or "").strip() or "caller"
+    canonical_source_brief_id = str(source_brief_id or "").strip()
     structured_dump = _dump_model(structured)
     finalization_manifest = (
         build_typed_document_finalization_manifest(
@@ -213,6 +252,13 @@ def build_document_deliverable_event(
     common_metadata: dict[str, Any] = {
         "artifact_type": artifact_type,
         "artifact_family": artifact_family,
+        "document_title": canonical_title,
+        "title_source": canonical_title_source,
+        **(
+            {"source_brief_id": canonical_source_brief_id}
+            if canonical_source_brief_id
+            else {}
+        ),
         **({mode_key: mode} if mode_key and mode is not None else {}),
         **({phase_key: phase} if phase_key and phase is not None else {}),
         **({"capability_id": capability_id} if capability_id else {}),
@@ -262,6 +308,13 @@ def build_document_deliverable_event(
         "narrative_preview": transported_narrative[:500] if transported_narrative else "",
         "artifact_type": artifact_type,
         "artifact_family": artifact_family,
+        "document_title": canonical_title,
+        "title_source": canonical_title_source,
+        **(
+            {"source_brief_id": canonical_source_brief_id}
+            if canonical_source_brief_id
+            else {}
+        ),
         **({mode_key: mode} if mode_key and mode is not None else {}),
         **({phase_key: phase} if phase_key and phase is not None else {}),
         **({"quality": dict(quality)} if quality else {}),
@@ -309,17 +362,22 @@ def build_document_deliverable_event(
     output.update(
         {
             "kind": "document_deliverable",
-            "title": str(
-                title
-                or structured_dump.get("summary")
-                or capability_id
-                or "Final Deliverable"
-            )[:120],
+            "document_title": canonical_title,
+            "title": canonical_title,
+            "title_source": canonical_title_source,
+            **(
+                {"source_brief_id": canonical_source_brief_id}
+                if canonical_source_brief_id
+                else {}
+            ),
             "final_markdown": transported_analysis,
             "content": transported_analysis,
             "authoring_strategy": authoring_strategy,
         }
     )
+    structured_summary = str(structured_dump.get("summary") or "").strip()
+    if structured_summary:
+        output["summary"] = structured_summary
     if finalization_manifest:
         output["finalization_manifest"] = finalization_manifest
     if authoring_ledger:
@@ -333,4 +391,5 @@ __all__ = [
     "document_final_event",
     "document_final_output",
     "recovery_metadata",
+    "task_brief_document_identity",
 ]

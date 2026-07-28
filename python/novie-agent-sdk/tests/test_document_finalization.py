@@ -10,6 +10,7 @@ from novie_agent_sdk import (
     authoring_ledger_from_checkpoint,
     build_document_deliverable_event,
     build_document_finalization_manifest,
+    task_brief_document_identity,
 )
 
 
@@ -98,6 +99,7 @@ def test_document_event_transports_manifest_instead_of_large_body() -> None:
     event = build_document_deliverable_event(
         card=None,
         structured={"summary": "Complete report", "body": large_body},
+        document_title="Example report",
         artifact_type="example_document",
         artifact_family="document",
         capability_id="agent.example.write",
@@ -147,6 +149,7 @@ def test_document_event_maps_invalid_manifest_to_repairable_public_failure() -> 
         build_document_deliverable_event(
             card=None,
             structured={},
+            document_title="Example report",
             artifact_type="example_document",
             artifact_family="document",
             capability_id="agent.example.write",
@@ -159,3 +162,74 @@ def test_document_event_maps_invalid_manifest_to_repairable_public_failure() -> 
 
     assert raised.value.error_code == "document_finalization_manifest_invalid"
     assert raised.value.repair_eligible is True
+
+
+def test_document_event_uses_canonical_title_without_summary_fallback_or_truncation() -> None:
+    document_title = "香港高端健身房会员管理系统产品需求文档" * 8
+    long_summary = "这是一段用于验证摘要不会覆盖标题的详细产品需求说明。" * 40
+
+    event = build_document_deliverable_event(
+        card=None,
+        structured={"summary": long_summary},
+        document_title=f"  {document_title}  ",
+        title_source="task_brief",
+        source_brief_id="brief-114",
+        artifact_type="prd_document",
+        artifact_family="document",
+        capability_id="agent.pm.prd_create",
+        analysis="# PRD",
+        narrative="PRD narrative",
+        final_payload_type=_FinalPayload,
+        recovery_type=_Recovery,
+    )
+
+    assert event.output["document_title"] == document_title
+    assert event.output["title"] == document_title
+    assert event.output["summary"] == long_summary
+    assert event.output["title_source"] == "task_brief"
+    assert event.output["source_brief_id"] == "brief-114"
+    assert len(event.output["title"]) > 120
+    assert event.metadata["document_title"] == document_title
+    assert event.metadata["title_source"] == "task_brief"
+    assert event.metadata["source_brief_id"] == "brief-114"
+
+
+@pytest.mark.parametrize("document_title", ["", "   ", "\n\t"])
+def test_document_event_rejects_blank_document_title(document_title: str) -> None:
+    with pytest.raises(ValueError, match="document_title is required"):
+        build_document_deliverable_event(
+            card=None,
+            structured={"summary": "Must not become the title"},
+            document_title=document_title,
+            artifact_type="example_document",
+            artifact_family="document",
+            capability_id="agent.example.write",
+            analysis="# Report",
+            narrative="Report",
+            final_payload_type=_FinalPayload,
+            recovery_type=_Recovery,
+        )
+
+
+def test_task_brief_document_identity_trims_title_and_preserves_id() -> None:
+    assert task_brief_document_identity(
+        {"title": "  香港健身房 PRD  ", "brief_id": " brief-114 "},
+        capability_id="agent.pm.prd_create",
+    ) == ("香港健身房 PRD", "brief-114")
+
+
+def test_task_brief_document_identity_reports_lineage_when_title_is_missing() -> None:
+    with pytest.raises(ValueError) as raised:
+        task_brief_document_identity(
+            {"brief_id": "brief-114", "summary": "Long generated summary"},
+            capability_id="agent.pm.prd_create",
+            workflow_id="workflow-114",
+            step_id="step-final",
+        )
+
+    message = str(raised.value)
+    assert "task_brief_document_title_missing" in message
+    assert "workflow_id=workflow-114" in message
+    assert "step_id=step-final" in message
+    assert "brief_id=brief-114" in message
+    assert "capability_id=agent.pm.prd_create" in message

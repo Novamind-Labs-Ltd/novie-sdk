@@ -251,6 +251,7 @@ def test_build_document_deliverable_event_builds_common_envelope() -> None:
     event = build_document_deliverable_event(
         card=None,
         structured=_Structured(summary="Demo"),
+        document_title="Demo document",
         artifact_type="demo_document",
         artifact_family="demo",
         capability_id="agent.demo.write",
