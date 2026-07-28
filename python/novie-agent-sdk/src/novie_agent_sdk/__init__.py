@@ -234,6 +234,7 @@ from .document_final import (
     document_final_event,
     document_final_output,
     recovery_metadata,
+    task_brief_document_identity,
 )
 from .document_finalization import (
     DOCUMENT_FINALIZATION_KIND,
@@ -565,6 +566,7 @@ __all__ = [
     "document_final_event",
     "document_final_output",
     "recovery_metadata",
+    "task_brief_document_identity",
     "DOCUMENT_FINALIZATION_KIND",
     "DOCUMENT_FINALIZATION_VERSION",
     "DocumentFinalizationManifestError",
