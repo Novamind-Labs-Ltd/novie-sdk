@@ -62,6 +62,7 @@ _PLACEHOLDER_SECTION_RE = re.compile(
 # merge/polish step cannot recover an empty or un-headed section.
 _STRUCTURAL_GATE_FAILURES = frozenset({
     "empty_section",
+    "glued_heading",
     "missing_section_heading",
     "placeholder_section",
 })
@@ -430,6 +431,10 @@ class DocumentAuthoringRequest:
         if not self.authoring_instructions.strip():
             raise ValueError(
                 "document_authoring_request skill authoring instructions are required"
+            )
+        if self.defer_intermediate_artifacts and self.defer_final_artifact:
+            raise ValueError(
+                "document_authoring_request cannot defer both intermediate and final artifacts"
             )
         for field_name in ("context_budget", "brief", "upstream"):
             object.__setattr__(
@@ -2162,6 +2167,9 @@ class SectionedLongformAuthor:
     ) -> str:
         combined = _join_markdown(draft.markdown for draft in drafts)
         if self._defer_final_artifact:
+            violation = _section_structure_violation(combined, drafts)
+            if violation is not None:
+                raise RuntimeError(f"document_final_structure_invalid:{violation}")
             return combined
         if self._contract.finalization == "boundary_stitch":
             finalized = await self._boundary_stitch_final(
@@ -2201,96 +2209,6 @@ class SectionedLongformAuthor:
             )
             finalized = combined
         return finalized
-
-    def _exceeds_final_output_byte_limit(self, markdown: str) -> bool:
-        return bool(
-            self._document_output_byte_limit is not None
-            and len(markdown.encode("utf-8")) > self._document_output_byte_limit
-        )
-
-    async def _compact_final_to_output_byte_limit(
-        self,
-        *,
-        brief: Mapping[str, Any],
-        drafts: list[SectionDraft],
-        markdown: str,
-    ) -> str:
-        """Return a complete, bounded final document for a frozen byte contract."""
-        max_bytes = self._document_output_byte_limit
-        if max_bytes is None:
-            return markdown
-        input_bytes = len(markdown.encode("utf-8"))
-        await self._emit(
-            "document.final.output_byte_limit_exceeded",
-            status="degraded",
-            input_bytes=input_bytes,
-            max_document_output_bytes=max_bytes,
-        )
-        refs = [
-            {
-                "section_id": draft.plan.section_id,
-                "title": draft.plan.title,
-                "artifact_ref": draft.artifact_ref.get("artifact_ref"),
-            }
-            for draft in drafts
-        ]
-        source = await self._bounded_for_final_prompt(
-            markdown,
-            limit=48000,
-            phase="output_byte_compaction",
-        )
-        # Four bytes per Unicode code point is a conservative UTF-8 target.  The
-        # postcondition below remains authoritative because Markdown/tokenization
-        # is not a byte-accounting protocol.
-        safe_character_limit = max(128, max_bytes // 4)
-        prompt = (
-            "Rewrite these Markdown sections as one concise, complete final document. "
-            "Preserve every top-level section heading, essential facts, source refs, "
-            "and required document structure. Return only the document, with no process "
-            "commentary. This is a hard delivery contract: the UTF-8 result must be no "
-            f"more than {max_bytes} bytes; stay within {safe_character_limit} Unicode "
-            "characters to leave a safety margin. Prefer concise paragraphs and remove "
-            "secondary detail before removing required structure.\n\n"
-            f"{self._skill_instruction_block()}"
-            f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
-            f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
-            f"Draft sections:\n{source}"
-        )
-        compacted = ""
-        strategy = "deterministic_structure"
-        if self._document_output_budget.remaining_tokens != 0:
-            streamed = await self._stream_llm_text(
-                purpose="output_byte_compaction",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_output_tokens=self._output_token_ceiling,
-                model=self._contract.finalize_model or None,
-                extra_metadata={
-                    "input_bytes": input_bytes,
-                    "max_document_output_bytes": max_bytes,
-                    "safe_character_limit": safe_character_limit,
-                },
-            )
-            candidate = streamed.text.strip()
-            if (
-                candidate
-                and not streamed.truncated
-                and not self._exceeds_final_output_byte_limit(candidate)
-                and _section_structure_violation(candidate, drafts) is None
-            ):
-                compacted = candidate
-                strategy = "llm"
-        if not compacted:
-            compacted = _compact_markdown_to_utf8_limit(markdown, max_bytes)
-        await self._emit(
-            "document.final.output_byte_compacted",
-            status="degraded",
-            input_bytes=input_bytes,
-            output_bytes=len(compacted.encode("utf-8")),
-            max_document_output_bytes=max_bytes,
-            strategy=strategy,
-        )
-        return compacted
 
     async def _boundary_stitch_final(
         self,
@@ -2883,6 +2801,8 @@ def _evaluate_section_quality(
         failures.append("output_truncated")
     if _PLACEHOLDER_SECTION_RE.search(text):
         failures.append("placeholder_section")
+    if _GLUED_HEADING_RE.search(text):
+        failures.append("glued_heading")
     if not _section_has_heading(text, plan.title):
         failures.append("missing_section_heading")
     if information_units < plan.min_words:
@@ -2933,77 +2853,6 @@ def _ensure_section_heading(markdown: str, title: str) -> str:
     return f"## {title}\n\n{text}" if text else f"## {title}"
 
 
-def _compact_markdown_to_utf8_limit(markdown: str, max_bytes: int) -> str:
-    """Deterministically retain Markdown structure when final compaction fails.
-
-    This is an explicitly signalled last resort, not a text-prefix truncation:
-    preserve every heading that fits and add only complete body lines.  A model
-    compaction is always attempted first, so this path keeps a terminal result
-    structurally valid if the model has exhausted its output allocation.
-    """
-    text = str(markdown or "").strip()
-    if max_bytes <= 0 or len(text.encode("utf-8")) <= max_bytes:
-        return text
-    blocks: list[list[str]] = []
-    current: list[str] = []
-    for line in text.splitlines():
-        if line.lstrip().startswith("#") and current:
-            blocks.append(current)
-            current = []
-        current.append(line)
-    if current:
-        blocks.append(current)
-    if not blocks:
-        return ""
-
-    heading_blocks = [
-        block
-        for block in blocks
-        if block and block[0].lstrip().startswith("#")
-    ]
-    if not heading_blocks:
-        return _complete_lines_within_utf8_limit(text.splitlines(), max_bytes)
-
-    skeleton = "\n\n".join(block[0].strip() for block in heading_blocks).strip()
-    if len(skeleton.encode("utf-8")) > max_bytes:
-        return _complete_lines_within_utf8_limit(
-            [block[0].strip() for block in heading_blocks],
-            max_bytes,
-        )
-
-    remaining = max_bytes - len(skeleton.encode("utf-8"))
-    rendered: list[str] = []
-    for index, block in enumerate(heading_blocks):
-        heading = block[0].strip()
-        body_lines = [line.strip() for line in block[1:] if line.strip()]
-        blocks_remaining = len(heading_blocks) - index
-        allowance = remaining // max(1, blocks_remaining)
-        body = _complete_lines_within_utf8_limit(body_lines, allowance)
-        rendered.append(f"{heading}\n\n{body}".strip() if body else heading)
-        remaining -= len(body.encode("utf-8"))
-    result = "\n\n".join(rendered).strip()
-    # Separators between headings and body lines add a few bytes that are not
-    # represented in the per-block body allowances.  Fall back to the heading
-    # skeleton rather than ever returning an over-contract payload.
-    return result if len(result.encode("utf-8")) <= max_bytes else skeleton
-
-
-def _complete_lines_within_utf8_limit(lines: list[str], max_bytes: int) -> str:
-    selected: list[str] = []
-    used = 0
-    for line in lines:
-        candidate = str(line or "").strip()
-        if not candidate:
-            continue
-        separator = "\n" if selected else ""
-        candidate_bytes = len((separator + candidate).encode("utf-8"))
-        if used + candidate_bytes > max_bytes:
-            continue
-        selected.append(candidate)
-        used += candidate_bytes
-    return "\n".join(selected)
-
-
 def _isolate_requested_section(markdown: str, title: str) -> str:
     """Keep only the planned level-two section from an over-broad LLM draft.
 
@@ -3029,6 +2878,24 @@ def _isolate_requested_section(markdown: str, title: str) -> str:
                 end = sibling.start()
                 break
         return text[heading.start() : end].strip()
+    # The model may return one otherwise valid section under the wrong H2.
+    # Wrapping that response with the requested heading would preserve the
+    # foreign H2 and produce a structurally invalid final outline. Retitle the
+    # first returned H2 section and discard sibling document sections instead.
+    for index, heading in enumerate(headings):
+        raw_heading = heading.group(0)
+        level = len(raw_heading) - len(raw_heading.lstrip("#"))
+        if level != 2:
+            continue
+        end = len(text)
+        for sibling in headings[index + 1 :]:
+            sibling_raw = sibling.group(0)
+            sibling_level = len(sibling_raw) - len(sibling_raw.lstrip("#"))
+            if sibling_level <= 2:
+                end = sibling.start()
+                break
+        body = text[heading.end() : end].strip()
+        return f"## {title}\n\n{body}".strip()
     return _ensure_section_heading(text, title)
 
 

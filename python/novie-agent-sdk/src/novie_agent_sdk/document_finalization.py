@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .public_errors import PublicAgentError
+
 DOCUMENT_FINALIZATION_KIND = "document_finalization_manifest"
 DOCUMENT_FINALIZATION_VERSION = "document-finalization.v1"
 
@@ -95,6 +97,29 @@ def build_document_finalization_manifest(
     }
 
 
+def build_typed_document_finalization_manifest(
+    *,
+    artifact_type: str,
+    authoring_ledger: Mapping[str, Any],
+    language: str = "",
+) -> dict[str, Any]:
+    """Build a manifest or expose a stable repairable contract failure."""
+    try:
+        return build_document_finalization_manifest(
+            artifact_type=artifact_type,
+            authoring_ledger=authoring_ledger,
+            language=language,
+        )
+    except DocumentFinalizationManifestError as exc:
+        raise PublicAgentError(
+            error_code="document_finalization_manifest_invalid",
+            public_message="Accepted document sections could not form a final deliverable.",
+            retryable=False,
+            replan_eligible=False,
+            repair_eligible=True,
+        ) from exc
+
+
 def authoring_ledger_from_checkpoint(
     checkpoint: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -161,4 +186,5 @@ __all__ = [
     "DocumentFinalizationManifestError",
     "authoring_ledger_from_checkpoint",
     "build_document_finalization_manifest",
+    "build_typed_document_finalization_manifest",
 ]
