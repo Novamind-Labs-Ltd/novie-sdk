@@ -47,7 +47,29 @@ def skipped_quality_result(
     return DocumentQualityLoopResult(narrative=narrative, outcome=outcome)
 
 
+def completed_document_quality_result(
+    narrative: str,
+    *,
+    degraded: bool,
+    metadata: dict[str, Any] | None = None,
+) -> DocumentQualityLoopResult:
+    """Represent a document whose real section and final checks completed."""
+    outcome = DocumentQualityOutcome(
+        status="degraded" if degraded else "passed",
+        checks_passed=True,
+        revision_rounds=0,
+        final_review_passed=True,
+        metadata={
+            "quality_publication_eligible": True,
+            "blocking_failures": [],
+            **dict(metadata or {}),
+        },
+    )
+    return DocumentQualityLoopResult(narrative=narrative, outcome=outcome)
+
+
 __all__ = [
+    "completed_document_quality_result",
     "DocumentQualityLoopResult",
     "DocumentQualityOutcome",
     "skipped_quality_result",

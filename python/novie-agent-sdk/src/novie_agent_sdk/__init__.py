@@ -153,7 +153,21 @@ from .artifact_ledger import (
     EvidencePackBuilder,
     EvidencePackItem,
 )
-from .document_authoring_budget import DocumentAuthoringBudgetExceeded
+from .document_authoring_budget import (
+    AuthoringCallBudget,
+    DocumentAuthoringBudgetExceeded,
+    DocumentAuthoringCallBudgetExceeded,
+)
+from .document_authoring_context import (
+    AuthoringContextEnvelope,
+    AuthoringContextOverflow,
+)
+from .document_authoring_plan import (
+    AuthoringExecutionPlan,
+    PlannedPart,
+    SectionExecutionPlan,
+)
+from .document_authoring_recovery import SectionCoverageCursor
 from .platform_langchain_tools import (
     PlatformToolConfig,
     PlatformToolDegradationFlags,
@@ -243,7 +257,9 @@ from .document_finalization import (
     authoring_ledger_from_checkpoint,
     build_document_finalization_manifest,
 )
+from .document_completeness import DocumentCompletenessReviewError
 from .document_quality import (
+    completed_document_quality_result,
     DocumentQualityLoopResult,
     DocumentQualityOutcome,
     skipped_quality_result,
@@ -572,6 +588,8 @@ __all__ = [
     "DocumentFinalizationManifestError",
     "authoring_ledger_from_checkpoint",
     "build_document_finalization_manifest",
+    "DocumentCompletenessReviewError",
+    "completed_document_quality_result",
     "DocumentQualityLoopResult",
     "DocumentQualityOutcome",
     "skipped_quality_result",
@@ -716,10 +734,18 @@ __all__ = [
     "classify_envelope_error",
     "ArtifactLedger",
     "ContextBudget",
+    "AuthoringCallBudget",
+    "AuthoringContextEnvelope",
+    "AuthoringContextOverflow",
+    "AuthoringExecutionPlan",
     "DocumentAuthoringBudgetExceeded",
+    "DocumentAuthoringCallBudgetExceeded",
     "DocumentAuthoringDeadlineExceeded",
     "DocumentAuthoringRequest",
+    "PlannedPart",
+    "SectionCoverageCursor",
     "SectionDraft",
+    "SectionExecutionPlan",
     "SectionPlan",
     "SectionQualityGateResult",
     "SectionedAuthoringContract",

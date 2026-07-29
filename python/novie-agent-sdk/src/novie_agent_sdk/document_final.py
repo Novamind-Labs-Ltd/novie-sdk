@@ -81,6 +81,7 @@ def document_final_output(
     """Build a platform-friendly final output without hiding agent-specific fields."""
     structured = dict(structured_output or {})
     output: dict[str, Any] = {
+        "status": "completed",
         "artifact_type": artifact_type,
         "artifact_family": artifact_family,
         "capability_id": capability_id,
@@ -179,6 +180,19 @@ def task_brief_document_identity(
     )
 
 
+def _require_publishable_document_quality(
+    quality: Mapping[str, Any] | None,
+) -> None:
+    evidence = dict(quality or {})
+    status = str(evidence.get("quality_status") or "").strip().lower()
+    if (
+        status not in {"passed", "degraded"}
+        or evidence.get("quality_final_review_passed") is not True
+        or evidence.get("quality_publication_eligible") is not True
+    ):
+        raise RuntimeError("document_deliverable_not_publishable")
+
+
 def build_document_deliverable_event(
     *,
     card: AgentCard | None,
@@ -221,6 +235,7 @@ def build_document_deliverable_event(
     helper owns the repeated envelope: recovery, final_payload,
     provides_artifacts, metadata, and the final ``AgentStreamEvent``.
     """
+    _require_publishable_document_quality(quality)
     canonical_title = str(document_title or "").strip()
     if not canonical_title:
         raise ValueError(

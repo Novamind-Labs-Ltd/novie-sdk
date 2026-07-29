@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import os
@@ -18,11 +19,38 @@ from .artifact_ledger import ArtifactLedger, EvidencePackBuilder
 from .artifact_text import scrub_artifact_scaffolding
 from .context_budget import wall_clock_deadline as context_wall_clock_deadline
 from .document_authoring_budget import (
-    DocumentAuthoringBudgetExceeded,
+    AuthoringCallBudget,
     DocumentAuthoringDeadlineExceeded,
     DocumentOutputBudget,
 )
-from .document_quality import DocumentQualityLoopResult, skipped_quality_result
+from .document_authoring_compaction import compact_authoring_context
+from .document_authoring_context import (
+    build_authoring_context_envelope,
+    deterministic_authoring_summary,
+)
+from .document_authoring_plan import (
+    PlannedPart,
+    build_authoring_execution_plan,
+)
+from .document_authoring_plan_codec import authoring_execution_plan_from_mapping
+from .document_authoring_plan_recovery import (
+    append_recovery_part,
+    merge_executed_section_parts,
+)
+from .document_authoring_recovery import SectionCoverageCursor
+from .document_completeness import (
+    markdown_structure_violation,
+    review_section_completeness,
+)
+from .document_quality import (
+    DocumentQualityLoopResult,
+    completed_document_quality_result,
+)
+from .document_part_assembly import AcceptedPart
+from .document_section_parts import (
+    author_planned_section,
+    resumed_parts_from_checkpoint,
+)
 from .skill_contracts import SkillRuntimeContract
 
 _SECTIONED_AUTHORING_ENV = "NOVIE_SECTIONED_AUTHORING_V2"
@@ -63,8 +91,11 @@ _PLACEHOLDER_SECTION_RE = re.compile(
 _STRUCTURAL_GATE_FAILURES = frozenset({
     "empty_section",
     "glued_heading",
+    "markdown_structure_unclosed",
     "missing_section_heading",
+    "output_truncated",
     "placeholder_section",
+    "semantic_incomplete",
 })
 
 # Gate enforcement modes. ``strict`` keeps the legacy behaviour of hard-failing
@@ -75,16 +106,10 @@ _GATE_ENFORCEMENT_STRICT = "strict"
 _GATE_ENFORCEMENT_DEGRADE = "degrade"
 _GATE_ENFORCEMENT_MODES = frozenset({_GATE_ENFORCEMENT_STRICT, _GATE_ENFORCEMENT_DEGRADE})
 
-# Finalization modes implemented by ``SectionedLongformAuthor._polish_final``.
-# Contract construction rejects anything else: an unrecognised mode used to
-# fall through to ``single_polish`` silently, which shipped truncated
-# full-document rewrites while the skill author believed a different
-# finalize path was active.
-KNOWN_FINALIZATION_MODES = frozenset({
-    "single_polish",
-    "boundary_stitch",
-    "progressive_section_merge",
-})
+# Accepted parts and sections are immutable at finalization time. Cohesion is
+# created while drafting bounded parts; the final document is a deterministic
+# assembly and never another whole-document generation.
+KNOWN_FINALIZATION_MODES = frozenset({"deterministic_assembly"})
 
 
 # Provider stop/finish values that mean "output hit max_output_tokens".
@@ -113,10 +138,18 @@ def _finish_reason_of(completed_result: Mapping[str, Any] | None) -> str:
     if not isinstance(completed_result, Mapping):
         return ""
     metadata = completed_result.get("response_metadata")
-    if not isinstance(metadata, Mapping):
-        return ""
-    reason = metadata.get("finish_reason") or metadata.get("stop_reason")
-    return str(reason or "").strip().lower()
+    nested = metadata if isinstance(metadata, Mapping) else {}
+    reasons = {
+        str(source.get(key) or "").strip().lower()
+        for source in (completed_result, nested)
+        for key in ("finish_reason", "stop_reason")
+        if str(source.get(key) or "").strip()
+    }
+    if reasons & _TRUNCATION_FINISH_REASONS:
+        return "length"
+    if "tool_calls" in reasons or "tool_use" in reasons:
+        return "tool_calls"
+    return "stop" if reasons else ""
 
 
 def _remaining_deadline_seconds(deadline: float) -> float:
@@ -124,7 +157,7 @@ def _remaining_deadline_seconds(deadline: float) -> float:
 
 
 def _validated_finalization(value: Any) -> str:
-    mode = str(value or "single_polish").strip()
+    mode = str(value or "deterministic_assembly").strip()
     if mode not in KNOWN_FINALIZATION_MODES:
         raise ValueError(
             "sectioned_authoring contract: unknown finalization mode "
@@ -160,7 +193,7 @@ class SectionedAuthoringContract:
     profile_confidence: str = ""
     context_policy: str = "evidence_pack_v1"
     quality_contract_ref: str = "document.generic_quality"
-    finalization: str = "single_polish"
+    finalization: str = "deterministic_assembly"
     evidence_depth: str = "standard"
     min_outline_sections: int = 2
     max_outline_sections: int = 9
@@ -279,6 +312,7 @@ class SectionQualityGateResult:
     unique_sources_available: int = 0
     unique_sources_cited: int = 0
     degraded: bool = False
+    completeness_review: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -307,6 +341,7 @@ class SectionQualityGateResult:
             "unique_sources_available": self.unique_sources_available,
             "unique_sources_cited": self.unique_sources_cited,
             "degraded": self.degraded,
+            "completeness_review": dict(self.completeness_review),
         }
 
 
@@ -610,12 +645,14 @@ async def run_sectioned_document_finalization(
             "authoring_ledger": dict(authoring_result.ledger),
         },
     )
-    quality_result = skipped_quality_result(
+    quality_result = completed_document_quality_result(
         authoring_result.markdown,
-        reason=quality_reason,
+        degraded=bool(authoring_result.ledger.get("degraded")),
         metadata={
             **dict(quality_metadata or {}),
+            "quality_reason": quality_reason,
             "section_count": len(authoring_result.drafts),
+            "reviewed_section_count": len(authoring_result.drafts),
             "authoring_ledger": dict(authoring_result.ledger),
         },
     )
@@ -839,12 +876,14 @@ async def astream_sectioned_document_finalization(
         },
     )
     yield completed_event
-    quality_result = skipped_quality_result(
+    quality_result = completed_document_quality_result(
         authoring_result.markdown,
-        reason=quality_reason,
+        degraded=bool(authoring_result.ledger.get("degraded")),
         metadata={
             **dict(quality_metadata or {}),
+            "quality_reason": quality_reason,
             "section_count": len(authoring_result.drafts),
+            "reviewed_section_count": len(authoring_result.drafts),
             "authoring_ledger": dict(authoring_result.ledger),
             "length_profile": resolved_profile["profile"],
         },
@@ -993,7 +1032,7 @@ def sectioned_authoring_contract_from_skill(
             finalization_override
             or profile.finalization
             or contract.runtime.finalization
-            or "single_polish"
+            or "deterministic_assembly"
         )
         evidence_depth = profile.evidence_depth or "standard"
         min_outline_sections = profile.min_sections or document.outline.min_sections or 2
@@ -1014,7 +1053,11 @@ def sectioned_authoring_contract_from_skill(
             or 0.8
         )
     else:
-        finalization = finalization_override or contract.runtime.finalization or "single_polish"
+        finalization = (
+            finalization_override
+            or contract.runtime.finalization
+            or "deterministic_assembly"
+        )
         evidence_depth = str(raw_document.get("evidence_depth") or "standard")
         min_outline_sections = document.outline.min_sections or 2
         max_outline_sections = document.outline.max_sections or 9
@@ -1170,6 +1213,8 @@ class SectionedLongformAuthor:
         self._phase_checkpoint_sink = phase_checkpoint_sink
         self._llm_call_seq = 0
         self._tool_call_seq = 0
+        self._authoring_call_budget: AuthoringCallBudget | None = None
+        self._last_authoring_context_pressure = "normal"
 
     def _skill_instruction_block(self) -> str:
         if not self._authoring_instructions:
@@ -1211,6 +1256,7 @@ class SectionedLongformAuthor:
             length_profile = str(state.get("length_profile") or self._contract.length_profile)
             outline_ref = _mapping(state.get("outline_ref"))
             drafts = await self._resume_drafts_from_state(state, outline=outline)
+            drafts = await self._revalidate_resumed_drafts(drafts)
             await self._emit(
                 "document.sectioned_authoring.resumed",
                 status="running",
@@ -1252,17 +1298,61 @@ class SectionedLongformAuthor:
                 outline_ref=outline_ref,
                 drafts=[],
             )
-        degraded_sections: list[dict[str, Any]] = list(
-            state.get("degraded_sections") if isinstance(state.get("degraded_sections"), list) else []
+        degraded_sections = list(
+            state.get("degraded_sections")
+            if isinstance(state.get("degraded_sections"), list)
+            else []
         )
-        window_k = max(0, self._contract.running_context_window_k)
-        running_summary = str(state.get("running_summary") or "")
-        if self._contract.running_context and not running_summary and len(drafts) > window_k:
-            # Resuming a checkpoint that predates running-summary state: rebuild it
-            # by folding the sections already outside the recent-body window.
-            for dropped in drafts[: len(drafts) - window_k]:
-                running_summary = await self._fold_running_summary(running_summary, dropped)
+        scope = {
+            "tenant_id": str(self._context_budget.get("tenant_id") or ""),
+            "workspace_id": str(self._context_budget.get("workspace_id") or ""),
+            "workflow_id": str(workflow_id or ""),
+            "step_id": self._step_id,
+            "capability_id": self._capability_id,
+        }
+        execution_plan = build_authoring_execution_plan(
+            outline,
+            scope=scope,
+            context_budget=self._context_budget,
+            revision=_positive_int(state.get("authoring_plan_revision"), 1),
+        )
+        stored_plan = state.get("authoring_execution_plan")
+        if isinstance(stored_plan, Mapping):
+            try:
+                resumed_plan = authoring_execution_plan_from_mapping(stored_plan)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "document_authoring_checkpoint_plan_invalid"
+                ) from exc
+            if resumed_plan.outline_digest != execution_plan.outline_digest:
+                raise RuntimeError(
+                    "document_authoring_checkpoint_outline_mismatch"
+                )
+            execution_plan = resumed_plan
+        self._authoring_call_budget = AuthoringCallBudget(
+            total_limit=execution_plan.max_authoring_llm_calls,
+            compaction_limit=execution_plan.max_authoring_compaction_calls,
+            review_limit=execution_plan.max_section_review_calls,
+            used=_positive_int(state.get("authoring_llm_calls_used"), 0),
+            compactions_used=_positive_int(
+                state.get("authoring_compaction_calls_used"),
+                0,
+            ),
+            reviews_used=_positive_int(state.get("authoring_review_calls_used"), 0),
+        )
+        authoring_summary = _mapping(state.get("authoring_context_summary"))
+        await self._emit(
+            "document.authoring_plan.accepted",
+            status="complete",
+            plan_revision=execution_plan.revision,
+            planned_part_count=execution_plan.part_count,
+            mandatory_llm_call_count=execution_plan.mandatory_call_count,
+            max_authoring_llm_calls=execution_plan.max_authoring_llm_calls,
+            estimated_authoring_seconds=execution_plan.estimated_authoring_seconds,
+            deadline_feasible=execution_plan.deadline_feasible,
+        )
         for index, plan in enumerate(outline[len(drafts) :], start=len(drafts) + 1):
+            execution_section = execution_plan.sections[index - 1]
             await self._emit(
                 "document.section.started",
                 status="running",
@@ -1326,37 +1416,108 @@ class SectionedLongformAuthor:
                     reasons=list(evidence_pack.warnings)
                     or ["empty_evidence_pack"],
                 )
-            running_context = (
-                self._compose_running_context(drafts, running_summary)
-                if self._contract.running_context
-                else ""
+            checkpoint_base = {
+                "current_phase": "draft_sections",
+                "length_profile": length_profile,
+                "outline": [asdict(item) for item in outline],
+                "outline_ref": outline_ref,
+                "drafts": [_draft_resume_record(draft) for draft in drafts],
+                "degraded_sections": degraded_sections,
+                "authoring_context_summary": authoring_summary,
+                **self._authoring_call_budget.metadata(),
+            }
+            resumed_parts = await resumed_parts_from_checkpoint(
+                self,
+                state,
+                section_id=plan.section_id,
             )
-            markdown, output_truncated = await self._draft_section(
+            part_result = await author_planned_section(
+                self,
                 brief=brief,
-                plan=plan,
+                section_plan=plan,
+                execution_plan=execution_plan,
+                execution_section=execution_section,
                 section_index=index,
-                previous=drafts,
+                previous_drafts=drafts,
                 evidence_pack=evidence_pack_input,
-                running_context=running_context,
-                output_slots_remaining=len(outline) - index + 2,
+                authoring_summary=authoring_summary,
+                workflow_id=workflow_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+                checkpoint_base=checkpoint_base,
+                resumed_parts=resumed_parts,
             )
-            if output_truncated:
-                await self._emit(
-                    "document.section.truncation_detected",
-                    status="degraded",
-                    section_id=plan.section_id,
-                    section_title=plan.title,
-                    section_index=index,
-                    revision_round=0,
-                )
+            markdown = part_result.markdown
             quality = _evaluate_section_quality(
                 plan=plan,
                 markdown=markdown,
                 evidence_pack=evidence_pack_input,
                 contract=self._contract,
                 revision_rounds=0,
-                output_truncated=output_truncated,
+                output_truncated=False,
             )
+            quality = await self._apply_completeness_review(
+                plan=plan,
+                markdown=markdown,
+                quality=quality,
+            )
+            if "semantic_incomplete" in quality.failures:
+                review = quality.completeness_review
+                execution_plan = merge_executed_section_parts(
+                    execution_plan,
+                    section_index=index - 1,
+                    parts=[
+                        item.accepted.plan
+                        for item in part_result.execution.parts
+                    ],
+                    revision=part_result.execution.plan_revision,
+                )
+                execution_plan = append_recovery_part(
+                    execution_plan,
+                    section_index=index - 1,
+                    issue_code=str(review.get("issue_code") or "missing_planned_content"),
+                    reason=str(review.get("reason") or plan.objective),
+                    scope=scope,
+                )
+                execution_section = execution_plan.sections[index - 1]
+                await self._emit(
+                    "document.section.recovery_part_planned",
+                    status="running",
+                    section_id=plan.section_id,
+                    section_index=index,
+                    plan_revision=execution_plan.revision,
+                    issue_code=review.get("issue_code"),
+                )
+                part_result = await author_planned_section(
+                    self,
+                    brief=brief,
+                    section_plan=plan,
+                    execution_plan=execution_plan,
+                    execution_section=execution_section,
+                    section_index=index,
+                    previous_drafts=drafts,
+                    evidence_pack=evidence_pack_input,
+                    authoring_summary=authoring_summary,
+                    workflow_id=workflow_id,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    checkpoint_base=checkpoint_base,
+                    resumed_parts=part_result.execution.parts,
+                )
+                markdown = part_result.markdown
+                quality = _evaluate_section_quality(
+                    plan=plan,
+                    markdown=markdown,
+                    evidence_pack=evidence_pack_input,
+                    contract=self._contract,
+                    revision_rounds=1,
+                    output_truncated=False,
+                )
+                quality = await self._apply_completeness_review(
+                    plan=plan,
+                    markdown=markdown,
+                    quality=quality,
+                )
             await self._emit(
                 "document.section.quality_checked",
                 # ponytail: use gate_failed (not failed) so A2A stream guards
@@ -1368,47 +1529,6 @@ class SectionedLongformAuthor:
                 section_index=index,
                 quality=quality.to_metadata(),
             )
-            revision_rounds = 0
-            while (
-                not quality.passed
-                and revision_rounds < self._max_section_revision_rounds
-            ):
-                revision_rounds += 1
-                markdown, output_truncated = await self._draft_section(
-                    brief=brief,
-                    plan=plan,
-                    section_index=index,
-                    previous=drafts,
-                    evidence_pack=evidence_pack_input,
-                    running_context=running_context,
-                    revision_feedback=quality,
-                    output_slots_remaining=len(outline) - index + 2,
-                )
-                if output_truncated:
-                    await self._emit(
-                        "document.section.truncation_detected",
-                        status="degraded",
-                        section_id=plan.section_id,
-                        section_title=plan.title,
-                        section_index=index,
-                        revision_round=revision_rounds,
-                    )
-                quality = _evaluate_section_quality(
-                    plan=plan,
-                    markdown=markdown,
-                    evidence_pack=evidence_pack_input,
-                    contract=self._contract,
-                    revision_rounds=revision_rounds,
-                    output_truncated=output_truncated,
-                )
-                await self._emit(
-                    "document.section.quality_checked",
-                    status="passed" if quality.passed else "gate_failed",
-                    section_id=plan.section_id,
-                    section_title=plan.title,
-                    section_index=index,
-                    quality=quality.to_metadata(),
-                )
             if not quality.passed:
                 hard_failures = quality.hard_failures
                 if (
@@ -1441,6 +1561,7 @@ class SectionedLongformAuthor:
                     unique_sources_available=quality.unique_sources_available,
                     unique_sources_cited=quality.unique_sources_cited,
                     degraded=True,
+                    completeness_review=quality.completeness_review,
                 )
                 degraded_sections.append(
                     {
@@ -1483,27 +1604,31 @@ class SectionedLongformAuthor:
                     quality=quality.to_metadata(),
                 )
             )
-            if self._contract.running_context and len(drafts) > window_k:
-                # The section that just left the recent-body window is folded once
-                # into the running summary (incremental fold).
-                dropped = drafts[len(drafts) - window_k - 1]
-                running_summary = await self._fold_running_summary(
-                    running_summary,
-                    dropped,
-                    output_slots_remaining=len(outline) - index + 2,
-                )
+            authoring_summary = await self._refresh_authoring_summary(
+                prior_summary=authoring_summary,
+                execution_plan=execution_plan,
+                drafts=drafts,
+                accepted_parts=part_result.execution.parts,
+                evidence_pack=evidence_pack_input,
+            )
             await self._checkpoint(
+                checkpoint_schema="document-authoring-checkpoint.v2",
                 current_phase="draft_sections",
                 length_profile=length_profile,
                 outline=[asdict(item) for item in outline],
                 outline_ref=outline_ref,
                 drafts=[_draft_resume_record(draft) for draft in drafts],
                 degraded_sections=degraded_sections,
-                running_summary=running_summary,
+                authoring_execution_plan=execution_plan.to_mapping(),
+                authoring_plan_revision=part_result.execution.plan_revision,
+                authoring_context_summary=authoring_summary,
+                current_section_id="",
+                accepted_parts=[],
+                **self._authoring_call_budget.metadata(),
             )
 
         await self._emit(
-            "document.final.polish_started",
+            "document.final.deterministic_assembly_started",
             status="running",
             section_count=len(drafts),
             length_profile=self._contract.length_profile,
@@ -1581,6 +1706,39 @@ class SectionedLongformAuthor:
             },
         )
 
+    async def _apply_completeness_review(
+        self,
+        *,
+        plan: SectionPlan,
+        markdown: str,
+        quality: SectionQualityGateResult,
+    ) -> SectionQualityGateResult:
+        if quality.hard_failures:
+            return quality
+        self._reserve_authoring_call("review")
+        review = await review_section_completeness(
+            self._llm,
+            section_title=plan.title,
+            section_objective=plan.objective,
+            markdown=markdown,
+        )
+        failures = quality.failures
+        if not review.complete:
+            failures = tuple(dict.fromkeys((*failures, "semantic_incomplete")))
+        await self._emit(
+            "document.section.completeness_reviewed",
+            status="passed" if review.complete else "gate_failed",
+            section_id=plan.section_id,
+            section_title=plan.title,
+            issue_code=review.issue_code,
+            complete=review.complete,
+        )
+        return replace(
+            quality,
+            failures=failures,
+            completeness_review=review.to_metadata(),
+        )
+
     async def _emit(self, event: str, **metadata: Any) -> None:
         sink = self._phase_event_sink
         if sink is None:
@@ -1649,6 +1807,62 @@ class SectionedLongformAuthor:
                 )
             )
         return drafts
+
+    async def _revalidate_resumed_drafts(
+        self,
+        drafts: list[SectionDraft],
+    ) -> list[SectionDraft]:
+        """Admit legacy checkpoint drafts only after ADR-114 completeness checks."""
+        admitted: list[SectionDraft] = []
+        for draft in drafts:
+            quality = dict(draft.quality)
+            hard_failures = quality.get("hard_failures")
+            mechanical = (
+                markdown_structure_violation(draft.markdown)
+                or (
+                    "glued_heading"
+                    if _GLUED_HEADING_RE.search(draft.markdown)
+                    else None
+                )
+                or (
+                    None
+                    if _section_has_heading(draft.markdown, draft.plan.title)
+                    else "missing_section_heading"
+                )
+            )
+            if (
+                mechanical is not None
+                or isinstance(hard_failures, (list, tuple))
+                and bool(hard_failures)
+            ):
+                await self._emit(
+                    "document.section.resume_invalidated",
+                    status="gate_failed",
+                    section_id=draft.plan.section_id,
+                    section_title=draft.plan.title,
+                    reason=mechanical or "blocking_quality_failure",
+                )
+                break
+            review = quality.get("completeness_review")
+            if not isinstance(review, Mapping) or review.get("complete") is not True:
+                reviewed = await review_section_completeness(
+                    self._llm,
+                    section_title=draft.plan.title,
+                    section_objective=draft.plan.objective,
+                    markdown=draft.markdown,
+                )
+                if not reviewed.complete:
+                    await self._emit(
+                        "document.section.resume_invalidated",
+                        status="gate_failed",
+                        section_id=draft.plan.section_id,
+                        section_title=draft.plan.title,
+                        reason=reviewed.issue_code,
+                    )
+                    break
+                quality["completeness_review"] = reviewed.to_metadata()
+            admitted.append(replace(draft, quality=quality))
+        return admitted
 
     async def _read_resume_artifact_text(self, artifact_ref: Mapping[str, Any]) -> str:
         artifacts = getattr(self._platform, "artifacts", None)
@@ -1975,71 +2189,81 @@ class SectionedLongformAuthor:
             tuple(fallback[: max(self._contract.min_outline_sections, 1)]),
         )
 
-    def _compose_running_context(
+    async def _refresh_authoring_summary(
         self,
+        *,
+        prior_summary: Mapping[str, Any],
+        execution_plan: Any,
         drafts: list[SectionDraft],
-        running_summary: str,
-    ) -> str:
-        """Build the bounded "document so far" context for the next section.
-
-        Recent sections (last ``running_context_window_k``) are included verbatim
-        so the most relevant continuity cues are exact; earlier sections are
-        represented by the rolling summary. The footprint is bounded by the window
-        plus the summary cap, independent of total document length.
-        """
-        window_k = max(0, self._contract.running_context_window_k)
-        window = drafts[-window_k:] if window_k else []
-        parts: list[str] = []
-        summary = running_summary.strip()
-        if summary:
-            parts.append(
-                "Earlier sections (running summary — covered points, key claims, "
-                f"terminology):\n{summary}"
+        accepted_parts: Any,
+        evidence_pack: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        covered = list(prior_summary.get("covered_objectives") or [])
+        covered.extend(
+            part.accepted.plan.objective_digest for part in accepted_parts
+        )
+        covered = list(dict.fromkeys(str(item) for item in covered if str(item)))
+        all_objectives = [
+            part.objective_digest
+            for section in execution_plan.sections
+            for part in section.parts
+        ]
+        unresolved = [item for item in all_objectives if item not in covered]
+        evidence_refs = [
+            {
+                "artifact_id": str(item.get("artifact_id") or ""),
+                "artifact_ref": str(item.get("ref") or ""),
+            }
+            for item in evidence_pack.get("items", [])
+            if isinstance(item, Mapping)
+        ]
+        if self._last_authoring_context_pressure == "normal":
+            summary = deterministic_authoring_summary(
+                covered_objectives=covered,
+                unresolved_objectives=unresolved,
+                evidence_refs=evidence_refs,
+                continuity_notes=(
+                    str(prior_summary.get("previous_part_handoff") or ""),
+                ),
             )
-        for draft in window:
-            body = draft.markdown.strip()
-            if body:
-                parts.append(f"Recent section — {draft.plan.title}:\n{body}")
-        return "\n\n".join(parts)
-
-    async def _fold_running_summary(
-        self,
-        prior_summary: str,
-        dropped: SectionDraft,
-        output_slots_remaining: int = 1,
-    ) -> str:
-        """Incrementally fold one section into the rolling running summary."""
-        prompt = (
-            "Maintain a running summary of a document being written section by "
-            "section. Fold the new section into the prior running summary. Keep it "
-            "factual and structural — covered points, key claims and numbers, "
-            "defined terms, and still-open threads. Do not add information that is "
-            "not in the sections and do not editorialize. Be concise.\n\n"
-            f"Prior running summary:\n{prior_summary.strip() or '(none yet)'}\n\n"
-            f"New section to fold in — {dropped.plan.title}:\n"
-            f"{dropped.markdown.strip()[:16000]}"
+            await self._emit(
+                "document.authoring_context.compacted",
+                status="complete",
+                compaction_mode="deterministic",
+                pressure="normal",
+            )
+            return summary
+        self._reserve_authoring_call("compaction")
+        if accepted_parts:
+            latest = accepted_parts[-1].accepted.markdown
+        elif drafts:
+            latest = drafts[-1].markdown
+        else:
+            latest = ""
+        compaction_input_tokens = _positive_int(
+            self._context_budget.get("max_authoring_compaction_input_tokens"),
+            12_000,
         )
-        # A summary cut at its token budget is still a usable lossy summary,
-        # so truncation is accepted here.
-        streamed = await self._stream_llm_text(
-            purpose="running_summary",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_output_tokens=max(1, self._contract.running_summary_max_tokens),
-            output_slots_remaining=output_slots_remaining,
+        latest = latest[: compaction_input_tokens * 4]
+        compacted = await compact_authoring_context(
+            self._llm,
+            prior_summary=prior_summary,
+            accepted_part_markdown=latest,
+            covered_objectives=covered,
+            unresolved_objectives=unresolved,
+            evidence_refs=evidence_refs,
             model=self._contract.running_summary_model or None,
-            extra_metadata={"section_id": dropped.plan.section_id},
+            max_output_tokens=self._contract.running_summary_max_tokens,
         )
-        summary = streamed.text.strip()
-        if not summary:
-            return prior_summary
         await self._emit(
-            "document.running_summary.updated",
+            "document.authoring_context.compacted",
             status="complete",
-            section_id=dropped.plan.section_id,
-            summary_chars=len(summary),
+            compaction_mode=compacted.mode,
+            source_digest=compacted.source_digest,
+            fallback_reason=compacted.error,
+            pressure=self._last_authoring_context_pressure,
         )
-        return summary
+        return dict(compacted.summary)
 
     async def _draft_section(
         self,
@@ -2049,11 +2273,13 @@ class SectionedLongformAuthor:
         section_index: int | None,
         previous: list[SectionDraft],
         evidence_pack: Mapping[str, Any],
-        running_context: str = "",
-        revision_feedback: SectionQualityGateResult | None = None,
+        planned_part: PlannedPart | None = None,
+        coverage_cursor: SectionCoverageCursor | None = None,
+        previous_part_handoff: str = "",
+        authoring_summary: Mapping[str, Any] | None = None,
         output_slots_remaining: int = 1,
     ) -> tuple[str, bool]:
-        """Draft one section; returns ``(markdown, output_truncated)``."""
+        """Draft one bounded Planned Part; returns text and truncation state."""
         previous_index = [
             {
                 "section_id": draft.plan.section_id,
@@ -2062,60 +2288,137 @@ class SectionedLongformAuthor:
             }
             for draft in previous
         ]
-        story_block = ""
-        if running_context.strip():
-            story_block = (
-                "Document so far (maintain continuity; do not repeat what is already "
-                f"covered):\n{running_context.strip()}\n\n"
-            )
-        prompt = (
-            "Write exactly this document section in Markdown.\n"
-            "Return only the requested section: do not write a document title or "
-            "any other level-one or level-two heading. The response must start "
-            f"with `## {plan.title}` and may use level-three-or-deeper headings "
-            "inside that section. Treat any whole-document instructions below as "
-            "global requirements, but satisfy only the current section in this "
-            "response.\n"
-            "Use the original task, the document-so-far context, the prior section "
-            "ledger, and the bounded evidence pack. Continue naturally from what "
-            "earlier sections established and avoid repeating their content. "
-            "Do not include process notes. Cite artifact refs or source refs when evidence is used. "
-            f"Write at least {plan.min_words} substantive information units.\n\n"
-            f"{self._skill_instruction_block()}"
-            f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
-            f"Section plan:\n{_json_block(asdict(plan), limit=4000)}\n\n"
-            f"{story_block}"
-            f"Prior section refs:\n{_json_block(previous_index, limit=4000)}\n\n"
-            f"Evidence pack:\n{_json_block(evidence_pack, limit=24000)}"
+        objective = planned_part.objective if planned_part else plan.objective
+        target = (
+            planned_part.target_information_units
+            if planned_part
+            else plan.min_words
         )
-        if revision_feedback is not None:
-            prompt += (
-                "\n\nSection quality gate failed. Rewrite the same section only, "
-                "fixing these deterministic failures without dropping evidence:\n"
-                f"{_json_block(revision_feedback.to_metadata(), limit=4000)}"
-            )
-            if "output_truncated" in revision_feedback.failures:
-                prompt += (
-                    "\n\nThe previous draft was cut off at the output length limit "
-                    "before it could finish. Write a tighter version of this "
-                    "section that reaches a proper conclusion: prioritise the most "
-                    "important content, compress or drop secondary detail, and "
-                    "always end with a complete sentence."
-                )
+        maximum = (
+            planned_part.max_information_units
+            if planned_part
+            else max(plan.min_words + 1, int(plan.min_words * 1.25))
+        )
+        cursor = coverage_cursor or SectionCoverageCursor(section_id=plan.section_id)
+        envelope = build_authoring_context_envelope(
+            context_budget=self._context_budget,
+            authoring_contract={
+                "artifact_type": self._artifact_type,
+                "skill_instructions": self._authoring_instructions,
+            },
+            objective={
+                "section": asdict(plan),
+                "planned_part": asdict(planned_part) if planned_part else {},
+                "objective": objective,
+            },
+            required_evidence=evidence_pack,
+            coverage_cursor=asdict(cursor),
+            previous_part_handoff=previous_part_handoff,
+            authoring_summary=authoring_summary or {},
+            optional_evidence={"prior_section_refs": previous_index},
+        )
+        self._last_authoring_context_pressure = envelope.pressure
+        await self._emit(
+            "document.authoring_context.envelope_built",
+            status="complete",
+            section_id=plan.section_id,
+            part_identity=planned_part.part_identity if planned_part else "",
+            envelope=envelope.to_metadata(),
+        )
+        prompt = (
+            "Write one complete bounded part of a document section in Markdown.\n"
+            f"The parent section is `## {plan.title}`. Do not emit a level-one or "
+            "level-two heading; use level-three-or-deeper local headings only. "
+            "Finish every sentence, list, table, and code block started in this "
+            "part. Cover only the current objective and do not anticipate later "
+            "parts. Use the previous-part handoff to open naturally without "
+            "repeating accepted content. Cite supplied artifact/source refs when "
+            "evidence is used. Return prose only, without process notes.\n"
+            f"Target {target} substantive information units and do not exceed "
+            f"{maximum} information units.\n\n"
+            f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
+            f"{envelope.render()}"
+        )
+        # Token counts and word-like information units are not interchangeable.
+        # Keep enough provider headroom to reach a semantic boundary; calibrating
+        # this near the information-unit target caused real providers to stop
+        # mid-word.  Acceptance has an independent runaway ceiling, and the
+        # document-level budget remains the aggregate protection against
+        # context/output explosion.
+        part_output_tokens = max(256, maximum * 8)
+        if self._output_token_ceiling is not None:
+            part_output_tokens = min(part_output_tokens, self._output_token_ceiling)
+        self._reserve_authoring_call("draft")
         streamed = await self._stream_llm_text(
-            purpose="revise_section" if revision_feedback is not None else "draft_section",
+            purpose="draft_planned_part",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.25,
-            max_output_tokens=self._output_token_ceiling,
+            max_output_tokens=part_output_tokens,
             output_slots_remaining=output_slots_remaining,
             section=plan,
             section_index=section_index,
             extra_metadata={
-                "revision_round": revision_feedback.revision_rounds + 1
-                if revision_feedback is not None
-                else 0,
+                "part_identity": planned_part.part_identity if planned_part else "",
+                "part_ordinal": planned_part.ordinal if planned_part else 1,
+                "part_total": planned_part.total if planned_part else 1,
+                "target_information_units": target,
+                "max_information_units": maximum,
             },
         )
+        continuation_attempt = 0
+        max_continuations = _positive_int(
+            self._context_budget.get("max_part_continuations"),
+            2,
+        )
+        while streamed.truncated and continuation_attempt < max_continuations:
+            continuation_attempt += 1
+            await self._emit(
+                "document.part.continuation_requested",
+                status="running",
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                continuation_attempt=continuation_attempt,
+            )
+            continuation_prompt = (
+                "The preceding planned-part output stopped at the provider token "
+                "limit. Continue exactly where it ended. Do not restart, repeat, "
+                "summarize, add a section heading, or expand the scope. Complete "
+                "the current sentence and any open list, table, or code block, "
+                "then finish only this planned part in the fewest words needed. "
+                "Return continuation text only.\n\n"
+                f"Current objective:\n{objective}\n\n"
+                "Tail of interrupted output:\n"
+                f"{streamed.text[-6000:]}"
+            )
+            self._reserve_authoring_call("draft")
+            continuation = await self._stream_llm_text(
+                purpose="continue_truncated_planned_part",
+                messages=[{"role": "user", "content": continuation_prompt}],
+                temperature=0.1,
+                max_output_tokens=part_output_tokens,
+                output_slots_remaining=output_slots_remaining,
+                section=plan,
+                section_index=section_index,
+                extra_metadata={
+                    "part_identity": planned_part.part_identity if planned_part else "",
+                    "continuation_attempt": continuation_attempt,
+                },
+            )
+            if not continuation.text:
+                break
+            streamed = _StreamedLlmText(
+                text=streamed.text + continuation.text,
+                finish_reason=continuation.finish_reason,
+                truncated=continuation.truncated,
+            )
+            await self._emit(
+                "document.part.continuation_completed",
+                status="complete" if not streamed.truncated else "incomplete",
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                continuation_attempt=continuation_attempt,
+                truncated=streamed.truncated,
+            )
         content = streamed.text.strip()
         if not content:
             return "", streamed.truncated
@@ -2129,35 +2432,16 @@ class SectionedLongformAuthor:
         section = scrub_artifact_scaffolding(
             _isolate_requested_section(content, plan.title)
         ).text
+        if _PLACEHOLDER_SECTION_RE.search(section):
+            raise RuntimeError(
+                "document_planned_part_rejected:placeholder_section"
+            )
         return section, streamed.truncated
 
-    async def _bounded_for_final_prompt(
-        self,
-        text: str,
-        *,
-        limit: int,
-        phase: str,
-        seam_index: int | None = None,
-    ) -> str:
-        """Bound prompt input, emitting a warning event when truncation occurs.
-
-        Finalize prompts still cap their input, but truncation is never silent:
-        a ``document.final.truncation_warning`` event records the dropped span so
-        a degraded long-document finalize is observable rather than hidden.
-        """
-        if len(text) <= limit:
-            return text
-        metadata: dict[str, Any] = {
-            "status": "degraded",
-            "phase": phase,
-            "input_chars": len(text),
-            "limit": limit,
-            "dropped_chars": len(text) - limit,
-        }
-        if seam_index is not None:
-            metadata["cluster_index"] = seam_index
-        await self._emit("document.final.truncation_warning", **metadata)
-        return text[:limit]
+    def _reserve_authoring_call(self, kind: str) -> None:
+        budget = self._authoring_call_budget
+        if budget is not None:
+            budget.reserve(kind)
 
     async def _polish_final(
         self,
@@ -2165,351 +2449,29 @@ class SectionedLongformAuthor:
         brief: Mapping[str, Any],
         drafts: list[SectionDraft],
     ) -> str:
+        del brief
         combined = _join_markdown(draft.markdown for draft in drafts)
-        if self._defer_final_artifact:
-            violation = _section_structure_violation(combined, drafts)
-            if violation is not None:
-                raise RuntimeError(f"document_final_structure_invalid:{violation}")
-            return combined
-        if self._contract.finalization == "boundary_stitch":
-            finalized = await self._boundary_stitch_final(
-                brief=brief,
-                drafts=drafts,
-                combined=combined,
+        if self._contract.finalization not in KNOWN_FINALIZATION_MODES:
+            raise RuntimeError(
+                "document_finalization_mode_invalid:"
+                f"{self._contract.finalization}"
             )
-        elif self._contract.finalization == "progressive_section_merge":
-            finalized = await self._progressive_merge_final(
-                brief=brief,
-                drafts=drafts,
-                combined=combined,
-            )
-        else:
-            if self._contract.finalization != "single_polish":
-                # Contracts built via from_mapping cannot reach here; this guards
-                # direct dataclass construction so an unknown mode is at least
-                # loud before the single_polish fallback runs.
-                await self._emit(
-                    "document.finalize.mode_fallback",
-                    status="degraded",
-                    requested_mode=self._contract.finalization,
-                    effective_mode="single_polish",
-                )
-            finalized = await self._single_polish_final(
-                brief=brief,
-                drafts=drafts,
-                combined=combined,
-            )
-        violation = _section_structure_violation(finalized, drafts)
+        violation = _document_integrity_violation(combined, drafts)
         if violation is not None:
-            await self._emit(
-                "document.final.structure_fallback",
-                status="degraded",
-                reason=violation,
-                expected_section_titles=[draft.plan.title for draft in drafts],
+            raise RuntimeError(
+                f"document_final_integrity_invalid:{violation}"
             )
-            finalized = combined
-        return finalized
-
-    async def _boundary_stitch_final(
-        self,
-        *,
-        brief: Mapping[str, Any],
-        drafts: list[SectionDraft],
-        combined: str,
-    ) -> str:
-        """Smooth seams between sections without rewriting their bodies.
-
-        Section bodies are preserved verbatim; the LLM only produces a short
-        transition between adjacent sections. The prompt footprint is O(number
-        of seams) and independent of total document length, so this path never
-        truncates and cannot drop section content.
-        """
-        bodies = [draft.markdown.strip() for draft in drafts if draft.markdown.strip()]
-        if len(bodies) <= 1:
-            return combined
-        if self._document_output_budget.remaining_tokens == 0:
-            await self._emit(
-                "document.final.output_budget_exhausted",
-                status="degraded",
-                **self._document_output_budget.metadata(),
+        mechanical_violation = markdown_structure_violation(combined)
+        if mechanical_violation is not None:
+            raise RuntimeError(
+                f"document_final_integrity_invalid:{mechanical_violation}"
             )
-            return combined
-        finalize_model = self._contract.finalize_model or None
-        limit = max(200, self._contract.seam_context_chars)
-
-        async def _bridge(seam_index: int) -> str:
-            before = bodies[seam_index]
-            after = bodies[seam_index + 1]
-            await self._emit(
-                "document.final.seam_stitch_started",
-                status="running",
-                seam_index=seam_index + 1,
-                seam_count=len(bodies) - 1,
-                length_profile=self._contract.length_profile,
-            )
-            prompt = (
-                "You are smoothing the seam between two adjacent sections of one "
-                "Markdown document. Write ONLY a short transition of at most two "
-                "sentences (no heading, no list) that leads from the first section "
-                "into the second. Do not repeat or summarize their content and do "
-                "not introduce new facts or citations. If the flow already reads "
-                "smoothly, return an empty string.\n\n"
-                f"Original task:\n{_json_block(brief, limit=4000)}\n\n"
-                f"End of preceding section:\n{before[-limit:]}\n\n"
-                f"Start of following section:\n{after[:limit]}"
-            )
-            try:
-                streamed = await self._stream_llm_text(
-                    purpose="seam_stitch",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_output_tokens=200,
-                    output_slots_remaining=len(bodies) - seam_index - 1,
-                    model=finalize_model,
-                    extra_metadata={"seam_index": seam_index + 1},
-                )
-            except DocumentAuthoringBudgetExceeded:
-                # Seam bridges are optional polish. The section bodies are the
-                # durable deliverable, so an exhausted shared budget degrades
-                # to a plain join instead of failing the whole agent run.
-                await self._emit(
-                    "document.final.output_budget_exhausted",
-                    status="degraded",
-                    phase="boundary_stitch",
-                    seam_index=seam_index + 1,
-                    **self._document_output_budget.metadata(),
-                )
-                return ""
-            bridge = streamed.text.strip()
-            if streamed.truncated:
-                # A cut-off transition reads worse than a plain join; sections
-                # stand on their own, so drop the bridge entirely.
-                bridge = ""
-            await self._emit(
-                "document.final.seam_stitch_completed",
-                status="degraded" if streamed.truncated else "complete",
-                seam_index=seam_index + 1,
-                bridged=bool(bridge),
-                truncated=streamed.truncated,
-                length_profile=self._contract.length_profile,
-            )
-            return bridge
-
-        bridges = await asyncio.gather(
-            *(_bridge(seam_index) for seam_index in range(len(bodies) - 1))
+        await self._emit(
+            "document.final.deterministic_assembly_completed",
+            status="complete",
+            section_count=len(drafts),
         )
-        parts: list[str] = [bodies[0]]
-        for index in range(1, len(bodies)):
-            bridge = bridges[index - 1]
-            if bridge:
-                parts.append(bridge)
-            parts.append(bodies[index])
-        return _join_markdown(parts)
-
-    async def _single_polish_final(
-        self,
-        *,
-        brief: Mapping[str, Any],
-        drafts: list[SectionDraft],
-        combined: str,
-    ) -> str:
-        refs = [
-            {
-                "section_id": draft.plan.section_id,
-                "title": draft.plan.title,
-                "artifact_ref": draft.artifact_ref.get("artifact_ref"),
-            }
-            for draft in drafts
-        ]
-        draft_sections = await self._bounded_for_final_prompt(
-            combined,
-            limit=48000,
-            phase="single_polish",
-        )
-        prompt = (
-            "Polish the concatenated sections into one coherent final Markdown deliverable. "
-            "Preserve factual claims, source refs, and section substance. "
-            "Improve transitions and remove repetition without shortening materially.\n\n"
-            f"{self._skill_instruction_block()}"
-            f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
-            f"Section artifact refs:\n{_json_block(refs, limit=6000)}\n\n"
-            f"Draft sections:\n{draft_sections}"
-        )
-        if self._document_output_budget.remaining_tokens == 0:
-            await self._emit(
-                "document.final.output_budget_exhausted",
-                status="degraded",
-                **self._document_output_budget.metadata(),
-            )
-            return combined
-        try:
-            streamed = await self._stream_llm_text(
-                purpose="final_polish",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_output_tokens=self._output_token_ceiling,
-                model=self._contract.finalize_model or None,
-                extra_metadata={"section_count": len(drafts)},
-            )
-        except DocumentAuthoringBudgetExceeded:
-            await self._emit(
-                "document.final.output_budget_exhausted",
-                status="degraded",
-                phase="single_polish",
-                **self._document_output_budget.metadata(),
-            )
-            return combined
-        if streamed.truncated:
-            # A rewrite cut at the output limit ends mid-document. The combined
-            # sections are complete, so they always beat a truncated polish.
-            # (The retention guard below cannot catch this case: a rewrite that
-            # EXPANDED the drafts before being cut still passes the shrinkage
-            # check — that is exactly how a half-written deliverable shipped as
-            # a success in prod.)
-            await self._emit(
-                "document.final.truncation_warning",
-                status="degraded",
-                phase="single_polish_output",
-                finish_reason=streamed.finish_reason,
-                polished_chars=len(streamed.text),
-            )
-            return combined
-        polished = streamed.text.strip()
-        if not polished:
-            return combined
-        combined_units = _information_units(combined)
-        polished_units = _information_units(polished)
-        if (
-            combined_units > 0
-            and polished_units < int(combined_units * self._contract.final_retention_ratio)
-        ):
-            return combined
-        return polished
-
-    async def _progressive_merge_final(
-        self,
-        *,
-        brief: Mapping[str, Any],
-        drafts: list[SectionDraft],
-        combined: str,
-    ) -> str:
-        if len(drafts) <= 3:
-            return await self._single_polish_final(
-                brief=brief,
-                drafts=drafts,
-                combined=combined,
-            )
-
-        if self._document_output_budget.remaining_tokens == 0:
-            await self._emit(
-                "document.final.output_budget_exhausted",
-                status="degraded",
-                **self._document_output_budget.metadata(),
-            )
-            return combined
-        merged_clusters: list[str] = []
-        cluster_size = 4
-        for cluster_index, start in enumerate(range(0, len(drafts), cluster_size), start=1):
-            cluster = drafts[start : start + cluster_size]
-            cluster_markdown = _join_markdown(draft.markdown for draft in cluster)
-            cluster_refs = [
-                {
-                    "section_id": draft.plan.section_id,
-                    "title": draft.plan.title,
-                    "artifact_ref": draft.artifact_ref.get("artifact_ref"),
-                }
-                for draft in cluster
-            ]
-            await self._emit(
-                "document.final.merge_cluster_started",
-                status="running",
-                cluster_index=cluster_index,
-                section_count=len(cluster),
-                length_profile=self._contract.length_profile,
-            )
-            cluster_sections = await self._bounded_for_final_prompt(
-                cluster_markdown,
-                limit=36000,
-                phase="merge_cluster",
-                seam_index=cluster_index,
-            )
-            prompt = (
-                "Merge this cluster of adjacent report sections into one "
-                "coherent Markdown chapter block. Preserve all factual claims, "
-                "source refs, headings, and confidence markers. Reduce only "
-                "clear repetition.\n\n"
-                f"{self._skill_instruction_block()}"
-                f"Original task:\n{_json_block(brief, limit=6000)}\n\n"
-                f"Cluster section refs:\n{_json_block(cluster_refs, limit=5000)}\n\n"
-                f"Cluster draft sections:\n{cluster_sections}"
-            )
-            try:
-                streamed = await self._stream_llm_text(
-                    purpose="merge_cluster",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_output_tokens=self._output_token_ceiling,
-                    model=self._contract.finalize_model or None,
-                    extra_metadata={
-                        "cluster_index": cluster_index,
-                        "section_count": len(cluster),
-                    },
-                )
-            except DocumentAuthoringBudgetExceeded:
-                await self._emit(
-                    "document.final.output_budget_exhausted",
-                    status="degraded",
-                    phase="merge_cluster",
-                    cluster_index=cluster_index,
-                    **self._document_output_budget.metadata(),
-                )
-                merged_clusters.extend(
-                    draft.markdown.strip() for draft in drafts[start:]
-                )
-                return _join_markdown(merged_clusters)
-            if streamed.truncated:
-                # Same rule as single_polish: complete originals beat a
-                # merge that was cut mid-cluster.
-                await self._emit(
-                    "document.final.truncation_warning",
-                    status="degraded",
-                    phase="merge_cluster_output",
-                    cluster_index=cluster_index,
-                    finish_reason=streamed.finish_reason,
-                )
-                merged = cluster_markdown
-            else:
-                merged = streamed.text.strip() or cluster_markdown
-            if _information_units(merged) < int(
-                _information_units(cluster_markdown)
-                * self._contract.final_retention_ratio
-            ):
-                merged = cluster_markdown
-            merged_clusters.append(merged)
-            await self._emit(
-                "document.final.merge_cluster_completed",
-                status="complete",
-                cluster_index=cluster_index,
-                section_count=len(cluster),
-                length_profile=self._contract.length_profile,
-            )
-
-        cluster_drafts = [
-            SectionDraft(
-                plan=SectionPlan(
-                    section_id=f"merged-cluster-{index}",
-                    title=f"Merged Cluster {index}",
-                    min_words=1,
-                ),
-                markdown=markdown,
-            )
-            for index, markdown in enumerate(merged_clusters, start=1)
-        ]
-        return await self._single_polish_final(
-            brief=brief,
-            drafts=cluster_drafts,
-            combined=_join_markdown(merged_clusters),
-        )
+        return combined
 
     async def _record_outline(
         self,
@@ -2602,6 +2564,55 @@ class SectionedLongformAuthor:
             },
         )
         return dict(result.get("artifact") or {})
+
+    async def _record_part(
+        self,
+        section: SectionPlan,
+        accepted: AcceptedPart,
+        *,
+        section_index: int,
+        workflow_id: str | None,
+        thread_id: str | None,
+        agent_id: str | None,
+    ) -> dict[str, Any]:
+        if not self._ledger.is_available:
+            raise RuntimeError("artifact_create_failed:artifact_ledger_unavailable")
+        result = await self._ledger.create_artifact(
+            artifact_type=f"{self._artifact_type}.section_part",
+            content=accepted.markdown,
+            content_type="text/markdown",
+            summary=_preview(accepted.markdown),
+            workflow_id=workflow_id,
+            thread_id=thread_id,
+            step_id=self._step_id,
+            agent_id=agent_id,
+            metadata={
+                "role": "section_part",
+                "internal_authoring_artifact": True,
+                "section_id": section.section_id,
+                "section_index": section_index,
+                "part_identity": accepted.plan.part_identity,
+                "part_ordinal": accepted.plan.ordinal,
+                "part_total": accepted.plan.total,
+                "objective_digest": accepted.plan.objective_digest,
+                "evidence_digest": accepted.plan.evidence_digest,
+                "content_digest": accepted.content_digest,
+                "capability_id": self._capability_id,
+            },
+        )
+        if result.get("available", True) is False or not result.get("artifact_ref"):
+            raise RuntimeError(
+                "artifact_create_failed:"
+                f"{result.get('error') or 'artifact_ref_missing'}"
+            )
+        stored = await self._read_resume_artifact_text(result)
+        stored_digest = hashlib.sha256(stored.encode()).hexdigest()
+        if stored_digest != accepted.content_digest:
+            raise RuntimeError(
+                "document_part_artifact_digest_mismatch:"
+                f"{accepted.plan.part_identity}"
+            )
+        return result
 
     async def _record_final(
         self,
@@ -2794,15 +2805,16 @@ def _evaluate_section_quality(
     if not text:
         failures.append("empty_section")
     if output_truncated:
-        # The provider stopped at max_output_tokens, so the section ends
-        # mid-thought. Soft failure: the revision loop asks for a rewrite
-        # that fits the budget; if that also truncates, degrade enforcement
-        # records the cut in the gap note instead of shipping it silently.
+        # A token-limit stop is blocking. The bounded revision loop may rewrite
+        # it, but degrade enforcement must never publish it.
         failures.append("output_truncated")
     if _PLACEHOLDER_SECTION_RE.search(text):
         failures.append("placeholder_section")
     if _GLUED_HEADING_RE.search(text):
         failures.append("glued_heading")
+    structure_failure = markdown_structure_violation(text)
+    if structure_failure is not None:
+        failures.append(structure_failure)
     if not _section_has_heading(text, plan.title):
         failures.append("missing_section_heading")
     if information_units < plan.min_words:
@@ -3026,6 +3038,27 @@ def _section_structure_violation(
     ]
     if actual != expected:
         return "missing_or_reordered_section_headings"
+    return None
+
+
+def _document_integrity_violation(
+    markdown: str,
+    drafts: list[SectionDraft],
+) -> str | None:
+    structure = _section_structure_violation(markdown, drafts)
+    if structure is not None:
+        return structure
+    mechanical = markdown_structure_violation(markdown)
+    if mechanical is not None:
+        return mechanical
+    for draft in drafts:
+        quality = draft.quality if isinstance(draft.quality, Mapping) else {}
+        review = quality.get("completeness_review")
+        if not isinstance(review, Mapping) or review.get("complete") is not True:
+            return f"section_completeness_missing:{draft.plan.section_id}"
+        hard_failures = quality.get("hard_failures")
+        if isinstance(hard_failures, (list, tuple)) and hard_failures:
+            return f"section_blocking_failure:{draft.plan.section_id}"
     return None
 
 

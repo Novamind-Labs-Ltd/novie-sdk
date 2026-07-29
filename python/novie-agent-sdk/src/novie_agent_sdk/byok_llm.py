@@ -187,7 +187,14 @@ class ByokLlmClient:
         response = await llm.ainvoke([_to_msg(m) for m in messages])
         content = getattr(response, "content", str(response))
         usage_metadata = dict(getattr(response, "usage_metadata", None) or {})
-        return {"content": content, "usage_metadata": usage_metadata}
+        response_metadata = dict(
+            getattr(response, "response_metadata", None) or {}
+        )
+        return {
+            "content": content,
+            "usage_metadata": usage_metadata,
+            "response_metadata": response_metadata,
+        }
 
     async def structured(
         self,

@@ -21,6 +21,53 @@ class DocumentAuthoringDeadlineExceeded(TimeoutError):
     code = "document_authoring_deadline_exceeded"
 
 
+class DocumentAuthoringCallBudgetExceeded(RuntimeError):
+    """Raised before an unplanned authoring LLM call can begin."""
+
+    code = "document_authoring_call_budget_exceeded"
+
+
+@dataclass(slots=True)
+class AuthoringCallBudget:
+    """Bound content, review, and compaction calls independently and in total."""
+
+    total_limit: int
+    compaction_limit: int
+    review_limit: int
+    used: int = 0
+    compactions_used: int = 0
+    reviews_used: int = 0
+
+    def reserve(self, kind: str) -> None:
+        if self.used >= self.total_limit:
+            raise DocumentAuthoringCallBudgetExceeded(
+                "document_authoring_call_budget_exceeded: total"
+            )
+        if kind == "compaction" and self.compactions_used >= self.compaction_limit:
+            raise DocumentAuthoringCallBudgetExceeded(
+                "document_authoring_call_budget_exceeded: compaction"
+            )
+        if kind == "review" and self.reviews_used >= self.review_limit:
+            raise DocumentAuthoringCallBudgetExceeded(
+                "document_authoring_call_budget_exceeded: review"
+            )
+        self.used += 1
+        if kind == "compaction":
+            self.compactions_used += 1
+        elif kind == "review":
+            self.reviews_used += 1
+
+    def metadata(self) -> dict[str, int]:
+        return {
+            "authoring_llm_calls_used": self.used,
+            "authoring_llm_calls_limit": self.total_limit,
+            "authoring_compaction_calls_used": self.compactions_used,
+            "authoring_compaction_calls_limit": self.compaction_limit,
+            "authoring_review_calls_used": self.reviews_used,
+            "authoring_review_calls_limit": self.review_limit,
+        }
+
+
 @dataclass(slots=True)
 class DocumentOutputBudget:
     """Resolve the per-call completion ceiling for sectioned authoring.
@@ -100,6 +147,8 @@ def _positive_int(value: Any) -> int:
 
 
 __all__ = [
+    "AuthoringCallBudget",
+    "DocumentAuthoringCallBudgetExceeded",
     "DocumentAuthoringBudgetExceeded",
     "DocumentAuthoringDeadlineExceeded",
     "DocumentOutputBudget",
