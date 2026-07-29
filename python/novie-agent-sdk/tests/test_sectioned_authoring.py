@@ -58,8 +58,17 @@ class _FakeLlm:
         messages: list[dict[str, str]],
         output_schema: dict[str, Any],
         temperature: float,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
-        self.structured_prompts.append(messages[0]["content"])
+        self.structured_prompts.append("\n".join(item["content"] for item in messages))
+        if output_schema.get("title") == "SectionCompletenessReview":
+            return {
+                "structured": {
+                    "complete": True,
+                    "issue_code": "none",
+                    "reason": "The candidate section fulfills its objective.",
+                }
+            }
         return {
             "structured": {
                 "length_profile": "short",
@@ -156,7 +165,14 @@ class _LongFakeLlm(_FakeLlm):
         messages: list[dict[str, str]],
         output_schema: dict[str, Any],
         temperature: float,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
+        if output_schema.get("title") == "SectionCompletenessReview":
+            return await super().structured(
+                messages=messages,
+                output_schema=output_schema,
+                temperature=temperature,
+            )
         return {
             "structured": {
                 "length_profile": "long",
@@ -367,6 +383,13 @@ class _FakeArtifacts:
             "metadata": {"bytes": len(artifact_id)},
         }
 
+    async def read_text(self, artifact_id: str, **_kwargs: Any) -> str:
+        self.read_artifact_ids.append(artifact_id)
+        for artifact in self.created:
+            if artifact["artifact_id"] == artifact_id:
+                return str(artifact.get("content") or "")
+        return ""
+
 
 class _FakeWorkpads:
     def __init__(self) -> None:
@@ -447,30 +470,19 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
     ]
     assert [item["artifact_type"] for item in platform.artifacts.created] == [
         "example_document.outline",
+        "example_document.section_part",
         "example_document.section",
+        "example_document.section_part",
         "example_document.section",
         "example_document",
     ]
-    assert platform.workpads.final_refs == ["artifact://artifact-4"]
+    assert platform.workpads.final_refs == ["artifact://artifact-6"]
     assert all(item["reasoning_mode"] == "disabled" for item in llm.chat_kwargs)
     event_names = [event["event"] for event in phase_events]
-    assert [name for name in event_names if name.startswith("document.")] == [
-        "document.profile.selected",
-        "document.outline.started",
-        "document.outline.completed",
-        "document.section.started",
-        "document.section.evidence_pack_built",
-        "document.section.gap_detected",
-        "document.section.quality_checked",
-        "document.section.completed",
-        "document.section.started",
-        "document.section.evidence_pack_built",
-        "document.section.gap_detected",
-        "document.section.quality_checked",
-        "document.section.completed",
-        "document.final.polish_started",
-        "document.final.created",
-    ]
+    assert event_names.count("document.part.completed") == 2
+    assert event_names.count("document.section.completed") == 2
+    assert "document.final.deterministic_assembly_completed" in event_names
+    assert "document.final.created" in event_names
     assert "agent.llm_call.started" in event_names
     assert "agent.llm_call.delta" in event_names
     assert "agent.llm_call.completed" in event_names
@@ -627,7 +639,12 @@ metadata:
     assert "## Context" in result.authoring_result.markdown
     assert result.finalize_strategy == "sectioned_longform"
     assert result.finalize_attempts == 1
-    assert result.quality_result.outcome.status == "skipped"
+    assert result.quality_result.outcome.status == "passed"
+    assert result.quality_result.outcome.final_review_passed is True
+    assert (
+        result.quality_result.outcome.metadata["quality_publication_eligible"]
+        is True
+    )
     assert result.started_event.metadata["event"] == "sectioned_authoring_started"
     assert result.started_event.metadata["example_mode"] == "write"
     assert result.completed_event.metadata["event"] == "sectioned_authoring_completed"
@@ -772,12 +789,9 @@ async def test_sectioned_author_passes_budget_ceiling_to_content_calls() -> None
         agent_id="writer",
     )
 
-    # Two section drafts and final polish each get the model output top.
-    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        64000,
-        64000,
-        64000,
-    ]
+    # Planned Parts receive a bounded per-call allowance below the provider top;
+    # deterministic final assembly makes no third LLM call.
+    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [256, 256]
 
 
 @pytest.mark.asyncio
@@ -808,12 +822,40 @@ async def test_sectioned_author_defers_output_cap_to_platform_without_budget() -
         agent_id="writer",
     )
 
-    # No budget contract → None, so the platform applies its own default.
-    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [
-        None,
-        None,
-        None,
-    ]
+    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [256, 256]
+
+
+@pytest.mark.asyncio
+async def test_large_planned_part_uses_tight_provider_allowance() -> None:
+    platform = _FakePlatform()
+    llm = _LongFakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=platform,
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "coverage_model": "example_document",
+            "min_outline_sections": 1,
+            "max_outline_sections": 1,
+            "min_section_words": 300,
+            "default_section_words": 300,
+            "max_section_words": 320,
+        },
+    )
+
+    await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        agent_id="writer",
+    )
+
+    allowances = [item["max_output_tokens"] for item in llm.chat_kwargs]
+    assert allowances
+    assert all(allowance <= 3200 for allowance in allowances)
 
 
 def test_sectioned_contract_applies_active_length_profile(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -850,7 +892,7 @@ metadata:
             max_units: 900
             max_revision_rounds: 2
             max_document_output_tokens: 12000
-            finalization: progressive_section_merge
+            finalization: deterministic_assembly
             evidence_depth: deep
 ---
 
@@ -875,12 +917,12 @@ metadata:
     assert authoring["default_section_words"] == 520
     assert authoring["max_section_revision_rounds"] == 2
     assert authoring["max_document_output_tokens"] == 12000
-    assert authoring["finalization"] == "progressive_section_merge"
+    assert authoring["finalization"] == "deterministic_assembly"
     assert authoring["evidence_depth"] == "deep"
 
 
 @pytest.mark.asyncio
-async def test_long_profile_uses_progressive_section_merge() -> None:
+async def test_long_profile_uses_deterministic_assembly() -> None:
     platform = _FakePlatform()
     phase_events: list[dict[str, Any]] = []
     llm = _LongFakeLlm()
@@ -900,7 +942,7 @@ async def test_long_profile_uses_progressive_section_merge() -> None:
             "min_section_words": 5,
             "default_section_words": 5,
             "max_section_words": 20,
-            "finalization": "progressive_section_merge",
+            "finalization": "deterministic_assembly",
             "final_retention_ratio": 0.8,
         },
         phase_event_sink=phase_events.append,
@@ -916,14 +958,15 @@ async def test_long_profile_uses_progressive_section_merge() -> None:
 
     assert len(result.drafts) == 5
     assert result.ledger["length_profile"] == "long"
-    assert result.ledger["finalization"] == "progressive_section_merge"
-    assert any("Merge this cluster" in prompt for prompt in llm.chat_prompts)
-    assert [event["event"] for event in phase_events].count(
-        "document.final.merge_cluster_started"
-    ) == 2
-    assert [event["event"] for event in phase_events].count(
-        "document.final.merge_cluster_completed"
-    ) == 2
+    assert result.ledger["finalization"] == "deterministic_assembly"
+    assert not any("Merge this cluster" in prompt for prompt in llm.chat_prompts)
+    assert any(
+        event["event"] == "document.final.deterministic_assembly_completed"
+        for event in phase_events
+    )
+    assert "document.final.merge_cluster_started" not in [
+        event["event"] for event in phase_events
+    ]
 
 
 def test_outline_schema_carries_function_title() -> None:
@@ -1013,9 +1056,13 @@ async def test_sectioned_author_isolates_the_requested_section_from_a_whole_docu
     assert result.drafts[1].markdown == "## Recommendation\n\neta theta iota kappa lambda mu"
     assert result.markdown.count("## Context") == 1
     assert result.markdown.count("## Recommendation") == 1
-    draft_prompts = [prompt for prompt in llm.chat_prompts if "Section plan:" in prompt]
+    draft_prompts = [
+        prompt
+        for prompt in llm.chat_prompts
+        if "Write one complete bounded part" in prompt
+    ]
     assert len(draft_prompts) == 2
-    assert all("Return only the requested section" in prompt for prompt in draft_prompts)
+    assert all("Cover only the current objective" in prompt for prompt in draft_prompts)
 
 
 def test_unique_sources_gate_caps_requirement_by_available_evidence() -> None:
@@ -1191,7 +1238,7 @@ async def test_sectioned_author_rejects_empty_section_drafts() -> None:
         },
     )
 
-    with pytest.raises(RuntimeError, match="section_quality_gate_failed:context"):
+    with pytest.raises(RuntimeError, match="empty_part"):
         await author.author(
             brief={"title": "Example document"},
             upstream={},
@@ -1273,7 +1320,12 @@ async def test_deferred_intermediate_artifacts_keep_successful_final_in_memory()
     assert result.markdown
     assert result.ledger["final_ref"] == {}
     assert result.ledger["artifact_refs"] == []
-    assert platform.artifacts.created == []
+    assert [
+        item["artifact_type"] for item in platform.artifacts.created
+    ] == [
+        "example_document.section_part",
+        "example_document.section_part",
+    ]
     assert platform.workpads.entries == []
     assert platform.workpads.final_refs == []
 
@@ -1310,7 +1362,9 @@ async def test_deferred_final_keeps_resume_sections_without_committing_final() -
 
     assert [item["artifact_type"] for item in platform.artifacts.created] == [
         "example_document.outline",
+        "example_document.section_part",
         "example_document.section",
+        "example_document.section_part",
         "example_document.section",
     ]
     assert result.ledger["final_ref"] == {}
@@ -1319,6 +1373,30 @@ async def test_deferred_final_keeps_resume_sections_without_committing_final() -
         "Polish the concatenated sections" in prompt
         for prompt in author._llm.chat_prompts
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_resumed_draft_is_revalidated_for_completeness() -> None:
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+    )
+    legacy = SectionDraft(
+        plan=SectionPlan(
+            section_id="overview",
+            title="Overview",
+            objective="Provide a complete overview.",
+        ),
+        markdown="## Overview\n\nComplete overview body.",
+        quality={},
+    )
+
+    admitted = await author._revalidate_resumed_drafts([legacy])
+
+    assert admitted[0].quality["completeness_review"]["complete"] is True
 
 
 @pytest.mark.asyncio
@@ -1340,7 +1418,7 @@ async def test_deferred_final_rejects_glued_heading_in_accepted_section() -> Non
 
     with pytest.raises(
         RuntimeError,
-        match="document_final_structure_invalid:glued_heading",
+        match="document_final_integrity_invalid:glued_heading",
     ):
         await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
 
@@ -1365,7 +1443,7 @@ async def test_deferred_intermediate_artifacts_do_not_persist_on_failure() -> No
         defer_intermediate_artifacts=True,
     )
 
-    with pytest.raises(RuntimeError, match="section_quality_gate_failed:context"):
+    with pytest.raises(RuntimeError, match="empty_part"):
         await author.author(
             brief={"title": "Example document"},
             upstream={},
@@ -1437,333 +1515,11 @@ async def test_sectioned_author_excludes_current_step_workpad_refs_from_evidence
     draft_prompts = [
         prompt
         for prompt in llm.chat_prompts
-        if "Write exactly this document section" in prompt
+        if "Write one complete bounded part" in prompt
     ]
     assert draft_prompts
     assert "evidence from upstream-s1-evidence" in draft_prompts[0]
     assert "stale-s2-section" not in draft_prompts[0]
-
-
-class _BridgeLlm:
-    """Minimal LLM double for the boundary-stitch finalize path."""
-
-    def __init__(self, bridge: str = "With that established, the next theme follows.") -> None:
-        self.bridge = bridge
-        self.chat_kwargs: list[dict[str, Any]] = []
-        self.chat_prompts: list[str] = []
-
-    async def chat(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        temperature: float,
-        **kwargs: Any,
-    ) -> dict[str, str]:
-        self.chat_kwargs.append(dict(kwargs))
-        self.chat_prompts.append(messages[0]["content"])
-        return {"content": self.bridge}
-
-
-def _stitch_author(
-    llm: Any,
-    *,
-    phase_events: list[dict[str, Any]],
-    contract_extra: dict[str, Any] | None = None,
-    context_budget: dict[str, Any] | None = None,
-) -> SectionedLongformAuthor:
-    contract: dict[str, Any] = {
-        "coverage_model": "example_document",
-        "finalization": "boundary_stitch",
-    }
-    if contract_extra:
-        contract.update(contract_extra)
-    return SectionedLongformAuthor(
-        llm_facade=llm,
-        platform=_FakePlatform(),
-        artifact_type="example_document",
-        step_id="s1",
-        capability_id="agent.example.write_document",
-        context_budget=context_budget,
-        authoring_contract=contract,
-        phase_event_sink=phase_events.append,
-    )
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_preserves_bodies_and_inserts_bridges() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm(bridge="With that established, attention turns to the next theme.")
-    author = _stitch_author(llm, phase_events=phase_events)
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Context"),
-            markdown="## Context\n\nalpha beta gamma.",
-        ),
-        SectionDraft(
-            plan=SectionPlan(section_id="s2", title="Findings"),
-            markdown="## Findings\n\ndelta epsilon zeta.",
-        ),
-        SectionDraft(
-            plan=SectionPlan(section_id="s3", title="Recommendation"),
-            markdown="## Recommendation\n\neta theta iota.",
-        ),
-    ]
-    combined = "\n\n".join(draft.markdown for draft in drafts)
-
-    result = await author._boundary_stitch_final(
-        brief={"title": "Doc"}, drafts=drafts, combined=combined
-    )
-
-    # Every section body is preserved verbatim — the seam pass cannot drop content.
-    for draft in drafts:
-        assert draft.markdown in result
-    # A transition bridge was inserted between sections.
-    assert "With that established" in result
-    # One LLM call per seam (3 sections -> 2 seams), all seam-stitch prompts.
-    assert len(llm.chat_prompts) == 2
-    assert all("smoothing the seam" in prompt for prompt in llm.chat_prompts)
-    events = [event["event"] for event in phase_events]
-    assert events.count("document.final.seam_stitch_started") == 2
-    assert events.count("document.final.seam_stitch_completed") == 2
-    # Normal-size document must not trigger a truncation warning.
-    assert "document.final.truncation_warning" not in events
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_keeps_full_per_call_allowance_for_each_seam() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm(bridge="Next.")
-    author = _stitch_author(
-        llm,
-        phase_events=phase_events,
-        contract_extra={"max_document_output_tokens": 400},
-        context_budget={"max_output_tokens": 64000},
-    )
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id=f"s{index}", title=f"Section {index}"),
-            markdown=f"## Section {index}\n\nBody {index}.",
-        )
-        for index in range(1, 5)
-    ]
-
-    result = await author._boundary_stitch_final(
-        brief={"title": "Doc"},
-        drafts=drafts,
-        combined="\n\n".join(draft.markdown for draft in drafts),
-    )
-
-    assert all(draft.markdown in result for draft in drafts)
-    assert len(llm.chat_kwargs) == 3
-    # Seam bridges request 200 tokens each; profile document caps must not
-    # fair-share or starve later seams.
-    assert [item["max_output_tokens"] for item in llm.chat_kwargs] == [200, 200, 200]
-    assert not any(
-        event["event"] == "document.final.output_budget_exhausted"
-        for event in phase_events
-    )
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_single_section_skips_llm() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm()
-    author = _stitch_author(llm, phase_events=phase_events)
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Only"),
-            markdown="## Only\n\nalpha beta gamma.",
-        )
-    ]
-
-    result = await author._boundary_stitch_final(
-        brief={}, drafts=drafts, combined=drafts[0].markdown
-    )
-
-    assert result == drafts[0].markdown
-    assert llm.chat_prompts == []
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_forwards_finalize_model_override() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm(bridge="Next.")
-    author = _stitch_author(
-        llm,
-        phase_events=phase_events,
-        contract_extra={"finalize_model": "custom-finalize-model"},
-    )
-    drafts = [
-        SectionDraft(plan=SectionPlan(section_id="s1", title="A"), markdown="## A\n\nalpha beta."),
-        SectionDraft(plan=SectionPlan(section_id="s2", title="B"), markdown="## B\n\ngamma delta."),
-    ]
-
-    await author._boundary_stitch_final(
-        brief={}, drafts=drafts, combined="\n\n".join(d.markdown for d in drafts)
-    )
-
-    assert llm.chat_kwargs
-    assert all(kw.get("model") == "custom-finalize-model" for kw in llm.chat_kwargs)
-
-
-@pytest.mark.asyncio
-async def test_bounded_for_final_prompt_emits_truncation_warning() -> None:
-    phase_events: list[dict[str, Any]] = []
-    author = _stitch_author(_BridgeLlm(), phase_events=phase_events)
-
-    short = "x" * 100
-    assert (
-        await author._bounded_for_final_prompt(short, limit=200, phase="single_polish")
-        == short
-    )
-    assert all(
-        event["event"] != "document.final.truncation_warning" for event in phase_events
-    )
-
-    long = "y" * 500
-    bounded = await author._bounded_for_final_prompt(
-        long, limit=200, phase="single_polish"
-    )
-    assert bounded == "y" * 200
-    warnings = [
-        event
-        for event in phase_events
-        if event["event"] == "document.final.truncation_warning"
-    ]
-    assert len(warnings) == 1
-    assert warnings[0]["input_chars"] == 500
-    assert warnings[0]["dropped_chars"] == 300
-    assert warnings[0]["phase"] == "single_polish"
-
-
-def _running_context_author(
-    llm: Any,
-    *,
-    phase_events: list[dict[str, Any]],
-    contract_extra: dict[str, Any] | None = None,
-) -> SectionedLongformAuthor:
-    contract: dict[str, Any] = {
-        "coverage_model": "example_document",
-        "length_profile": "long",
-        "min_outline_sections": 5,
-        "max_outline_sections": 5,
-        "min_section_words": 5,
-        "default_section_words": 5,
-        "max_section_words": 20,
-        "running_context_window_k": 2,
-    }
-    if contract_extra:
-        contract.update(contract_extra)
-    return SectionedLongformAuthor(
-        llm_facade=llm,
-        platform=_FakePlatform(),
-        artifact_type="example_document",
-        step_id="s2",
-        capability_id="agent.example.write_document",
-        authoring_contract=contract,
-        phase_event_sink=phase_events.append,
-    )
-
-
-def test_compose_running_context_windows_bodies_and_summarizes_older() -> None:
-    author = _stitch_author(
-        _BridgeLlm(), phase_events=[], contract_extra={"running_context_window_k": 2}
-    )
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id=f"s{i}", title=f"T{i}"),
-            markdown=f"## T{i}\n\nbody-{i}",
-        )
-        for i in range(1, 5)
-    ]
-
-    ctx = author._compose_running_context(drafts, running_summary="EARLIER-SUMMARY")
-
-    # Older sections are represented by the summary, not their verbatim bodies.
-    assert "EARLIER-SUMMARY" in ctx
-    assert "body-1" not in ctx
-    assert "body-2" not in ctx
-    # The last k=2 sections are included verbatim.
-    assert "body-3" in ctx
-    assert "body-4" in ctx
-
-
-@pytest.mark.asyncio
-async def test_fold_running_summary_forwards_model_and_emits_event() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _BridgeLlm(bridge="FOLDED SUMMARY")
-    author = _stitch_author(
-        llm,
-        phase_events=phase_events,
-        contract_extra={
-            "running_summary_model": "sum-model",
-            "running_summary_max_tokens": 400,
-        },
-    )
-    dropped = SectionDraft(
-        plan=SectionPlan(section_id="s1", title="T1"),
-        markdown="## T1\n\nalpha beta gamma.",
-    )
-
-    out = await author._fold_running_summary("prior summary", dropped)
-
-    assert out == "FOLDED SUMMARY"
-    assert llm.chat_kwargs
-    assert all(kw.get("model") == "sum-model" for kw in llm.chat_kwargs)
-    assert any("Maintain a running summary" in prompt for prompt in llm.chat_prompts)
-    assert any(
-        event["event"] == "document.running_summary.updated" for event in phase_events
-    )
-
-
-@pytest.mark.asyncio
-async def test_running_context_feeds_prior_context_and_folds_incrementally() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _LongFakeLlm()
-    author = _running_context_author(llm, phase_events=phase_events)
-
-    await author.author(
-        brief={"title": "Doc"},
-        upstream={},
-        workflow_id="w",
-        thread_id="t",
-        agent_id="a",
-    )
-
-    # 5 sections, window k=2 -> one fold per section that leaves the window = 3.
-    fold_prompts = [p for p in llm.chat_prompts if "Maintain a running summary" in p]
-    assert len(fold_prompts) == 3
-    updates = [
-        event
-        for event in phase_events
-        if event["event"] == "document.running_summary.updated"
-    ]
-    assert len(updates) == 3
-    # Later section drafts carry the running-context block.
-    draft_prompts = [
-        p for p in llm.chat_prompts if "Write exactly this document section" in p
-    ]
-    assert any("Document so far" in p for p in draft_prompts)
-
-
-@pytest.mark.asyncio
-async def test_running_context_disabled_uses_refs_only() -> None:
-    phase_events: list[dict[str, Any]] = []
-    llm = _LongFakeLlm()
-    author = _running_context_author(
-        llm, phase_events=phase_events, contract_extra={"running_context": False}
-    )
-
-    await author.author(
-        brief={"title": "Doc"},
-        upstream={},
-        workflow_id="w",
-        thread_id="t",
-        agent_id="a",
-    )
-
-    assert all("Document so far" not in prompt for prompt in llm.chat_prompts)
-    assert all("Maintain a running summary" not in prompt for prompt in llm.chat_prompts)
 
 
 # --- finalization contract validation ---------------------------------------
@@ -1779,8 +1535,8 @@ def test_contract_accepts_known_finalization_modes() -> None:
         contract = SectionedAuthoringContract.from_mapping({"finalization": mode})
         assert contract.finalization == mode
     # Absent / empty values fall back to the default mode.
-    assert SectionedAuthoringContract.from_mapping({}).finalization == "single_polish"
-    assert SectionedAuthoringContract.from_mapping(None).finalization == "single_polish"
+    assert SectionedAuthoringContract.from_mapping({}).finalization == "deterministic_assembly"
+    assert SectionedAuthoringContract.from_mapping(None).finalization == "deterministic_assembly"
 
 
 def test_contract_rejects_unknown_finalization_mode() -> None:
@@ -1794,55 +1550,47 @@ def test_contract_rejects_unknown_finalization_mode() -> None:
     # The offending value and the valid modes are both named so the skill
     # author can fix SKILL.md without reading SDK source.
     assert "section_ledger_polish" in message
-    assert "boundary_stitch" in message
-    assert "progressive_section_merge" in message
-    assert "single_polish" in message
+    assert "deterministic_assembly" in message
 
 
 @pytest.mark.asyncio
-async def test_polish_final_emits_fallback_event_for_unvalidated_contract() -> None:
-    from novie_agent_sdk.sectioned_authoring import SectionedAuthoringContract
-
-    phase_events: list[dict[str, Any]] = []
-    polished = "## Context\n\nalpha beta gamma.\n\n## Findings\n\ndelta epsilon zeta."
-    llm = _BridgeLlm(bridge=polished)
+async def test_deterministic_finalization_preserves_accepted_sections_without_llm() -> None:
+    llm = _FakeLlm()
+    events: list[dict[str, Any]] = []
     author = SectionedLongformAuthor(
         llm_facade=llm,
         platform=_FakePlatform(),
         artifact_type="example_document",
         step_id="s1",
         capability_id="agent.example.write_document",
-        # Direct dataclass construction bypasses from_mapping validation.
-        authoring_contract=SectionedAuthoringContract(
-            finalization="section_ledger_polish"
-        ),
-        phase_event_sink=phase_events.append,
+        phase_event_sink=events.append,
     )
+    complete = {
+        "completeness_review": {
+            "complete": True,
+            "issue_code": "none",
+            "reason": "complete",
+        },
+        "hard_failures": [],
+    }
     drafts = [
         SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Context"),
+            plan=SectionPlan(section_id="context", title="Context"),
             markdown="## Context\n\nalpha beta gamma.",
+            quality=complete,
         ),
         SectionDraft(
-            plan=SectionPlan(section_id="s2", title="Findings"),
+            plan=SectionPlan(section_id="findings", title="Findings"),
             markdown="## Findings\n\ndelta epsilon zeta.",
+            quality=complete,
         ),
     ]
 
     result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
 
-    fallback_events = [
-        event for event in phase_events
-        if event["event"] == "document.finalize.mode_fallback"
-    ]
-    assert len(fallback_events) == 1
-    assert fallback_events[0]["requested_mode"] == "section_ledger_polish"
-    assert fallback_events[0]["effective_mode"] == "single_polish"
-    # The single_polish path actually ran.
-    assert any(
-        "Polish the concatenated sections" in prompt for prompt in llm.chat_prompts
-    )
-    assert result == polished
+    assert result == "\n\n".join(draft.markdown for draft in drafts)
+    assert llm.chat_prompts == []
+    assert events[-1]["event"] == "document.final.deterministic_assembly_completed"
 
 
 # --- output truncation detection (stop_reason) --------------------------------
@@ -1854,7 +1602,18 @@ def test_finish_reason_normalisation() -> None:
     # OpenAI-compatible shape.
     assert _finish_reason_of({"response_metadata": {"finish_reason": "length"}}) == "length"
     # Anthropic-style shape, case-insensitive.
-    assert _finish_reason_of({"response_metadata": {"stop_reason": "MAX_TOKENS"}}) == "max_tokens"
+    assert _finish_reason_of({"response_metadata": {"stop_reason": "MAX_TOKENS"}}) == "length"
+    assert (
+        _finish_reason_of(
+            {
+                "response_metadata": {
+                    "finish_reason": "stop",
+                    "stop_reason": "MAX_TOKENS",
+                }
+            }
+        )
+        == "length"
+    )
     assert _finish_reason_of({"response_metadata": {"finish_reason": "stop"}}) == "stop"
     # Unreadable shapes degrade to "not truncated", never to an error.
     assert _finish_reason_of({"response_metadata": {}}) == ""
@@ -1876,13 +1635,167 @@ class _TruncatingDraftLlm(_FakeLlm):
         result = await super().chat(
             messages=messages, temperature=temperature, **kwargs
         )
-        if "Write exactly this document section" in messages[0]["content"]:
+        if (
+            "Write one complete bounded part" in messages[0]["content"]
+            or "Continue exactly where it ended" in messages[0]["content"]
+        ):
             return {**result, "response_metadata": {"finish_reason": "length"}}
         return dict(result)
 
 
+class _ContinuingDraftLlm(_FakeLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupted = False
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        prompt = messages[0]["content"]
+        self.chat_kwargs.append(dict(kwargs))
+        self.chat_prompts.append(prompt)
+        if "Continue exactly where it ended" in prompt:
+            return {
+                "content": "ma delta epsilon zeta",
+                "response_metadata": {"finish_reason": "stop"},
+            }
+        if "Write one complete bounded part" in prompt and not self.interrupted:
+            self.interrupted = True
+            return {
+                "content": "## Context\n\nalpha beta gam",
+                "response_metadata": {"finish_reason": "length"},
+            }
+        return await super().chat(
+            messages=messages,
+            temperature=temperature,
+            **kwargs,
+        )
+
+
+class _IncompleteThenCompleteLlm(_FakeLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completeness_calls = 0
+
+    async def structured(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        output_schema: dict[str, Any],
+        temperature: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if output_schema.get("title") != "SectionCompletenessReview":
+            return await super().structured(
+                messages=messages,
+                output_schema=output_schema,
+                temperature=temperature,
+                **kwargs,
+            )
+        self.completeness_calls += 1
+        if self.completeness_calls == 1:
+            return {
+                "structured": {
+                    "complete": False,
+                    "issue_code": "cut_off",
+                    "reason": "The second option ends mid-thought.",
+                }
+            }
+        return {
+            "structured": {
+                "complete": True,
+                "issue_code": "none",
+                "reason": "The revised section completes its objective.",
+            }
+        }
+
+
 @pytest.mark.asyncio
-async def test_truncated_section_draft_fails_gate_retries_then_degrades() -> None:
+async def test_semantically_incomplete_section_is_revised_before_acceptance() -> None:
+    phase_events: list[dict[str, Any]] = []
+    llm = _IncompleteThenCompleteLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+            "max_section_revision_rounds": 1,
+        },
+        defer_final_artifact=True,
+        phase_event_sink=phase_events.append,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+    )
+
+    reviews = [
+        event for event in phase_events
+        if event["event"] == "document.section.completeness_reviewed"
+    ]
+    assert reviews[0]["status"] == "gate_failed"
+    assert reviews[0]["issue_code"] == "cut_off"
+    assert any(
+        "Resolve the remaining completeness issue" in prompt
+        for prompt in llm.chat_prompts
+    )
+    assert any(
+        event["event"] == "document.section.recovery_part_planned"
+        for event in phase_events
+    )
+    assert len(result.drafts) == 2
+    assert all(
+        draft.quality["completeness_review"]["complete"] is True
+        for draft in result.drafts
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncated_part_continues_before_repartitioning() -> None:
+    events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=_ContinuingDraftLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "min_outline_sections": 2,
+            "max_outline_sections": 2,
+            "min_section_words": 5,
+            "default_section_words": 5,
+            "max_section_words": 20,
+        },
+        defer_final_artifact=True,
+        phase_event_sink=events.append,
+    )
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+    )
+
+    assert "alpha beta gamma delta epsilon zeta" in result.markdown
+    event_names = [event["event"] for event in events]
+    assert "document.part.continuation_requested" in event_names
+    assert "document.part.continuation_completed" in event_names
+    assert "document.part.repartitioned" not in event_names
+
+
+@pytest.mark.asyncio
+async def test_truncated_planned_part_fails_closed_when_it_cannot_be_split() -> None:
     platform = _FakePlatform()
     phase_events: list[dict[str, Any]] = []
     llm = _TruncatingDraftLlm()
@@ -1904,101 +1817,18 @@ async def test_truncated_section_draft_fails_gate_retries_then_degrades() -> Non
         phase_event_sink=phase_events.append,
     )
 
-    result = await author.author(
-        brief={"title": "Example document"},
-        upstream={},
-        workflow_id="workflow-1",
-        thread_id="thread-1",
-        agent_id="writer",
-    )
+    with pytest.raises(RuntimeError, match="document_part_completion_exhausted"):
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
 
     event_names = [event["event"] for event in phase_events]
-    # Detected on the first draft AND on the revision of each section.
-    assert event_names.count("document.section.truncation_detected") == 4
-    # The gate records the truncation as a deterministic failure.
-    quality_events = [
-        event for event in phase_events
-        if event["event"] == "document.section.quality_checked"
-    ]
-    assert all(
-        "output_truncated" in event["quality"]["failures"]
-        for event in quality_events
-    )
-    # The revision prompt tells the model to finish within the budget.
-    revision_prompts = [
-        prompt for prompt in llm.chat_prompts
-        if "Section quality gate failed" in prompt
-    ]
-    assert revision_prompts
-    assert all(
-        "cut off at the output length limit" in prompt
-        for prompt in revision_prompts
-    )
-    # Degrade enforcement ships the section, and names the cut structurally —
-    # the internal gate identifier must not leak into the reader-facing text.
-    assert "output_truncated" not in result.markdown
-    assert any(
-        "output_truncated" in section["failures"]
-        for section in result.ledger["degraded_sections"]
-    )
-
-
-@pytest.mark.asyncio
-async def test_single_polish_truncated_output_returns_combined() -> None:
-    class _TruncatedPolishLlm(_BridgeLlm):
-        async def chat(
-            self,
-            *,
-            messages: list[dict[str, str]],
-            temperature: float,
-            **kwargs: Any,
-        ) -> dict[str, Any]:
-            result = await super().chat(
-                messages=messages, temperature=temperature, **kwargs
-            )
-            return {**result, "response_metadata": {"stop_reason": "max_tokens"}}
-
-    phase_events: list[dict[str, Any]] = []
-    # Longer than the combined drafts: the shrinkage-only retention guard
-    # would have accepted this cut-off rewrite.
-    polished = (
-        "## Context\n\nalpha beta gamma delta epsilon zeta eta theta.\n\n"
-        "## Findings\n\niota kappa lambda mu nu xi omicron pi rho sigma"
-    )
-    llm = _TruncatedPolishLlm(bridge=polished)
-    author = SectionedLongformAuthor(
-        llm_facade=llm,
-        platform=_FakePlatform(),
-        artifact_type="example_document",
-        step_id="s1",
-        capability_id="agent.example.write_document",
-        authoring_contract={"finalization": "single_polish"},
-        phase_event_sink=phase_events.append,
-    )
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Context"),
-            markdown="## Context\n\nalpha beta gamma.",
-        ),
-        SectionDraft(
-            plan=SectionPlan(section_id="s2", title="Findings"),
-            markdown="## Findings\n\ndelta epsilon zeta.",
-        ),
-    ]
-
-    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
-
-    # Complete originals beat the truncated rewrite.
-    assert polished not in result
-    for draft in drafts:
-        assert draft.markdown in result
-    warnings = [
-        event for event in phase_events
-        if event["event"] == "document.final.truncation_warning"
-    ]
-    assert len(warnings) == 1
-    assert warnings[0]["phase"] == "single_polish_output"
-    assert warnings[0]["finish_reason"] == "max_tokens"
+    assert event_names.count("document.part.started") == 1
+    assert "document.part.completed" not in event_names
 
 
 @pytest.mark.asyncio
@@ -2034,53 +1864,6 @@ async def test_fixed_shape_outline_uses_canonical_section_titles_without_llm() -
 
 
 @pytest.mark.asyncio
-async def test_single_polish_with_glued_heading_returns_validated_drafts() -> None:
-    phase_events: list[dict[str, Any]] = []
-    polished = (
-        "## Context\n\n"
-        + "alpha beta gamma delta epsilon zeta " * 8
-        + ".## Findings\n\n"
-        + "iota kappa lambda mu nu xi omicron pi " * 8
-    )
-    author = SectionedLongformAuthor(
-        llm_facade=_BridgeLlm(bridge=polished),
-        platform=_FakePlatform(),
-        artifact_type="example_document",
-        step_id="s1",
-        capability_id="agent.example.write_document",
-        authoring_contract={"finalization": "single_polish"},
-        phase_event_sink=phase_events.append,
-    )
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Context"),
-            markdown="## Context\n\nalpha beta gamma.",
-        ),
-        SectionDraft(
-            plan=SectionPlan(section_id="s2", title="Findings"),
-            markdown="## Findings\n\ndelta epsilon zeta.",
-        ),
-    ]
-
-    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
-
-    assert result == "## Context\n\nalpha beta gamma.\n\n## Findings\n\ndelta epsilon zeta."
-    fallback = [
-        event for event in phase_events
-        if event["event"] == "document.final.structure_fallback"
-    ]
-    assert len(fallback) == 1
-    assert fallback[0]["expected_section_titles"] == ["Context", "Findings"]
-    # The reason names which check fired, so production tells us whether glued
-    # headings actually occur or the reordering check does all the work. This
-    # case is a glued heading (see the test name); it previously reported
-    # "missing_or_reordered_section_headings" because a glued level-two heading
-    # also breaks the outline comparison — accurate about the fallback, but
-    # misleading about the cause.
-    assert fallback[0]["reason"] == "glued_heading"
-
-
-@pytest.mark.asyncio
 async def test_terminal_output_byte_contract_does_not_compact_canonical_document() -> None:
     phase_events: list[dict[str, Any]] = []
     author = SectionedLongformAuthor(
@@ -2093,17 +1876,33 @@ async def test_terminal_output_byte_contract_does_not_compact_canonical_document
             "max_output_tokens": 1000,
             "max_document_output_bytes": 128,
         },
-        authoring_contract={"finalization": "single_polish"},
+        authoring_contract={"finalization": "deterministic_assembly"},
         phase_event_sink=phase_events.append,
     )
     drafts = [
         SectionDraft(
             plan=SectionPlan(section_id="context", title="Context"),
             markdown="## Context\n\n" + "Evidence detail. " * 20,
+            quality={
+                "completeness_review": {
+                    "complete": True,
+                    "issue_code": "none",
+                    "reason": "complete",
+                },
+                "hard_failures": [],
+            },
         ),
         SectionDraft(
             plan=SectionPlan(section_id="findings", title="Findings"),
             markdown="## Findings\n\n" + "Recommendation detail. " * 20,
+            quality={
+                "completeness_review": {
+                    "complete": True,
+                    "issue_code": "none",
+                    "reason": "complete",
+                },
+                "hard_failures": [],
+            },
         ),
     ]
 
@@ -2116,54 +1915,6 @@ async def test_terminal_output_byte_contract_does_not_compact_canonical_document
         event["event"].startswith("document.final.output_byte")
         for event in phase_events
     )
-
-
-@pytest.mark.asyncio
-async def test_boundary_stitch_drops_truncated_bridge() -> None:
-    class _TruncatedBridgeLlm(_BridgeLlm):
-        async def chat(
-            self,
-            *,
-            messages: list[dict[str, str]],
-            temperature: float,
-            **kwargs: Any,
-        ) -> dict[str, Any]:
-            result = await super().chat(
-                messages=messages, temperature=temperature, **kwargs
-            )
-            return {**result, "response_metadata": {"finish_reason": "length"}}
-
-    phase_events: list[dict[str, Any]] = []
-    llm = _TruncatedBridgeLlm(bridge="A transition that was cut mid-")
-    author = _stitch_author(llm, phase_events=phase_events)
-    drafts = [
-        SectionDraft(
-            plan=SectionPlan(section_id="s1", title="Context"),
-            markdown="## Context\n\nalpha beta gamma.",
-        ),
-        SectionDraft(
-            plan=SectionPlan(section_id="s2", title="Findings"),
-            markdown="## Findings\n\ndelta epsilon zeta.",
-        ),
-    ]
-    combined = "\n\n".join(draft.markdown for draft in drafts)
-
-    result = await author._boundary_stitch_final(
-        brief={"title": "Doc"}, drafts=drafts, combined=combined
-    )
-
-    # Bodies are intact; the cut-off bridge is dropped, not stitched in.
-    for draft in drafts:
-        assert draft.markdown in result
-    assert "A transition that was cut mid-" not in result
-    seam_events = [
-        event for event in phase_events
-        if event["event"] == "document.final.seam_stitch_completed"
-    ]
-    assert len(seam_events) == 1
-    assert seam_events[0]["truncated"] is True
-    assert seam_events[0]["bridged"] is False
-    assert seam_events[0]["status"] == "degraded"
 
 
 class _ScaffoldLeakingLlm(_FakeLlm):

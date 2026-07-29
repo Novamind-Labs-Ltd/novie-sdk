@@ -76,6 +76,15 @@ def _ledger() -> dict[str, Any]:
     }
 
 
+def _publishable_quality() -> dict[str, Any]:
+    return {
+        "quality_status": "passed",
+        "quality_checks_passed": True,
+        "quality_final_review_passed": True,
+        "quality_publication_eligible": True,
+    }
+
+
 def test_manifest_orders_durable_section_refs_without_bodies() -> None:
     manifest = build_document_finalization_manifest(
         artifact_type="example_document",
@@ -107,6 +116,12 @@ def test_document_event_transports_manifest_instead_of_large_body() -> None:
         narrative=large_body,
         final_payload_type=_FinalPayload,
         recovery_type=_Recovery,
+        quality={
+            "quality_status": "passed",
+            "quality_checks_passed": True,
+            "quality_final_review_passed": True,
+            "quality_publication_eligible": True,
+        },
         authoring_ledger=_ledger(),
     )
 
@@ -157,6 +172,12 @@ def test_document_event_maps_invalid_manifest_to_repairable_public_failure() -> 
             narrative="",
             final_payload_type=_FinalPayload,
             recovery_type=_Recovery,
+            quality={
+                "quality_status": "passed",
+                "quality_checks_passed": True,
+                "quality_final_review_passed": True,
+                "quality_publication_eligible": True,
+            },
             authoring_ledger={"enabled": True},
         )
 
@@ -181,6 +202,7 @@ def test_document_event_uses_canonical_title_without_summary_fallback_or_truncat
         narrative="PRD narrative",
         final_payload_type=_FinalPayload,
         recovery_type=_Recovery,
+        quality=_publishable_quality(),
     )
 
     assert event.output["document_title"] == document_title
@@ -208,6 +230,7 @@ def test_document_event_rejects_blank_document_title(document_title: str) -> Non
             narrative="Report",
             final_payload_type=_FinalPayload,
             recovery_type=_Recovery,
+            quality=_publishable_quality(),
         )
 
 
@@ -233,3 +256,21 @@ def test_task_brief_document_identity_reports_lineage_when_title_is_missing() ->
     assert "step_id=step-final" in message
     assert "brief_id=brief-114" in message
     assert "capability_id=agent.pm.prd_create" in message
+
+
+def test_document_event_rejects_non_publishable_quality() -> None:
+    with pytest.raises(RuntimeError, match="document_deliverable_not_publishable"):
+        build_document_deliverable_event(
+            card=None,
+            structured={"summary": "Incomplete report"},
+            document_title="Incomplete report",
+            artifact_type="example_document",
+            artifact_family="document",
+            capability_id="agent.example.write",
+            analysis="# Incomplete",
+            narrative="Incomplete",
+            final_payload_type=_FinalPayload,
+            recovery_type=_Recovery,
+            quality={"quality_status": "skipped"},
+            authoring_ledger=_ledger(),
+        )

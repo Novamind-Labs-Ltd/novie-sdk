@@ -267,7 +267,12 @@ def test_build_document_deliverable_event_builds_common_envelope() -> None:
         finalize_attempts=2,
         degraded_flags=["tool.degraded"],
         checkpoint_id="ckpt-1",
-        quality={"quality_status": "skipped"},
+        quality={
+            "quality_status": "passed",
+            "quality_checks_passed": True,
+            "quality_final_review_passed": True,
+            "quality_publication_eligible": True,
+        },
         authoring_ledger={
             "section_count": 1,
             "outline_ref": {
@@ -307,6 +312,8 @@ def test_build_document_deliverable_event_builds_common_envelope() -> None:
     assert payload["recovery"]["checkpoint_id"] == "ckpt-1"
     assert payload["recovery"]["finalize_attempts"] == 2
     assert payload["recovery"]["metadata"]["authoring_ledger"]["section_count"] == 1
+    assert event.output["quality_status"] == "passed"
+    assert event.output["quality_publication_eligible"] is True
     assert event.metadata["skill_contract"] == {"strategy": "sectioned_longform"}
 
 

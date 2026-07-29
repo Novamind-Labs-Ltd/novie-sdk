@@ -213,7 +213,7 @@ def test_document_final_output_namespaces_legacy_quality_status() -> None:
         },
     )
 
-    assert "status" not in output
+    assert output["status"] == "completed"
     assert "reason" not in output
     assert output["quality_status"] == "skipped"
     assert output["quality_reason"] == "sectioned_authoring_llm_failed"

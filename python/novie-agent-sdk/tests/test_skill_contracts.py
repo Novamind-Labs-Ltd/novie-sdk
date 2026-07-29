@@ -169,7 +169,7 @@ metadata:
             default_units: 520
             max_units: 900
             max_revision_rounds: 2
-            finalization: progressive_section_merge
+            finalization: deterministic_assembly
             evidence_depth: deep
       subagents:
         - name: researcher
@@ -194,7 +194,7 @@ metadata:
     assert contract.quality_gates.min_unique_sources_per_core_section == 2
     assert contract.document.length_profiles["long"].max_sections == 16
     assert contract.document.length_profiles["long"].default_units == 520
-    assert contract.document.length_profiles["long"].finalization == "progressive_section_merge"
+    assert contract.document.length_profiles["long"].finalization == "deterministic_assembly"
     assert contract.subagents[0].tools == ("web_research", "fetch_artifact")
     assert contract.subagents[0].skills == ("/skills/analyst/research/",)
     assert contract.sources == (str(skill / "SKILL.md"),)
@@ -259,7 +259,7 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
         "name": "report-synthesis",
         "runtime": {
             "strategy": "sectioned_longform",
-            "finalization": "progressive_section_merge",
+            "finalization": "deterministic_assembly",
             "running_context": True,
             "running_context_window_k": 2,
             "running_summary_model": "summary-model",
@@ -270,7 +270,7 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
             "length_profiles": {
                 "long": {
                     "strategy": "sectioned_longform",
-                    "finalization": "boundary_stitch",
+                    "finalization": "deterministic_assembly",
                     "max_sections": 16,
                     "running_context_window_k": 3,
                     "seam_context_chars": 2400,
@@ -286,7 +286,7 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
     )
 
     # Per-profile values win; runtime-level values fill the rest.
-    assert settings["finalization"] == "boundary_stitch"
+    assert settings["finalization"] == "deterministic_assembly"
     assert settings["running_context_window_k"] == 3  # profile overrides runtime 2
     assert settings["seam_context_chars"] == 2400  # profile only
     assert settings["running_summary_max_tokens"] == 600  # profile only
@@ -295,7 +295,7 @@ def test_sectioned_contract_forwards_tuning_knobs_with_profile_override() -> Non
     assert settings["running_context"] is True  # runtime
 
     typed = SectionedAuthoringContract.from_mapping(settings)
-    assert typed.finalization == "boundary_stitch"
+    assert typed.finalization == "deterministic_assembly"
     assert typed.running_context_window_k == 3
     assert typed.seam_context_chars == 2400
     assert typed.running_summary_max_tokens == 600
@@ -310,12 +310,12 @@ def test_sectioned_contract_accepts_explicit_finalization_override() -> None:
         "name": "fixed-shape",
         "runtime": {
             "strategy": "sectioned_longform",
-            "finalization": "progressive_section_merge",
+            "finalization": "deterministic_assembly",
         },
         "document": {
             "length_profiles": {
                 "long": {
-                    "finalization": "progressive_section_merge",
+                    "finalization": "deterministic_assembly",
                     "max_sections": 8,
                 },
             },
@@ -327,10 +327,10 @@ def test_sectioned_contract_accepts_explicit_finalization_override() -> None:
         contract,
         artifact_type="requirements_analysis",
         length_profile="long",
-        finalization_override="boundary_stitch",
+        finalization_override="deterministic_assembly",
     )
 
-    assert settings["finalization"] == "boundary_stitch"
+    assert settings["finalization"] == "deterministic_assembly"
 
 
 def test_sectioned_contract_omits_tuning_knobs_when_unspecified() -> None:
@@ -342,7 +342,7 @@ def test_sectioned_contract_omits_tuning_knobs_when_unspecified() -> None:
             "length_profiles": {
                 "long": {
                     "strategy": "sectioned_longform",
-                    "finalization": "single_polish",
+                    "finalization": "deterministic_assembly",
                     "max_sections": 16,
                 },
             },

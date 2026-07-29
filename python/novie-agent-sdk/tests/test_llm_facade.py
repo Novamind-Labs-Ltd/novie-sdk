@@ -335,3 +335,27 @@ def test_usage_callback_reports_langchain_usage() -> None:
 
     assert events[0]["payload"]["agent_event_kind"] == "token_usage"
     assert events[0]["payload"]["usage"]["total_tokens"] == 15
+
+
+def test_byok_chat_preserves_provider_finish_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from novie_agent_sdk import byok_llm
+    from novie_agent_sdk.byok_llm import ByokLlmClient
+
+    class _Response:
+        content = "partial"
+        usage_metadata = {"output_tokens": 10}
+        response_metadata = {"finish_reason": "length"}
+
+    class _Model:
+        async def ainvoke(self, _messages):  # type: ignore[no-untyped-def]
+            return _Response()
+
+    monkeypatch.setattr(byok_llm, "_require_langchain_openai", lambda: None)
+    client = ByokLlmClient(api_key="test-key")
+    monkeypatch.setattr(client, "_build_chat_model", lambda **_kwargs: _Model())
+
+    result = _run(client.chat([{"role": "user", "content": "write"}]))
+
+    assert result["response_metadata"]["finish_reason"] == "length"

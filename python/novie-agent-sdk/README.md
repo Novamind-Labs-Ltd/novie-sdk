@@ -84,9 +84,9 @@ name: document-authoring
 runtime:
   strategy: sectioned_longform
   context_policy: evidence_pack_v1
-  # One of: single_polish | boundary_stitch | progressive_section_merge.
+  # Accepted Planned Parts are assembled without a whole-document LLM rewrite.
   # Unknown values fail contract construction (ValueError).
-  finalization: boundary_stitch
+  finalization: deterministic_assembly
 task_profile:
   selected_by: llm
   defaults:

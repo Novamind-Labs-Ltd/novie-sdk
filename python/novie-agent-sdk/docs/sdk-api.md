@@ -618,21 +618,27 @@ result = await author.author(
 
 Purpose:
 
-- Provides the shared outline -> section drafts -> final polish path for document agents.
-- Writes the outline, each section draft, and the final deliverable as artifacts.
+- Provides the shared outline -> Planned Parts -> deterministic section/final
+  assembly path for document agents.
+- Persists and digest-verifies every accepted Planned Part before advancing its
+  durable checkpoint, then writes section and final artifacts.
 - Records artifact refs into Execution Workpad and marks the final deliverable ref when supported.
 - Builds bounded evidence packs from upstream/workpad refs for each section.
 - Applies a generic section quality gate before recording drafts, including exact planned-heading presence, minimum information units, process-language rejection, and evidence-ref checks.
 - Repairs missing planned Markdown headings before the quality gate so an otherwise valid section is not failed because the model used a different heading.
-- Allocates each section/summary/finalize LLM call at the current model output
-  top (`context_budget.max_output_tokens`). Skill `max_document_output_tokens`
-  is a length-profile hint for prompts/units, not a run-wide token pool to
-  fair-share across calls. Hard delivery size stays on
-  `max_document_output_bytes`.
+- Builds an explicit Authoring Context Envelope from provider input/output
+  ceilings. Optional evidence is dropped first; required context fails loudly
+  instead of being silently truncated.
+- Uses deterministic navigation summaries under normal pressure and structured
+  semantic compaction only under soft/hard context pressure. Canonical prose
+  remains behind artifact refs.
+- Bounds Planned Part, semantic review, compaction, and recovery calls through
+  the accepted execution plan. A semantically incomplete section gets one
+  bounded missing-objective recovery part, not a whole-section rewrite.
 - Accepts an absolute `wall_clock_deadline` in both finalization runners and
   surfaces `document_authoring_deadline_exceeded` without converting it into a
-  generic agent-runtime crash. When the final polish has no budget left, it
-  safely retains the already-complete assembled sections instead.
+  generic agent-runtime crash. Estimated deadline pressure is reported in the
+  execution plan; only the exact absolute deadline fails the run.
 
 ### `sectioned_authoring_enabled`
 
