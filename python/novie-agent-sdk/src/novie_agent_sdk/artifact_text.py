@@ -398,6 +398,55 @@ def format_artifact_read_result(data: dict[str, Any]) -> str:
     return "\n\n".join(line for line in lines if line)
 
 
+def extract_artifact_raw_text(data: dict[str, Any]) -> str:
+    """Return only the stored textual payload from an artifact-read response.
+
+    Unlike :func:`format_artifact_read_result`, this function deliberately adds
+    no prompt-facing headers, summaries, metadata, offsets, or labels. It is for
+    byte-stable integrity checks and durable resume state, where callers must
+    compare the stored payload with the text that was originally written.
+    """
+    if data.get("available") is False:
+        return ""
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    content = data.get("content")
+    if isinstance(content, list):
+        return "".join(
+            _decode_raw_artifact_value(
+                item.get("text") or item.get("content") or item.get("data") or "",
+                encoding=_artifact_content_encoding(item, metadata | item)
+                if isinstance(item, dict)
+                else None,
+            )
+            if isinstance(item, dict)
+            else str(item)
+            for item in content
+        )
+    if isinstance(content, dict):
+        return _decode_raw_artifact_value(
+            content.get("data") or content.get("text") or content.get("content") or "",
+            encoding=_artifact_content_encoding(content, metadata),
+        )
+    if isinstance(content, str):
+        return _decode_raw_artifact_value(
+            content,
+            encoding=_artifact_content_encoding(content, metadata),
+        )
+    return ""
+
+
+def _decode_raw_artifact_value(value: Any, *, encoding: str | None = None) -> str:
+    """Decode transport encoding without normalizing the stored text."""
+    if not isinstance(value, str) or not value:
+        return ""
+    if str(encoding or "").strip().lower() != "base64":
+        return value
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return ""
+
+
 def decode_artifact_text(
     value: Any,
     *,
@@ -540,6 +589,7 @@ __all__ = [
     "artifact_read_cache_key",
     "artifact_read_header",
     "decode_artifact_text",
+    "extract_artifact_raw_text",
     "format_artifact_read_result",
     "normalize_artifact_id",
     "render_artifact_text",

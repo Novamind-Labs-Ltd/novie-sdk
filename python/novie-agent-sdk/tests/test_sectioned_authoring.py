@@ -387,8 +387,41 @@ class _FakeArtifacts:
         self.read_artifact_ids.append(artifact_id)
         for artifact in self.created:
             if artifact["artifact_id"] == artifact_id:
+                return (
+                    f"[artifact {artifact_id}] mode=chunks\n\n"
+                    f"Metadata:\n{{}}\n\nContent:\n{artifact.get('content') or ''}"
+                )
+        return ""
+
+    async def read_raw_text(self, artifact_id: str, **_kwargs: Any) -> str:
+        self.read_artifact_ids.append(artifact_id)
+        for artifact in self.created:
+            if artifact["artifact_id"] == artifact_id:
                 return str(artifact.get("content") or "")
         return ""
+
+    async def search_index(self, **kwargs: Any) -> list[dict[str, Any]]:
+        artifact_type_prefix = str(kwargs.get("artifact_type_prefix") or "")
+        workflow_id = str(kwargs.get("workflow_id") or "")
+        thread_id = str(kwargs.get("thread_id") or "")
+        return [
+            dict(artifact)
+            for artifact in self.created
+            if (
+                not artifact_type_prefix
+                or str(artifact.get("artifact_type") or "").startswith(
+                    artifact_type_prefix
+                )
+            )
+            and (
+                not workflow_id
+                or str(artifact.get("workflow_id") or "") == workflow_id
+            )
+            and (
+                not thread_id
+                or str(artifact.get("thread_id") or "") == thread_id
+            )
+        ]
 
 
 class _FakeWorkpads:
@@ -1328,6 +1361,51 @@ async def test_deferred_intermediate_artifacts_keep_successful_final_in_memory()
     ]
     assert platform.workpads.entries == []
     assert platform.workpads.final_refs == []
+
+
+@pytest.mark.asyncio
+async def test_sectioned_author_reuses_verified_parts_after_process_resume() -> None:
+    platform = _FakePlatform()
+
+    async def run_once() -> None:
+        author = SectionedLongformAuthor(
+            llm_facade=_FakeLlm(),
+            platform=platform,
+            artifact_type="example_document",
+            step_id="s2",
+            capability_id="agent.example.write_document",
+            authoring_contract={
+                "coverage_model": "example_document",
+                "min_outline_sections": 2,
+                "max_outline_sections": 2,
+                "min_section_words": 5,
+                "default_section_words": 5,
+                "max_section_words": 20,
+                "final_retention_ratio": 0.8,
+            },
+            defer_intermediate_artifacts=True,
+        )
+        await author.author(
+            brief={"title": "Example document"},
+            upstream={},
+            workflow_id="workflow-1",
+            thread_id="thread-1",
+            agent_id="writer",
+        )
+
+    await run_once()
+    first_part_count = sum(
+        item["artifact_type"] == "example_document.section_part"
+        for item in platform.artifacts.created
+    )
+    await run_once()
+    second_part_count = sum(
+        item["artifact_type"] == "example_document.section_part"
+        for item in platform.artifacts.created
+    )
+
+    assert first_part_count == 2
+    assert second_part_count == first_part_count
 
 
 @pytest.mark.asyncio

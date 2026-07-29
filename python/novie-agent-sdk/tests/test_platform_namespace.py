@@ -493,6 +493,34 @@ async def test_artifacts_read_text_formats_platform_artifact_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_artifacts_read_raw_text_preserves_exact_stored_payload() -> None:
+    markdown = "## 执行摘要\n\n原始正文。\n"
+    encoded = base64.b64encode(markdown.encode("utf-8")).decode("ascii")
+
+    def responder(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "artifact_id": "artifact-1",
+                    "mode": "chunks",
+                    "summary": "This must not be included.",
+                    "metadata": {
+                        "encoding": "base64",
+                        "content_type": "text/markdown",
+                    },
+                    "content": {"data": encoded},
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+
+    assert await ns.artifacts.read_raw_text("artifact://artifact-1") == markdown
+
+
+@pytest.mark.asyncio
 async def test_artifacts_read_text_caches_exact_repeated_reads() -> None:
     call_count = 0
 
