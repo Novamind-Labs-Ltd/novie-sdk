@@ -1215,6 +1215,8 @@ class SectionedLongformAuthor:
         self._tool_call_seq = 0
         self._authoring_call_budget: AuthoringCallBudget | None = None
         self._last_authoring_context_pressure = "normal"
+        self._persisted_part_index_loaded = False
+        self._persisted_part_refs: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _skill_instruction_block(self) -> str:
         if not self._authoring_instructions:
@@ -1866,16 +1868,15 @@ class SectionedLongformAuthor:
 
     async def _read_resume_artifact_text(self, artifact_ref: Mapping[str, Any]) -> str:
         artifacts = getattr(self._platform, "artifacts", None)
-        read_text = getattr(artifacts, "read_text", None)
-        if not callable(read_text):
+        read_raw_text = getattr(artifacts, "read_raw_text", None)
+        if not callable(read_raw_text):
             return ""
         artifact_id = _artifact_id_from_ref(artifact_ref)
         if not artifact_id:
             return ""
         return str(
-            await read_text(
+            await read_raw_text(
                 artifact_id,
-                mode="chunks",
                 purpose="resume sectioned authoring draft",
                 max_bytes=64000,
             )
@@ -2577,6 +2578,13 @@ class SectionedLongformAuthor:
     ) -> dict[str, Any]:
         if not self._ledger.is_available:
             raise RuntimeError("artifact_create_failed:artifact_ledger_unavailable")
+        existing = await self._find_persisted_part(
+            accepted,
+            workflow_id=workflow_id,
+            thread_id=thread_id,
+        )
+        if existing:
+            return existing
         result = await self._ledger.create_artifact(
             artifact_type=f"{self._artifact_type}.section_part",
             content=accepted.markdown,
@@ -2612,7 +2620,56 @@ class SectionedLongformAuthor:
                 "document_part_artifact_digest_mismatch:"
                 f"{accepted.plan.part_identity}"
             )
+        self._persisted_part_refs[
+            (accepted.plan.part_identity, accepted.content_digest)
+        ] = dict(result)
         return result
+
+    async def _find_persisted_part(
+        self,
+        accepted: AcceptedPart,
+        *,
+        workflow_id: str | None,
+        thread_id: str | None,
+    ) -> dict[str, Any]:
+        if not self._persisted_part_index_loaded:
+            self._persisted_part_index_loaded = True
+            artifacts = getattr(self._platform, "artifacts", None)
+            search_index = getattr(artifacts, "search_index", None)
+            if callable(search_index) and (workflow_id or thread_id):
+                items = await search_index(
+                    workflow_id=workflow_id,
+                    thread_id=thread_id,
+                    artifact_type_prefix=f"{self._artifact_type}.section_part",
+                    limit=200,
+                )
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    metadata = item.get("metadata")
+                    if not isinstance(metadata, Mapping):
+                        continue
+                    part_identity = str(metadata.get("part_identity") or "").strip()
+                    content_digest = str(metadata.get("content_digest") or "").strip()
+                    if not part_identity or not content_digest:
+                        continue
+                    ref = dict(item)
+                    artifact_id = _artifact_id_from_ref(ref)
+                    if artifact_id and not ref.get("artifact_ref"):
+                        ref["artifact_ref"] = f"artifact://{artifact_id}"
+                    self._persisted_part_refs[
+                        (part_identity, content_digest)
+                    ] = ref
+
+        key = (accepted.plan.part_identity, accepted.content_digest)
+        candidate = self._persisted_part_refs.get(key)
+        if not candidate:
+            return {}
+        stored = await self._read_resume_artifact_text(candidate)
+        if hashlib.sha256(stored.encode()).hexdigest() != accepted.content_digest:
+            self._persisted_part_refs.pop(key, None)
+            return {}
+        return dict(candidate)
 
     async def _record_final(
         self,

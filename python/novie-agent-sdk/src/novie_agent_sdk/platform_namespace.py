@@ -59,6 +59,7 @@ import httpx
 
 from .artifact_text import (
     ArtifactReadCache,
+    extract_artifact_raw_text,
     format_artifact_read_result,
     normalize_artifact_id,
 )
@@ -1387,6 +1388,37 @@ class ArtifactsNamespace:
         rendered = format_artifact_read_result(data)
         self._text_cache.set(cache_key, rendered)
         return rendered
+
+    async def read_raw_text(
+        self,
+        artifact_id: str,
+        *,
+        purpose: str = "verify stored artifact content",
+        offset: int = 0,
+        max_bytes: int = 64000,
+    ) -> str:
+        """Read stored text without prompt-facing artifact scaffolding."""
+        normalized_artifact_id = normalize_artifact_id(artifact_id)
+        cache_key = (
+            "raw",
+            normalized_artifact_id,
+            int(offset or 0),
+            int(max_bytes or 64000),
+            str(purpose or ""),
+        )
+        cached = self._text_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        data = await self.read(
+            normalized_artifact_id,
+            mode="chunks",
+            purpose=purpose,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+        raw_text = extract_artifact_raw_text(data)
+        self._text_cache.set(cache_key, raw_text)
+        return raw_text
 
     async def search_index(
         self,
