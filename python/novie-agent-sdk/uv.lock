@@ -289,7 +289,7 @@ wheels = [
 
 [[package]]
 name = "novie-agent-sdk"
-version = "0.3.75"
+version = "0.3.76"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

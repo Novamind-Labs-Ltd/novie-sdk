@@ -27,6 +27,121 @@ class DocumentAuthoringCallBudgetExceeded(RuntimeError):
     code = "document_authoring_call_budget_exceeded"
 
 
+class DocumentInformationBudgetExceeded(RuntimeError):
+    """Raised when accepted prose would consume reserved later-section space."""
+
+    code = "document_information_budget_exceeded"
+
+
+@dataclass(slots=True)
+class DocumentInformationBudget:
+    """Track actual language-aware output units across the complete document."""
+
+    minimum_units: int
+    maximum_units: int
+    used_units: int = 0
+    pending_section_units: int = 0
+    reserved_future_units: int = 0
+
+    @classmethod
+    def from_outline(
+        cls,
+        outline: Any,
+        *,
+        requested_minimum: int = 0,
+        requested_maximum: int = 0,
+    ) -> "DocumentInformationBudget":
+        targets = [
+            _positive_int(getattr(section, "min_words", 0))
+            for section in outline
+        ]
+        planned_minimum = sum(targets)
+        minimum = requested_minimum or planned_minimum
+        maximum = requested_maximum or max(
+            minimum,
+            int(max(1, planned_minimum) * 1.35) + (len(targets) * 8),
+        )
+        return cls(minimum_units=minimum, maximum_units=max(minimum, maximum))
+
+    @property
+    def remaining_units(self) -> int:
+        return max(0, self.maximum_units - self.used_units - self.pending_section_units)
+
+    @property
+    def current_section_allowance(self) -> int:
+        return max(0, self.remaining_units - self.reserved_future_units)
+
+    def begin_section(
+        self,
+        *,
+        resumed_units: int,
+        reserved_future_units: int,
+        section_overhead_units: int = 0,
+    ) -> None:
+        # Parts are persisted without the parent H2, while commit_section()
+        # measures the assembled Markdown including that heading. Reserve the
+        # deterministic wrapper up front so part acceptance and final section
+        # commit use the same accounting boundary.
+        self.pending_section_units = max(0, int(resumed_units)) + max(
+            0, int(section_overhead_units)
+        )
+        self.reserved_future_units = max(0, int(reserved_future_units))
+        if self.current_section_allowance <= 0 and self.pending_section_units <= 0:
+            raise DocumentInformationBudgetExceeded(
+                "document_information_budget_exceeded:no_current_section_allowance"
+            )
+
+    def accept_part(self, units: int, *, allow_overflow: bool = False) -> None:
+        requested = max(0, int(units))
+        if requested > self.current_section_allowance:
+            if not allow_overflow:
+                raise DocumentInformationBudgetExceeded(
+                    "document_information_budget_exceeded:part_exceeds_remaining_allowance"
+                )
+            # Preserve the reserve for future sections. The configured maximum
+            # is a rewrite trigger and planning budget, not a publication gate
+            # after the final allowed retry.
+            self.maximum_units += requested - self.current_section_allowance
+        self.pending_section_units += requested
+
+    def commit_section(self, actual_units: int, *, allow_overflow: bool = False) -> None:
+        actual = max(0, int(actual_units))
+        available = self.maximum_units - self.used_units - self.reserved_future_units
+        if actual > max(0, available):
+            if not allow_overflow:
+                raise DocumentInformationBudgetExceeded(
+                    "document_information_budget_exceeded:section_consumes_future_reserve"
+                )
+            self.maximum_units += actual - max(0, available)
+        self.used_units += actual
+        self.pending_section_units = 0
+        self.reserved_future_units = 0
+
+    def discard_unused_capacity(self, units: int) -> None:
+        """Remove temporary recovery headroom that produced no final prose."""
+        discarded = max(0, int(units))
+        self.maximum_units = max(
+            self.minimum_units,
+            self.used_units,
+            self.maximum_units - discarded,
+        )
+
+    def metadata(self) -> dict[str, int]:
+        return {
+            "document_information_units_minimum": self.minimum_units,
+            "document_information_units_maximum": self.maximum_units,
+            "document_information_units_used": self.used_units,
+            "document_information_units_pending": self.pending_section_units,
+            "document_information_units_remaining": self.remaining_units,
+            "document_information_units_reserved_for_future_sections": (
+                self.reserved_future_units
+            ),
+            "current_section_information_units_remaining": (
+                self.current_section_allowance
+            ),
+        }
+
+
 @dataclass(slots=True)
 class AuthoringCallBudget:
     """Bound content, review, and compaction calls independently and in total."""
@@ -151,5 +266,7 @@ __all__ = [
     "DocumentAuthoringCallBudgetExceeded",
     "DocumentAuthoringBudgetExceeded",
     "DocumentAuthoringDeadlineExceeded",
+    "DocumentInformationBudget",
+    "DocumentInformationBudgetExceeded",
     "DocumentOutputBudget",
 ]

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from .document_authoring_plan import (
@@ -49,14 +49,27 @@ async def author_planned_section(
         "capability_id": str(owner._capability_id or ""),
     }
 
+    min_part_units = _positive_int(
+        owner._context_budget.get("min_part_information_units"),
+        20,
+    )
+
+    def max_acceptable_information_units(part: PlannedPart) -> int:
+        information_budget = getattr(owner, "_document_information_budget", None)
+        return _maximum_acceptable_information_units(part, information_budget)
+
     async def generate(part: Any, cursor: Any, handoff: str) -> tuple[str, bool]:
+        effective_part = replace(
+            part,
+            max_information_units=max_acceptable_information_units(part),
+        )
         return await owner._draft_section(
             brief=brief,
             plan=section_plan,
             section_index=section_index,
             previous=list(previous_drafts),
             evidence_pack=evidence_pack,
-            planned_part=part,
+            planned_part=effective_part,
             coverage_cursor=cursor,
             previous_part_handoff=handoff,
             authoring_summary=authoring_summary,
@@ -66,6 +79,12 @@ async def author_planned_section(
         )
 
     async def persist(accepted: AcceptedPart) -> Mapping[str, Any]:
+        information_budget = getattr(owner, "_document_information_budget", None)
+        if information_budget is not None:
+            information_budget.accept_part(
+                accepted.information_units,
+                allow_overflow=True,
+            )
         return await owner._record_part(
             section_plan,
             accepted,
@@ -105,15 +124,11 @@ async def author_planned_section(
         persist=persist,
         checkpoint=checkpoint,
         emit=emit,
+        max_acceptable_information_units=max_acceptable_information_units,
         resumed=resumed_parts,
-        max_plan_revisions=_positive_int(
-            owner._context_budget.get("max_authoring_plan_revisions_per_section"),
-            2,
-        ),
-        min_part_information_units=_positive_int(
-            owner._context_budget.get("min_part_information_units"),
-            20,
-        ),
+        max_plan_revisions=1,
+        min_part_information_units=min_part_units,
+        allow_over_maximum=True,
     )
     markdown = assemble_section(
         section_title=execution_section.title,
@@ -128,6 +143,20 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _maximum_acceptable_information_units(
+    part: PlannedPart,
+    information_budget: Any | None,
+) -> int:
+    """Clip a Planned Part to aggregate budget without expanding its contract."""
+    planned_maximum = max(1, int(part.max_information_units))
+    if information_budget is None:
+        return planned_maximum
+    return min(
+        planned_maximum,
+        max(0, int(information_budget.current_section_allowance)),
+    )
 
 
 async def resumed_parts_from_checkpoint(

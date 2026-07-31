@@ -1420,6 +1420,29 @@ class ArtifactsNamespace:
         self._text_cache.set(cache_key, raw_text)
         return raw_text
 
+    async def read_restore_text(
+        self,
+        artifact_id: str,
+        *,
+        purpose: str = "restore checkpoint-owned authoring artifact",
+        offset: int = 0,
+        max_bytes: int = 64000,
+    ) -> str:
+        """Read exact authoring state through the scoped restoration channel."""
+        data = await self.read(
+            normalize_artifact_id(artifact_id),
+            mode="restore",
+            purpose=purpose,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+        if data.get("available") is False:
+            raise RuntimeError(
+                "artifact_restore_failed:"
+                f"{data.get('error') or 'artifact_restore_unavailable'}"
+            )
+        return extract_artifact_raw_text(data)
+
     async def search_index(
         self,
         *,

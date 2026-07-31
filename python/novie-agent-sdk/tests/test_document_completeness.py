@@ -55,6 +55,219 @@ async def test_review_section_completeness_rejects_contradictory_shape() -> None
         )
 
 
+@pytest.mark.asyncio
+async def test_unfinished_structure_remains_fail_closed_at_sentence_boundary() -> None:
+    semantic_gap = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "complete": False,
+                "issue_code": "unfinished_structure",
+                "reason": "The section may leave a structure open.",
+            }
+        ),
+        section_title="Recommendation",
+        section_objective="State the complete recommendation.",
+        markdown="## Recommendation\n\n三项建议均已完整说明。",
+    )
+    still_open = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "complete": False,
+                "issue_code": "unfinished_structure",
+                "reason": "A fenced block remains open.",
+            }
+        ),
+        section_title="Recommendation",
+        section_objective="State the complete recommendation.",
+        markdown="## Recommendation\n\n```text\nunfinished",
+    )
+
+    assert semantic_gap.complete is False
+    assert semantic_gap.issue_code == "unfinished_structure"
+    assert still_open.complete is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_checklist_derives_incomplete_without_trusting_overall_reason() -> None:
+    review = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "structure_complete": True,
+                "issue_code": "none",
+                "coverage": [
+                    {
+                        "point_id": "impact.reliability",
+                        "covered": True,
+                        "evidence": "Delivery reliability is discussed.",
+                    },
+                    {
+                        "point_id": "impact.efficiency",
+                        "covered": False,
+                        "evidence": "Team efficiency is absent.",
+                    },
+                ],
+                "reason": "The prose is syntactically closed.",
+            }
+        ),
+        section_title="Business impact",
+        section_objective="Assess reliability and efficiency.",
+        required_points=(
+            {
+                "point_id": "impact.reliability",
+                "requirement": "Assess delivery reliability.",
+            },
+            {
+                "point_id": "impact.efficiency",
+                "requirement": "Assess team efficiency.",
+            },
+        ),
+        markdown="## Business impact\n\nDelivery is less predictable.",
+    )
+
+    assert review.complete is False
+    assert review.issue_code == "missing_planned_content"
+
+
+@pytest.mark.asyncio
+async def test_coverage_checklist_treats_missing_point_as_local_gap() -> None:
+    review = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "structure_complete": True,
+                "issue_code": "none",
+                "coverage": [
+                    {
+                        "point_id": "impact.reliability",
+                        "covered": True,
+                        "evidence": "Present.",
+                    }
+                ],
+                "reason": "Only one result was returned.",
+            }
+        ),
+        section_title="Business impact",
+        section_objective="Assess reliability and efficiency.",
+        required_points=(
+            {
+                "point_id": "impact.reliability",
+                "requirement": "Assess delivery reliability.",
+            },
+            {
+                "point_id": "impact.efficiency",
+                "requirement": "Assess team efficiency.",
+            },
+        ),
+        markdown="## Business impact\n\nDelivery is less predictable.",
+    )
+
+    assert review.complete is False
+    assert review.issue_code == "missing_planned_content"
+    assert review.coverage[1] == {
+        "point_id": "impact.efficiency",
+        "covered": False,
+        "evidence": "",
+    }
+    assert review.reliable is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_checklist_treats_invalid_entries_as_local_gaps() -> None:
+    review = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "structure_complete": True,
+                "issue_code": "none",
+                "coverage": [
+                    {
+                        "point_id": "impact.reliability",
+                        "covered": "yes",
+                        "evidence": "Malformed verdict.",
+                    },
+                    {
+                        "point_id": "unexpected",
+                        "covered": True,
+                        "evidence": "Unknown point.",
+                    },
+                ],
+                "reason": "",
+            }
+        ),
+        section_title="Business impact",
+        section_objective="Assess reliability.",
+        required_points=(
+            {
+                "point_id": "impact.reliability",
+                "requirement": "Assess delivery reliability.",
+            },
+        ),
+        markdown="## Business impact\n\nDelivery is less predictable.",
+    )
+
+    assert review.complete is False
+    assert review.issue_code == "missing_planned_content"
+    assert review.coverage[0]["covered"] is False
+    assert review.reliable is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_checklist_marks_unsupported_negative_as_unreliable() -> None:
+    review = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "structure_complete": True,
+                "issue_code": "missing_planned_content",
+                "coverage": [
+                    {
+                        "point_id": "summary.goal",
+                        "covered": False,
+                        "evidence": "",
+                    }
+                ],
+                "reason": "The section otherwise appears complete.",
+            }
+        ),
+        section_title="Summary",
+        section_objective="State the goal.",
+        required_points=(
+            {"point_id": "summary.goal", "requirement": "State the goal."},
+        ),
+        markdown="## Summary\n\nThe goal is stable delivery.",
+    )
+
+    assert review.complete is False
+    assert review.issue_code == "missing_planned_content"
+    assert review.reliable is False
+
+
+@pytest.mark.asyncio
+async def test_coverage_checklist_allows_empty_non_authoritative_explanations() -> None:
+    review = await review_section_completeness(
+        _StructuredLlm(
+            {
+                "structure_complete": True,
+                "issue_code": "none",
+                "coverage": [
+                    {
+                        "point_id": "summary.goal",
+                        "covered": True,
+                        "evidence": "",
+                    }
+                ],
+                "reason": "",
+            }
+        ),
+        section_title="Summary",
+        section_objective="State the goal.",
+        required_points=(
+            {"point_id": "summary.goal", "requirement": "State the goal."},
+        ),
+        markdown="## Summary\n\nThe goal is stable delivery.",
+    )
+
+    assert review.complete is True
+    assert review.reason == "Coverage checklist reviewed."
+
+
 def test_markdown_structure_violation_detects_unclosed_fence() -> None:
     assert markdown_structure_violation("## Example\n\n```python\nprint('x')") == (
         "markdown_structure_unclosed"

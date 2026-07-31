@@ -8,7 +8,7 @@ import inspect
 import json
 import os
 import re
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -21,6 +21,8 @@ from .context_budget import wall_clock_deadline as context_wall_clock_deadline
 from .document_authoring_budget import (
     AuthoringCallBudget,
     DocumentAuthoringDeadlineExceeded,
+    DocumentInformationBudget,
+    DocumentInformationBudgetExceeded,
     DocumentOutputBudget,
 )
 from .document_authoring_compaction import compact_authoring_context
@@ -46,7 +48,11 @@ from .document_quality import (
     DocumentQualityLoopResult,
     completed_document_quality_result,
 )
-from .document_part_assembly import AcceptedPart
+from .document_part_assembly import (
+    AcceptedPart,
+    information_units as part_information_units,
+    normalize_part_markdown,
+)
 from .document_section_parts import (
     author_planned_section,
     resumed_parts_from_checkpoint,
@@ -181,6 +187,7 @@ class SectionPlan:
     objective: str = ""
     evidence_query: str = ""
     min_words: int = 180
+    required_points: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,11 +328,15 @@ class SectionQualityGateResult:
     @property
     def hard_failures(self) -> tuple[str, ...]:
         """Structural failures that always block the deliverable."""
+        if self.degraded:
+            return ()
         return tuple(f for f in self.failures if f in _STRUCTURAL_GATE_FAILURES)
 
     @property
     def soft_failures(self) -> tuple[str, ...]:
         """Evidence/quality-bound failures eligible for graceful degradation."""
+        if self.degraded:
+            return self.failures
         return tuple(f for f in self.failures if f not in _STRUCTURAL_GATE_FAILURES)
 
     def to_metadata(self) -> dict[str, Any]:
@@ -453,6 +464,8 @@ class DocumentAuthoringRequest:
     length_profile: str | None = None
     profile_source: str = "skill_default"
     profile_confidence: str = "confirmed"
+    requested_min_information_units: int = 0
+    requested_max_information_units: int = 0
     resume_state: Mapping[str, Any] | None = None
     phase_checkpoint_sink: Callable[[Mapping[str, Any]], Any] | None = None
     rebase_artifact_types_to_runtime: bool = False
@@ -523,7 +536,11 @@ async def run_sectioned_document_finalization(
     artifact_type = request.artifact_type
     step_id = request.step_id
     capability_id = request.capability_id
-    context_budget = request.context_budget
+    context_budget = {
+        **dict(request.context_budget),
+        "requested_min_information_units": request.requested_min_information_units,
+        "requested_max_information_units": request.requested_max_information_units,
+    }
     brief = request.brief
     upstream = request.upstream
     workflow_id = request.workflow_id
@@ -768,6 +785,8 @@ async def astream_sectioned_document_finalization(
             "length_profile": resolved_profile["profile"],
             "profile_source": resolved_profile["source"],
             "profile_confidence": resolved_profile["confidence"],
+            "requested_min_information_units": request.requested_min_information_units,
+            "requested_max_information_units": request.requested_max_information_units,
             "skill_contract": skill_contract.to_metadata(),
         },
     )
@@ -1177,10 +1196,11 @@ class SectionedLongformAuthor:
             )
         self._ledger = ArtifactLedger(platform)
         self._evidence = EvidencePackBuilder(platform, budget=context_budget)
-        self._max_section_revision_rounds = _positive_int(
-            self._context_budget.get("max_section_revision_rounds"),
-            self._contract.max_section_revision_rounds,
-        )
+        # Quality review is observational on the default path. Length rewriting
+        # already has one bounded group of three attempts; a failed semantic
+        # review must degrade that accepted result rather than open a second
+        # generation/retry group for the same section.
+        self._max_section_revision_rounds = 0
         # Output ceiling for content-bearing LLM calls (section drafts and
         # finalize rewrites). This is the run's budget-contract limit — the
         # platform sends it per run, sized to the tenant's model — NOT a
@@ -1214,6 +1234,7 @@ class SectionedLongformAuthor:
         self._llm_call_seq = 0
         self._tool_call_seq = 0
         self._authoring_call_budget: AuthoringCallBudget | None = None
+        self._document_information_budget: DocumentInformationBudget | None = None
         self._last_authoring_context_pressure = "normal"
         self._persisted_part_index_loaded = False
         self._persisted_part_refs: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1254,7 +1275,13 @@ class SectionedLongformAuthor:
         resume_outline = _section_plans_from_resume_state(state)
         drafts: list[SectionDraft] = []
         if resume_outline:
-            outline = resume_outline
+            outline = _scale_outline_to_document_minimum(
+                resume_outline,
+                _positive_int(
+                    self._context_budget.get("requested_min_information_units"),
+                    0,
+                ),
+            )
             length_profile = str(state.get("length_profile") or self._contract.length_profile)
             outline_ref = _mapping(state.get("outline_ref"))
             drafts = await self._resume_drafts_from_state(state, outline=outline)
@@ -1277,6 +1304,13 @@ class SectionedLongformAuthor:
                 profile_source=self._contract.profile_source,
             )
             length_profile, outline = await self._build_outline(brief=brief, upstream=upstream)
+            outline = _scale_outline_to_document_minimum(
+                outline,
+                _positive_int(
+                    self._context_budget.get("requested_min_information_units"),
+                    0,
+                ),
+            )
             outline_ref = await self._record_outline(
                 outline,
                 length_profile=length_profile,
@@ -1318,6 +1352,37 @@ class SectionedLongformAuthor:
             context_budget=self._context_budget,
             revision=_positive_int(state.get("authoring_plan_revision"), 1),
         )
+        requested_minimum_units = _positive_int(
+            self._context_budget.get("requested_min_information_units"),
+            0,
+        )
+        requested_maximum_units = _positive_int(
+            self._context_budget.get("requested_max_information_units"),
+            0,
+        )
+        self._document_information_budget = DocumentInformationBudget.from_outline(
+            outline,
+            requested_minimum=requested_minimum_units,
+            requested_maximum=requested_maximum_units,
+        )
+        self._document_information_budget.used_units = sum(
+            _information_units(draft.markdown) for draft in drafts
+        )
+        additive_recovery_capacity = requested_maximum_units <= 0
+        if additive_recovery_capacity:
+            recovery_reserve_per_round = 80
+            self._document_information_budget.maximum_units += (
+                recovery_reserve_per_round
+                * self._max_section_revision_rounds
+                * len(outline)
+            )
+        else:
+            recovery_reserve_per_round = _section_recovery_reserve(
+                minimum_units=self._document_information_budget.minimum_units,
+                maximum_units=self._document_information_budget.maximum_units,
+                section_count=len(outline),
+                recovery_rounds=self._max_section_revision_rounds,
+            )
         stored_plan = state.get("authoring_execution_plan")
         if isinstance(stored_plan, Mapping):
             try:
@@ -1355,6 +1420,12 @@ class SectionedLongformAuthor:
         )
         for index, plan in enumerate(outline[len(drafts) :], start=len(drafts) + 1):
             execution_section = execution_plan.sections[index - 1]
+            self._document_information_budget.reserved_future_units = (
+                sum(max(1, item.min_words) for item in outline[index:])
+                + recovery_reserve_per_round
+                * self._max_section_revision_rounds
+                * (len(outline) - index + 1)
+            )
             await self._emit(
                 "document.section.started",
                 status="running",
@@ -1433,6 +1504,26 @@ class SectionedLongformAuthor:
                 state,
                 section_id=plan.section_id,
             )
+            reserved_future_units = sum(
+                max(1, item.min_words) for item in outline[index:]
+            )
+            future_recovery_reserve_units = (
+                recovery_reserve_per_round
+                * self._max_section_revision_rounds
+                * (len(outline) - index)
+            )
+            self._document_information_budget.begin_section(
+                resumed_units=sum(
+                    item.accepted.information_units for item in resumed_parts
+                ),
+                reserved_future_units=(
+                    reserved_future_units
+                    + future_recovery_reserve_units
+                    + recovery_reserve_per_round
+                    * self._max_section_revision_rounds
+                ),
+                section_overhead_units=_information_units(f"## {plan.title}"),
+            )
             part_result = await author_planned_section(
                 self,
                 brief=brief,
@@ -1463,22 +1554,44 @@ class SectionedLongformAuthor:
                 markdown=markdown,
                 quality=quality,
             )
-            if "semantic_incomplete" in quality.failures:
+            accepted_section_parts = part_result.execution.parts
+            recovery_units_used = 0
+            recovery_round = 0
+            while (
+                (
+                    quality.hard_failures
+                    or (
+                        self._contract.gate_enforcement
+                        == _GATE_ENFORCEMENT_STRICT
+                        and quality.failures
+                    )
+                )
+                and recovery_round < self._max_section_revision_rounds
+            ):
+                recovery_round += 1
                 review = quality.completeness_review
                 execution_plan = merge_executed_section_parts(
                     execution_plan,
                     section_index=index - 1,
-                    parts=[
-                        item.accepted.plan
-                        for item in part_result.execution.parts
-                    ],
+                    parts=tuple(
+                        item.accepted.plan for item in accepted_section_parts
+                    ),
                     revision=part_result.execution.plan_revision,
                 )
                 execution_plan = append_recovery_part(
                     execution_plan,
                     section_index=index - 1,
-                    issue_code=str(review.get("issue_code") or "missing_planned_content"),
-                    reason=str(review.get("reason") or plan.objective),
+                    issue_code=(
+                        str(review.get("issue_code"))
+                        if review.get("issue_code")
+                        and review.get("issue_code") != "none"
+                        else "quality_gate_recovery"
+                    ),
+                    reason=_recovery_objective(
+                        plan=plan,
+                        review=review,
+                        hard_failures=quality.failures,
+                    ),
                     scope=scope,
                 )
                 execution_section = execution_plan.sections[index - 1]
@@ -1488,8 +1601,31 @@ class SectionedLongformAuthor:
                     section_id=plan.section_id,
                     section_index=index,
                     plan_revision=execution_plan.revision,
+                    recovery_round=recovery_round,
                     issue_code=review.get("issue_code"),
+                    recovery_mode="append_missing_objective_within_budget",
                 )
+                self._document_information_budget.begin_section(
+                    resumed_units=sum(
+                        item.accepted.information_units
+                        for item in accepted_section_parts
+                    ),
+                    # Release this section's recovery reserve while retaining
+                    # the minimum promised to later sections.
+                    reserved_future_units=(
+                        reserved_future_units
+                        + future_recovery_reserve_units
+                        + recovery_reserve_per_round
+                        * (self._max_section_revision_rounds - recovery_round)
+                    ),
+                    section_overhead_units=_information_units(f"## {plan.title}"),
+                )
+                replacement_summary = {
+                    **dict(authoring_summary or {}),
+                    "section_rewrite_source": markdown,
+                    "section_rewrite_issue": dict(review),
+                }
+                accepted_count_before_recovery = len(accepted_section_parts)
                 part_result = await author_planned_section(
                     self,
                     brief=brief,
@@ -1499,12 +1635,19 @@ class SectionedLongformAuthor:
                     section_index=index,
                     previous_drafts=drafts,
                     evidence_pack=evidence_pack_input,
-                    authoring_summary=authoring_summary,
+                    authoring_summary=replacement_summary,
                     workflow_id=workflow_id,
                     thread_id=thread_id,
                     agent_id=agent_id,
                     checkpoint_base=checkpoint_base,
-                    resumed_parts=part_result.execution.parts,
+                    resumed_parts=accepted_section_parts,
+                )
+                accepted_section_parts = part_result.execution.parts
+                recovery_units_used += sum(
+                    item.accepted.information_units
+                    for item in accepted_section_parts[
+                        accepted_count_before_recovery:
+                    ]
                 )
                 markdown = part_result.markdown
                 quality = _evaluate_section_quality(
@@ -1512,13 +1655,25 @@ class SectionedLongformAuthor:
                     markdown=markdown,
                     evidence_pack=evidence_pack_input,
                     contract=self._contract,
-                    revision_rounds=1,
+                    revision_rounds=recovery_round,
                     output_truncated=False,
                 )
                 quality = await self._apply_completeness_review(
                     plan=plan,
                     markdown=markdown,
                     quality=quality,
+                )
+            self._document_information_budget.commit_section(
+                _information_units(markdown),
+                allow_overflow=True,
+            )
+            if additive_recovery_capacity and recovery_reserve_per_round:
+                allocated_recovery_units = (
+                    recovery_reserve_per_round
+                    * self._max_section_revision_rounds
+                )
+                self._document_information_budget.discard_unused_capacity(
+                    max(0, allocated_recovery_units - recovery_units_used)
                 )
             await self._emit(
                 "document.section.quality_checked",
@@ -1532,19 +1687,11 @@ class SectionedLongformAuthor:
                 quality=quality.to_metadata(),
             )
             if not quality.passed:
-                hard_failures = quality.hard_failures
-                if (
-                    hard_failures
-                    or self._contract.gate_enforcement == _GATE_ENFORCEMENT_STRICT
-                ):
-                    raise RuntimeError(
-                        "section_quality_gate_failed:"
-                        f"{plan.section_id}:"
-                        + ",".join(quality.failures)
-                    )
                 # Graceful degradation: soft, evidence-bound gate failures must
-                # not dead-end the plan. Record the best-effort section and
-                # continue so the deliverable completes.
+                # not dead-end the plan. Retry exhaustion converts all remaining
+                # section-review findings into explicit degradation, including
+                # a provider truncation marker on the final non-empty attempt.
+                # Record the best-effort section and continue.
                 #
                 # The degradation is reported structurally only — via the
                 # `document.section.quality_degraded` event, the `degraded` /
@@ -1699,6 +1846,7 @@ class SectionedLongformAuthor:
                 "length_profile": length_profile,
                 "profile_source": self._contract.profile_source,
                 "profile_confidence": self._contract.profile_confidence,
+                **self._document_information_budget.metadata(),
                 "finalization": self._contract.finalization,
                 "section_count": len(outline),
                 "created_count": len(artifact_refs),
@@ -1715,18 +1863,34 @@ class SectionedLongformAuthor:
         markdown: str,
         quality: SectionQualityGateResult,
     ) -> SectionQualityGateResult:
-        if quality.hard_failures:
+        if any(
+            failure != "insufficient_section_depth"
+            for failure in quality.hard_failures
+        ):
             return quality
         self._reserve_authoring_call("review")
         review = await review_section_completeness(
             self._llm,
             section_title=plan.title,
             section_objective=plan.objective,
+            required_points=_required_coverage_points(plan),
             markdown=markdown,
         )
         failures = quality.failures
         if not review.complete:
-            failures = tuple(dict.fromkeys((*failures, "semantic_incomplete")))
+            # Completeness review is a bounded quality aid, not an unlimited
+            # publication veto. A reliable missing-content finding receives one
+            # local recovery. If the gap remains after that attempt it is
+            # recorded as degraded and the document continues. Unreliable
+            # reviewer output never triggers content rewriting. Deterministic
+            # empty/truncated/Markdown/heading guards remain hard blockers.
+            if not review.reliable:
+                review_failure = "completeness_review_degraded"
+            elif quality.revision_rounds < 1:
+                review_failure = "semantic_incomplete"
+            else:
+                review_failure = "semantic_incomplete_degraded"
+            failures = tuple(dict.fromkeys((*failures, review_failure)))
         await self._emit(
             "document.section.completeness_reviewed",
             status="passed" if review.complete else "gate_failed",
@@ -1822,6 +1986,11 @@ class SectionedLongformAuthor:
             mechanical = (
                 markdown_structure_violation(draft.markdown)
                 or (
+                    "insufficient_section_depth"
+                    if _information_units(draft.markdown) < draft.plan.min_words
+                    else None
+                )
+                or (
                     "glued_heading"
                     if _GLUED_HEADING_RE.search(draft.markdown)
                     else None
@@ -1846,11 +2015,27 @@ class SectionedLongformAuthor:
                 )
                 break
             review = quality.get("completeness_review")
-            if not isinstance(review, Mapping) or review.get("complete") is not True:
+            expected_point_ids = {
+                item["point_id"] for item in _required_coverage_points(draft.plan)
+            }
+            recorded_coverage = (
+                review.get("coverage") if isinstance(review, Mapping) else None
+            )
+            recorded_point_ids = {
+                str(item.get("point_id") or "")
+                for item in recorded_coverage
+                if isinstance(item, Mapping) and item.get("covered") is True
+            } if isinstance(recorded_coverage, list) else set()
+            if (
+                not isinstance(review, Mapping)
+                or review.get("complete") is not True
+                or recorded_point_ids != expected_point_ids
+            ):
                 reviewed = await review_section_completeness(
                     self._llm,
                     section_title=draft.plan.title,
                     section_objective=draft.plan.objective,
+                    required_points=_required_coverage_points(draft.plan),
                     markdown=draft.markdown,
                 )
                 if not reviewed.complete:
@@ -1868,14 +2053,14 @@ class SectionedLongformAuthor:
 
     async def _read_resume_artifact_text(self, artifact_ref: Mapping[str, Any]) -> str:
         artifacts = getattr(self._platform, "artifacts", None)
-        read_raw_text = getattr(artifacts, "read_raw_text", None)
-        if not callable(read_raw_text):
+        read_restore_text = getattr(artifacts, "read_restore_text", None)
+        if not callable(read_restore_text):
             return ""
         artifact_id = _artifact_id_from_ref(artifact_ref)
         if not artifact_id:
             return ""
         return str(
-            await read_raw_text(
+            await read_restore_text(
                 artifact_id,
                 purpose="resume sectioned authoring draft",
                 max_bytes=64000,
@@ -2058,6 +2243,9 @@ class SectionedLongformAuthor:
                     objective=f"Cover the {title.lower()} required by the artifact contract.",
                     evidence_query=title,
                     min_words=self._contract.default_section_words,
+                    required_points=(
+                        f"Cover the {title.lower()} required by the artifact contract.",
+                    ),
                 )
                 for index, title in enumerate(
                     self._contract.canonical_section_titles,
@@ -2072,6 +2260,18 @@ class SectionedLongformAuthor:
                     section_titles=[plan.title for plan in plans],
                 )
                 return self._contract.length_profile or "medium", plans
+        acceptance_criteria = _explicit_acceptance_criteria(brief)
+        acceptance_contract = (
+            "\nExplicit acceptance criteria (all IDs must appear verbatim in "
+            "at least one section objective or required_points item):\n"
+            + "\n".join(
+                f"- AC-{index}: {criterion}"
+                for index, criterion in enumerate(acceptance_criteria, start=1)
+            )
+            + "\n"
+            if acceptance_criteria
+            else ""
+        )
         prompt = (
             "Design a longform document outline for the selected length profile.\n"
             f"Coverage model: {self._contract.coverage_model}.\n"
@@ -2082,8 +2282,14 @@ class SectionedLongformAuthor:
             "change it. Plan within the declared section and unit bounds. "
             f"Return {self._contract.min_outline_sections}-"
             f"{self._contract.max_outline_sections} sections. "
-            "Each section must have a focused evidence query and an appropriate "
-            "minimum information-unit target.\n\n"
+            "Each section must have a focused evidence query, an appropriate "
+            "minimum information-unit target, and a required_points checklist "
+            "of atomic, independently verifiable content requirements. The "
+            "checklist—not prose implication—defines when the section is "
+            "complete. Preserve every explicit acceptance criterion by copying "
+            "its AC-N ID verbatim into the objective or required_points of the "
+            "section that owns it."
+            f"{acceptance_contract}\n"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Available upstream/workpad refs:\n{_json_block(upstream, limit=12000)}"
         )
@@ -2101,6 +2307,10 @@ class SectionedLongformAuthor:
                 messages=[{"role": "user", "content": prompt}],
                 output_schema=_outline_schema(self._contract),
                 temperature=0.2,
+                max_output_tokens=_outline_output_token_budget(
+                    self._contract,
+                    retry=False,
+                ),
             )
         except Exception as exc:
             await self._emit(
@@ -2113,32 +2323,11 @@ class SectionedLongformAuthor:
             )
             raise
         structured = result.get("structured") if isinstance(result, Mapping) else None
-        raw_sections = structured.get("sections") if isinstance(structured, Mapping) else None
         length_profile = self._contract.length_profile
-        plans: list[SectionPlan] = []
-        if isinstance(raw_sections, list):
-            for index, raw in enumerate(raw_sections, start=1):
-                if not isinstance(raw, Mapping):
-                    continue
-                title = str(raw.get("title") or "").strip()
-                if not title:
-                    continue
-                plans.append(
-                    SectionPlan(
-                        section_id=_slug(raw.get("section_id") or title, fallback=f"section-{index}"),
-                        title=title,
-                        objective=str(raw.get("objective") or "").strip(),
-                        evidence_query=str(raw.get("evidence_query") or title).strip(),
-                        min_words=_clamp_int(
-                            _int(
-                                raw.get("min_words"),
-                                self._contract.default_section_words,
-                            ),
-                            minimum=self._contract.min_section_words,
-                            maximum=self._contract.max_section_words,
-                        ),
-                    )
-                )
+        plans = _section_plans_from_outline_payload(
+            structured,
+            contract=self._contract,
+        )
         await self._emit(
             "agent.llm_call.completed",
             call_id=call_id,
@@ -2146,48 +2335,94 @@ class SectionedLongformAuthor:
             status="complete",
             section_count=len(plans),
         )
-        if len(plans) >= self._contract.min_outline_sections:
+        if (
+            len(plans) >= self._contract.min_outline_sections
+            and _outline_covers_acceptance_criteria(
+                plans,
+                criterion_count=len(acceptance_criteria),
+            )
+        ):
             return (
                 length_profile or "medium",
                 tuple(plans[: self._contract.max_outline_sections]),
             )
-        fallback = [
-            SectionPlan(
-                section_id="overview",
-                title="Overview",
-                objective="Summarize the requested document scope and key points.",
-                evidence_query=str(brief.get("title") or brief.get("goal") or "overview"),
-                min_words=self._contract.default_section_words,
-            ),
-            SectionPlan(
-                section_id="details",
-                title="Details",
-                objective="Develop the main body from the available context and evidence.",
-                evidence_query="document details",
-                min_words=self._contract.default_section_words,
-            ),
-            SectionPlan(
-                section_id="next-steps",
-                title="Next Steps",
-                objective="Capture follow-up actions, decisions, or open questions.",
-                evidence_query="next steps open questions",
-                min_words=self._contract.default_section_words,
-            ),
-        ]
-        while len(fallback) < self._contract.min_outline_sections:
-            index = len(fallback) + 1
-            fallback.append(
-                SectionPlan(
-                    section_id=f"section-{index}",
-                    title=f"Section {index}",
-                    objective="Develop an additional required section from the available context.",
-                    evidence_query=f"section {index} supporting evidence",
-                    min_words=self._contract.default_section_words,
-                )
+        retry_plans: list[SectionPlan] = []
+        for retry_attempt in range(1, 3):
+            await self._emit(
+                "document.outline.retry_requested",
+                status="running",
+                reason="structured_outline_incomplete",
+                section_count=len(plans if retry_attempt == 1 else retry_plans),
+                required_section_count=self._contract.min_outline_sections,
+                retry_attempt=retry_attempt,
+                max_retry_attempts=2,
             )
-        return (
-            length_profile or "medium",
-            tuple(fallback[: max(self._contract.min_outline_sections, 1)]),
+            retry_call_id = self._next_llm_call_id("build_outline_retry")
+            await self._emit(
+                "agent.llm_call.started",
+                call_id=retry_call_id,
+                llm_purpose="build_outline_retry",
+                status="running",
+                max_outline_sections=self._contract.max_outline_sections,
+                length_profile=self._contract.length_profile,
+                retry_attempt=retry_attempt,
+            )
+            retry_result = await self._llm.structured(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{prompt}\n\n"
+                            "The previous response did not contain enough valid "
+                            "sections or did not map every AC-N acceptance criterion. "
+                            "Return a complete outline now. Preserve every "
+                            "explicit deliverable dimension and acceptance "
+                            "requirement from the Original task as an exact section "
+                            "or atomic required point. Do not substitute generic "
+                            "Overview, Details, Next Steps, or numbered placeholder "
+                            f"sections. Bounded retry {retry_attempt} of 2."
+                        ),
+                    }
+                ],
+                output_schema=_outline_schema(self._contract),
+                temperature=0,
+                max_output_tokens=_outline_output_token_budget(
+                    self._contract,
+                    retry=True,
+                ),
+                method="json_schema",
+                strict=True,
+            )
+            retry_structured = (
+                retry_result.get("structured")
+                if isinstance(retry_result, Mapping)
+                else None
+            )
+            retry_plans = _section_plans_from_outline_payload(
+                retry_structured,
+                contract=self._contract,
+            )
+            await self._emit(
+                "agent.llm_call.completed",
+                call_id=retry_call_id,
+                llm_purpose="build_outline_retry",
+                status="complete",
+                section_count=len(retry_plans),
+                retry_attempt=retry_attempt,
+            )
+            if (
+                len(retry_plans) >= self._contract.min_outline_sections
+                and _outline_covers_acceptance_criteria(
+                    retry_plans,
+                    criterion_count=len(acceptance_criteria),
+                )
+            ):
+                return (
+                    length_profile or "medium",
+                    tuple(retry_plans[: self._contract.max_outline_sections]),
+                )
+        raise RuntimeError(
+            "document_outline_invalid:explicit_scope_not_preserved"
         )
 
     async def _refresh_authoring_summary(
@@ -2289,6 +2524,11 @@ class SectionedLongformAuthor:
             }
             for draft in previous
         ]
+        previous_section_tail = (
+            previous[-1].markdown[-self._contract.seam_context_chars :]
+            if previous
+            else ""
+        )
         objective = planned_part.objective if planned_part else plan.objective
         target = (
             planned_part.target_information_units
@@ -2300,6 +2540,19 @@ class SectionedLongformAuthor:
             if planned_part
             else max(plan.min_words + 1, int(plan.min_words * 1.25))
         )
+        information_budget = self._document_information_budget
+        budget_metadata = information_budget.metadata() if information_budget else {}
+        if information_budget is not None:
+            maximum = min(maximum, information_budget.current_section_allowance)
+            if maximum <= 0:
+                raise DocumentInformationBudgetExceeded(
+                    "document_information_budget_exceeded:no_part_allowance"
+                )
+            # Aggregate-budget clipping must preserve a usable acceptance
+            # window. Setting target == maximum makes the model hit one exact
+            # information-unit count, which is practically impossible for a
+            # small recovery Part and causes endless repartitioning.
+            target = _fit_information_target(target, maximum=maximum)
         cursor = coverage_cursor or SectionCoverageCursor(section_id=plan.section_id)
         envelope = build_authoring_context_envelope(
             context_budget=self._context_budget,
@@ -2316,7 +2569,10 @@ class SectionedLongformAuthor:
             coverage_cursor=asdict(cursor),
             previous_part_handoff=previous_part_handoff,
             authoring_summary=authoring_summary or {},
-            optional_evidence={"prior_section_refs": previous_index},
+            optional_evidence={
+                "prior_section_refs": previous_index,
+                "previous_section_tail_for_seam": previous_section_tail,
+            },
         )
         self._last_authoring_context_pressure = envelope.pressure
         await self._emit(
@@ -2333,12 +2589,29 @@ class SectionedLongformAuthor:
             "Finish every sentence, list, table, and code block started in this "
             "part. Cover only the current objective and do not anticipate later "
             "parts. Use the previous-part handoff to open naturally without "
-            "repeating accepted content. Cite supplied artifact/source refs when "
+            "repeating accepted content. When a previous-section tail is supplied, "
+            "make the opening flow naturally from it without restating it. "
+            "Cite supplied artifact/source refs when "
             "evidence is used. Return prose only, without process notes.\n"
             f"Target {target} substantive information units and do not exceed "
-            f"{maximum} information units.\n\n"
+            f"{maximum} information units. For this limit, one Chinese/Japanese/"
+            "Korean Han character counts as one unit and one Latin word or number "
+            "counts as one unit; headings and Markdown punctuation do not add "
+            "useful units. The complete document has "
+            f"{budget_metadata.get('document_information_units_remaining', maximum)} "
+            "information units remaining, of which "
+            f"{budget_metadata.get('document_information_units_reserved_for_future_sections', 0)} "
+            "are reserved for later sections. Do not spend that reserve.\n\n"
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
-            f"{envelope.render()}"
+            f"{envelope.render()}\n\n"
+            "FINAL LENGTH CONTRACT FOR THIS RESPONSE (takes precedence over "
+            "descriptive detail elsewhere in the context):\n"
+            f"- Aim for {target} information units.\n"
+            f"- Hard maximum: {maximum} information units.\n"
+            "- Stop after the current planned-part objective is complete; do "
+            "not spend space on later objectives.\n"
+            "- Silently shorten examples and background before answering if "
+            "needed to stay within the hard maximum."
         )
         # Token counts and word-like information units are not interchangeable.
         # Keep enough provider headroom to reach a semantic boundary; calibrating
@@ -2346,7 +2619,25 @@ class SectionedLongformAuthor:
         # mid-word.  Acceptance has an independent runaway ceiling, and the
         # document-level budget remains the aggregate protection against
         # context/output explosion.
-        part_output_tokens = max(256, maximum * 8)
+        # Keep enough provider headroom for Markdown/tokenisation overhead, but
+        # do not hand a non-compliant model six times the semantic allowance.
+        # If this bounded window is reached, the continuation/compression path
+        # below finishes the thought without allowing one part to consume the
+        # remaining document budget.
+        # A 384-token floor made small CJK parts structurally impossible to
+        # satisfy in practice: providers commonly filled most of that window,
+        # producing 170-300 Han-character information units for a 70-110 unit
+        # allowance. Keep modest Markdown/tokenisation headroom, but scale the
+        # floor to the smallest response that can still close a short paragraph.
+        language_probe = (
+            f"{plan.title}\n{objective}\n"
+            f"{_json_block(brief, limit=2000)}"
+        )
+        output_token_multiplier = 4 if _CJK_RE.search(language_probe) else 2
+        part_output_tokens = max(
+            256 if output_token_multiplier == 4 else 192,
+            maximum * output_token_multiplier,
+        )
         if self._output_token_ceiling is not None:
             part_output_tokens = min(part_output_tokens, self._output_token_ceiling)
         self._reserve_authoring_call("draft")
@@ -2358,21 +2649,90 @@ class SectionedLongformAuthor:
             output_slots_remaining=output_slots_remaining,
             section=plan,
             section_index=section_index,
-            extra_metadata={
-                "part_identity": planned_part.part_identity if planned_part else "",
-                "part_ordinal": planned_part.ordinal if planned_part else 1,
-                "part_total": planned_part.total if planned_part else 1,
-                "target_information_units": target,
-                "max_information_units": maximum,
-            },
+                extra_metadata={
+                    "part_identity": planned_part.part_identity if planned_part else "",
+                    "part_ordinal": planned_part.ordinal if planned_part else 1,
+                    "part_total": planned_part.total if planned_part else 1,
+                    "target_information_units": target,
+                    "max_information_units": maximum,
+                    **budget_metadata,
+                },
+            )
+        empty_attempt = 0
+        max_empty_retries = _positive_int(
+            self._context_budget.get("max_empty_part_retries"),
+            1,
         )
+        while not streamed.text.strip() and empty_attempt < max_empty_retries:
+            empty_attempt += 1
+            await self._emit(
+                "document.part.empty_output_retry_requested",
+                status="running",
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                empty_retry_attempt=empty_attempt,
+            )
+            # Do not resend the full authoring envelope. Real providers can
+            # return a nominal `stop` with one output token and no prose under a
+            # large second-part prompt. A focused recovery call preserves the
+            # objective and seam while removing unrelated context pressure.
+            empty_recovery_prompt = (
+                "Write the missing planned part now in complete Markdown prose. "
+                "The previous provider response was empty. Start directly with "
+                "content: do not apologize, explain the retry, repeat the parent "
+                "heading, or return an empty response. Cover only the objective, "
+                "use the prior-part handoff only to avoid repetition, and finish "
+                "every sentence and local structure. "
+                f"Target {target} information units and do not exceed {maximum}; "
+                "one CJK Han character is one unit and one Latin word or number "
+                "is one unit.\n\n"
+                f"Current objective:\n{objective}\n\n"
+                f"Previous-part handoff:\n{previous_part_handoff[-1600:]}\n\n"
+                "Required evidence (compact):\n"
+                f"{_json_block(evidence_pack, limit=3500)}"
+            )
+            self._reserve_authoring_call("draft")
+            streamed = await self._stream_llm_text(
+                purpose="recover_empty_planned_part",
+                messages=[{"role": "user", "content": empty_recovery_prompt}],
+                temperature=0.1,
+                max_output_tokens=part_output_tokens,
+                output_slots_remaining=output_slots_remaining,
+                section=plan,
+                section_index=section_index,
+                extra_metadata={
+                    "part_identity": (
+                        planned_part.part_identity if planned_part else ""
+                    ),
+                    "empty_retry_attempt": empty_attempt,
+                    "target_information_units": target,
+                    "max_information_units": maximum,
+                    **budget_metadata,
+                },
+            )
+            await self._emit(
+                "document.part.empty_output_retry_completed",
+                status="complete" if streamed.text.strip() else "incomplete",
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                empty_retry_attempt=empty_attempt,
+                recovered=bool(streamed.text.strip()),
+            )
         continuation_attempt = 0
-        max_continuations = _positive_int(
-            self._context_budget.get("max_part_continuations"),
-            2,
-        )
-        while streamed.truncated and continuation_attempt < max_continuations:
+        # The default document path rewrites the whole section. A generic
+        # platform budget must not silently re-enable the legacy continuation
+        # branch and multiply the section retry contract.
+        max_continuations = 0
+        while (
+            streamed.truncated
+            and _information_units(streamed.text) < target
+            and continuation_attempt < max_continuations
+        ):
             continuation_attempt += 1
+            continuation_units = max(
+                1,
+                maximum - _information_units(streamed.text),
+            )
             await self._emit(
                 "document.part.continuation_requested",
                 status="running",
@@ -2386,6 +2746,7 @@ class SectionedLongformAuthor:
                 "summarize, add a section heading, or expand the scope. Complete "
                 "the current sentence and any open list, table, or code block, "
                 "then finish only this planned part in the fewest words needed. "
+                "Do not add new claims merely to use the available token space. "
                 "Return continuation text only.\n\n"
                 f"Current objective:\n{objective}\n\n"
                 "Tail of interrupted output:\n"
@@ -2396,7 +2757,10 @@ class SectionedLongformAuthor:
                 purpose="continue_truncated_planned_part",
                 messages=[{"role": "user", "content": continuation_prompt}],
                 temperature=0.1,
-                max_output_tokens=part_output_tokens,
+                max_output_tokens=min(
+                    part_output_tokens,
+                    max(192, continuation_units * 4),
+                ),
                 output_slots_remaining=output_slots_remaining,
                 section=plan,
                 section_index=section_index,
@@ -2433,9 +2797,200 @@ class SectionedLongformAuthor:
         section = scrub_artifact_scaffolding(
             _isolate_requested_section(content, plan.title)
         ).text
+        section = normalize_part_markdown(section, section_title=plan.title)
         if _PLACEHOLDER_SECTION_RE.search(section):
             raise RuntimeError(
                 "document_planned_part_rejected:placeholder_section"
+            )
+        compression_attempt = 0
+        max_compressions = _positive_int(
+            self._context_budget.get("max_part_compressions"),
+            3,
+        )
+        compression_acceptance_maximum = maximum
+        while (
+            (
+                streamed.truncated
+                or _information_units(section) > compression_acceptance_maximum
+            )
+            and compression_attempt < max_compressions
+        ):
+            compression_attempt += 1
+            units_before = _information_units(section)
+            await self._emit(
+                "document.part.compression_requested",
+                status="running",
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                compression_attempt=compression_attempt,
+                information_units_before=units_before,
+                max_information_units=maximum,
+            )
+            # Each retry carries the same simple section contract: aim for the
+            # requested length and stay within its 25% tolerance.
+            compression_target = target
+            required_reduction = max(0, units_before - compression_target)
+            compression_prompt = (
+                "Rewrite the planned-part draft below into complete, concise "
+                "Markdown prose. Preserve the current objective, material facts, "
+                "decisions, the strongest evidence references, and syntactic "
+                "closure. Prefer one direct statement over several examples; "
+                "remove secondary detail, repetition, background not needed for "
+                "the objective, and process commentary. The draft may end "
+                "abruptly: repair that ending instead of continuing it verbatim. "
+                "Do not add a level-one or level-two heading. Aim for "
+                f"{compression_target} information units by removing at least "
+                f"{required_reduction} units from this draft. The result MUST "
+                f"contain at most {maximum} information units. One "
+                "Chinese/Japanese/Korean Han character is one unit; one Latin word "
+                "or number is one unit. Return only the rewritten prose. Before "
+                "answering, silently verify that the rewrite is materially shorter "
+                "and complete.\n\n"
+                f"Current objective:\n{objective}\n\n"
+                f"Draft ({units_before} information units):\n{section}"
+            )
+            self._reserve_authoring_call("draft")
+            # Compression must have a smaller provider window than the draft.
+            # Otherwise a model that tends to fill its output window can return
+            # a rewrite longer than the requested hard maximum on every retry.
+            compression_output_tokens = max(
+                256 if output_token_multiplier == 4 else 128,
+                compression_target * output_token_multiplier,
+                # Compression still has to finish a response near the allowed
+                # upper bound. CJK output also carries Markdown and reasoning
+                # overhead that is not represented by information units; a
+                # two-token-per-unit window still cut dense Chinese rewrites
+                # before they reached syntactic closure in live runs.
+                maximum * output_token_multiplier,
+            )
+            if self._output_token_ceiling is not None:
+                compression_output_tokens = min(
+                    compression_output_tokens,
+                    self._output_token_ceiling,
+                )
+            compressed = await self._stream_llm_text(
+                purpose="compress_overlong_planned_part",
+                messages=[{"role": "user", "content": compression_prompt}],
+                temperature=0.1,
+                max_output_tokens=compression_output_tokens,
+                output_slots_remaining=output_slots_remaining,
+                section=plan,
+                section_index=section_index,
+                extra_metadata={
+                    "part_identity": (
+                        planned_part.part_identity if planned_part else ""
+                    ),
+                    "compression_attempt": compression_attempt,
+                    "max_information_units": maximum,
+                    **budget_metadata,
+                },
+            )
+            candidate = scrub_artifact_scaffolding(
+                _isolate_requested_section(compressed.text.strip(), plan.title)
+            ).text
+            candidate_units = _information_units(candidate)
+            current_units = _information_units(section)
+            candidate_is_in_window = (
+                target <= candidate_units <= compression_acceptance_maximum
+            )
+            candidate_reduces_overflow = (
+                current_units > compression_acceptance_maximum
+                and candidate_units >= target
+                and candidate_units < current_units
+            )
+            if candidate and (
+                candidate_is_in_window
+                or candidate_reduces_overflow
+                or (
+                    current_units < target
+                    and candidate_units > current_units
+                )
+                # The tolerance is the threshold for requesting a rewrite, not
+                # a publication hard stop.  After the third and final retry,
+                # keep the model's last non-empty result even when it remains
+                # outside the requested window so authoring can continue.
+                or compression_attempt == max_compressions
+            ):
+                section = candidate
+                streamed = _StreamedLlmText(
+                    text=section,
+                    finish_reason=compressed.finish_reason,
+                    truncated=compressed.truncated,
+                )
+            await self._emit(
+                "document.part.compression_completed",
+                status=(
+                    "complete"
+                    if candidate and not compressed.truncated
+                    else "incomplete"
+                ),
+                section_id=plan.section_id,
+                part_identity=planned_part.part_identity if planned_part else "",
+                compression_attempt=compression_attempt,
+                information_units_after=_information_units(section),
+                max_information_units=maximum,
+                compression_acceptance_maximum=compression_acceptance_maximum,
+                truncated=compressed.truncated,
+            )
+        if (
+            streamed.truncated
+            and section.strip()
+            and compression_attempt >= max_compressions
+        ):
+            # Retry exhaustion is an explicit degraded terminal result, not a
+            # reason to repartition or begin another retry group. Preserve the
+            # user's last model result exactly and let section quality record
+            # the uncertainty while the document continues.
+            await self._emit(
+                "document.part.truncation_degraded",
+                status="degraded",
+                section_id=plan.section_id,
+                part_identity=(
+                    planned_part.part_identity if planned_part else ""
+                ),
+                compression_attempts=compression_attempt,
+                information_units=_information_units(section),
+            )
+            streamed = _StreamedLlmText(
+                text=section,
+                finish_reason="retry_exhausted_degraded",
+                truncated=False,
+            )
+        if (
+            (streamed.truncated or _has_open_prose_tail(section))
+            and _information_units(section) <= maximum
+        ):
+            closed = _close_truncated_tail(section)
+            if closed and closed != section:
+                units_before_closure = _information_units(section)
+                section = closed
+                streamed = _StreamedLlmText(
+                    text=section,
+                    finish_reason="bounded_tail_closure",
+                    truncated=False,
+                )
+                await self._emit(
+                    "document.part.truncated_tail_closed",
+                    status="complete",
+                    section_id=plan.section_id,
+                    part_identity=(
+                        planned_part.part_identity if planned_part else ""
+                    ),
+                    information_units_before=units_before_closure,
+                    information_units_after=_information_units(section),
+                    max_information_units=maximum,
+                )
+        balanced = _close_unbalanced_bold(section)
+        if balanced != section:
+            section = balanced
+            await self._emit(
+                "document.part.inline_markdown_closed",
+                status="complete",
+                section_id=plan.section_id,
+                part_identity=(
+                    planned_part.part_identity if planned_part else ""
+                ),
+                marker="**",
             )
         return section, streamed.truncated
 
@@ -2451,7 +3006,133 @@ class SectionedLongformAuthor:
         drafts: list[SectionDraft],
     ) -> str:
         del brief
-        combined = _join_markdown(draft.markdown for draft in drafts)
+        assembled_sections: list[str] = []
+        seam_review_enabled = _bool(
+            self._context_budget.get("enable_document_seam_review"),
+            False,
+        )
+        for index, draft in enumerate(drafts):
+            markdown = draft.markdown
+            if seam_review_enabled and index > 0:
+                previous = assembled_sections[-1]
+                self._reserve_authoring_call("review")
+                result = await self._llm.structured(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Review the transition between two adjacent "
+                                "document sections. If it is abrupt, provide one "
+                                "short bridge sentence that can be inserted after "
+                                "the next section heading. The bridge must connect "
+                                "the ideas without repeating content, adding facts, "
+                                "or changing either section. Return an empty bridge "
+                                "when the transition is already smooth."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Previous section tail:\n"
+                                f"{previous[-1800:]}\n\n"
+                                "Next section opening:\n"
+                                f"{markdown[:1800]}"
+                            ),
+                        },
+                    ],
+                    output_schema=_section_seam_schema(),
+                    temperature=0,
+                    method="json_schema",
+                    strict=True,
+                    max_output_tokens=256,
+                )
+                payload = result.get("structured") if isinstance(result, Mapping) else None
+                if not isinstance(payload, Mapping):
+                    raise RuntimeError("document_seam_review_invalid:missing_result")
+                smooth = payload.get("smooth")
+                bridge = str(payload.get("bridge") or "").strip()
+                reason = str(payload.get("reason") or "").strip()
+                if not isinstance(smooth, bool) or not reason:
+                    raise RuntimeError("document_seam_review_invalid:invalid_shape")
+                bridge_inserted = False
+                if not smooth:
+                    bridge = _safe_seam_bridge(bridge)
+                    if not bridge:
+                        raise RuntimeError("document_seam_review_invalid:missing_bridge")
+                    markdown = _insert_bridge_after_heading(markdown, bridge)
+                    bridge_inserted = True
+                await self._emit(
+                    "document.seam.reviewed",
+                    status="complete",
+                    previous_section_id=drafts[index - 1].plan.section_id,
+                    section_id=draft.plan.section_id,
+                    smooth=smooth,
+                    bridge_inserted=bridge_inserted,
+                    reason=reason,
+                )
+            assembled_sections.append(markdown)
+        combined = _join_markdown(assembled_sections)
+        if seam_review_enabled and combined.strip():
+            self._reserve_authoring_call("review")
+            tail_result = await self._llm.structured(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Review only whether the final sentence of a document "
+                            "reaches a natural semantic conclusion. A sentence can "
+                            "end with punctuation yet still dangle by requiring an "
+                            "unstated object, condition, comparison, or continuation. "
+                            "If incomplete, return one replacement final sentence "
+                            "that closes the existing thought without adding facts. "
+                            "Otherwise return an empty replacement."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Document tail:\n"
+                            f"{combined[-1600:]}\n\n"
+                            "Keep any replacement under 80 information units."
+                        ),
+                    },
+                ],
+                output_schema=_final_tail_review_schema(),
+                temperature=0,
+                method="json_schema",
+                strict=True,
+                max_output_tokens=384,
+            )
+            tail_payload = (
+                tail_result.get("structured")
+                if isinstance(tail_result, Mapping)
+                else None
+            )
+            if not isinstance(tail_payload, Mapping):
+                raise RuntimeError("document_final_tail_review_invalid:missing_result")
+            tail_complete = tail_payload.get("complete")
+            replacement_tail = str(
+                tail_payload.get("replacement_tail") or ""
+            ).strip()
+            tail_reason = str(tail_payload.get("reason") or "").strip()
+            if not isinstance(tail_complete, bool) or not tail_reason:
+                raise RuntimeError("document_final_tail_review_invalid:invalid_shape")
+            tail_replaced = False
+            if not tail_complete:
+                replacement_tail = _safe_final_tail_replacement(replacement_tail)
+                if not replacement_tail:
+                    raise RuntimeError(
+                        "document_final_tail_review_invalid:missing_replacement"
+                    )
+                combined = _replace_final_sentence(combined, replacement_tail)
+                tail_replaced = True
+            await self._emit(
+                "document.final.tail_reviewed",
+                status="complete",
+                complete=tail_complete,
+                tail_replaced=tail_replaced,
+                reason=tail_reason,
+            )
         if self._contract.finalization not in KNOWN_FINALIZATION_MODES:
             raise RuntimeError(
                 "document_finalization_mode_invalid:"
@@ -2550,6 +3231,7 @@ class SectionedLongformAuthor:
             agent_id=agent_id,
             metadata={
                 "role": "section_draft",
+                "internal_authoring_artifact": True,
                 "section_id": plan.section_id,
                 "section_title": plan.title,
                 "section_index": index,
@@ -2973,9 +3655,246 @@ def _normalise_heading(value: str) -> str:
 
 
 def _information_units(markdown: str) -> int:
-    text = re.sub(r"`[^`]*`", " ", str(markdown or ""))
-    text = re.sub(r"https?://\S+", " ", text)
-    return len(_WORD_RE.findall(text)) + len(_CJK_RE.findall(text))
+    return part_information_units(markdown)
+
+
+def _fit_information_target(target: int, *, maximum: int) -> int:
+    """Keep aggregate clipping from collapsing target and maximum together."""
+    bounded_maximum = max(1, int(maximum))
+    requested_target = max(1, int(target))
+    if requested_target <= bounded_maximum:
+        return requested_target
+    return min(
+        requested_target,
+        max(1, int(bounded_maximum * 0.8)),
+    )
+
+
+def _section_recovery_reserve(
+    *,
+    minimum_units: int,
+    maximum_units: int,
+    section_count: int,
+    recovery_rounds: int,
+) -> int:
+    """Allocate equal per-round recovery reserves from document slack."""
+    slack = max(0, int(maximum_units) - max(0, int(minimum_units)))
+    slots = max(1, int(section_count)) * max(1, int(recovery_rounds))
+    candidate = min(80, slack // slots)
+    return candidate if candidate >= 24 else 0
+
+
+def _required_coverage_points(plan: SectionPlan) -> tuple[dict[str, str], ...]:
+    requirements = tuple(
+        item.strip() for item in plan.required_points if item.strip()
+    ) or (plan.objective.strip() or plan.title,)
+    return tuple(
+        {
+            "point_id": f"{plan.section_id}.p{index}",
+            "requirement": requirement,
+        }
+        for index, requirement in enumerate(requirements, start=1)
+    )
+
+
+def _recovery_objective(
+    *,
+    plan: SectionPlan,
+    review: Mapping[str, Any],
+    hard_failures: tuple[str, ...],
+) -> str:
+    """Describe only the missing atomic coverage while preserving accepted prose."""
+    expected = {
+        item["point_id"]: item["requirement"]
+        for item in _required_coverage_points(plan)
+    }
+    missing: list[dict[str, str]] = []
+    coverage = review.get("coverage")
+    for item in coverage if isinstance(coverage, list) else ():
+        if not isinstance(item, Mapping) or item.get("covered") is not False:
+            continue
+        point_id = str(item.get("point_id") or "").strip()
+        requirement = expected.get(point_id)
+        if requirement is None:
+            continue
+        missing.append(
+            {
+                "point_id": point_id,
+                "requirement": requirement,
+                "review_finding": str(item.get("evidence") or "").strip(),
+            }
+        )
+    if missing:
+        return (
+            "Add concise prose that satisfies every missing atomic point below. "
+            "Do not restate or rewrite already accepted material. "
+            f"Missing points: {json.dumps(missing, ensure_ascii=False)}"
+        )
+    if hard_failures:
+        return (
+            "Add only the material needed to resolve these remaining publication "
+            "quality gates without restating accepted prose: "
+            + ", ".join(hard_failures)
+        )
+    return str(
+        review.get("reason")
+        or "Resolve the remaining completion gate without restating accepted material."
+    )
+
+
+def _close_truncated_tail(markdown: str) -> str:
+    """Drop only an unfinished trailing fragment from budget-compliant prose."""
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+    if re.search(r"[。！？.!?][”’\"')）】》]*\s*$", text):
+        return text
+    boundaries = list(re.finditer(r"[。！？.!?][”’\"')）】》]*", text))
+    if boundaries:
+        candidate = text[: boundaries[-1].end()].rstrip()
+        if (
+            len(candidate) >= int(len(text) * 0.45)
+            and _information_units(candidate)
+            >= max(1, int(_information_units(text) * 0.5))
+        ):
+            if candidate.count("```") % 2:
+                candidate = f"{candidate}\n```"
+            return candidate
+    blocks = [item.rstrip() for item in re.split(r"\n\s*\n", text) if item.strip()]
+    if len(blocks) > 1:
+        candidate = "\n\n".join(blocks[:-1]).rstrip()
+        if _information_units(candidate) >= max(
+            1, int(_information_units(text) * 0.6)
+        ):
+            if candidate.count("```") % 2:
+                candidate = f"{candidate}\n```"
+            return candidate
+    # Compact Markdown often uses one line per bullet without blank lines or
+    # terminal punctuation. A provider cut in the last bullet should not throw
+    # away all earlier, structurally complete bullets.
+    lines = [item.rstrip() for item in text.splitlines()]
+    nonempty_indexes = [index for index, item in enumerate(lines) if item.strip()]
+    if len(nonempty_indexes) > 1:
+        candidate = "\n".join(lines[: nonempty_indexes[-1]]).rstrip()
+        if _information_units(candidate) >= max(
+            1, int(_information_units(text) * 0.6)
+        ):
+            if candidate.count("```") % 2:
+                candidate = f"{candidate}\n```"
+            return candidate
+    # A final compact CJK paragraph can fill the provider window before the
+    # model emits its last full stop. Close only at an existing clause boundary
+    # and retain most of the generated substance; the subsequent semantic
+    # completeness review still decides whether the objective was fully met.
+    clause_boundaries = list(re.finditer(r"[；;，,][”’\"')）】》]*", text))
+    if clause_boundaries:
+        candidate = text[: clause_boundaries[-1].start()].rstrip()
+        if _information_units(candidate) >= max(
+            1, int(_information_units(text) * 0.7)
+        ):
+            if candidate.count("```") % 2:
+                candidate = f"{candidate}\n```"
+            if not re.search(r"[。！？.!?]\s*$", candidate):
+                candidate = f"{candidate}。"
+            return candidate
+    return ""
+
+
+def _has_open_prose_tail(markdown: str) -> bool:
+    """Detect an unfinished prose tail without rewriting valid Markdown shapes."""
+    lines = [line.strip() for line in str(markdown or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    tail = lines[-1]
+    if (
+        tail.startswith(("#", "```", "|", "- ", "* ", "+ "))
+        or re.match(r"^\d+[.)]\s+", tail)
+        or re.search(r"[。！？.!?][”’\"')）】》]*$", tail)
+    ):
+        return False
+    return True
+
+
+def _close_unbalanced_bold(markdown: str) -> str:
+    """Close one dangling Markdown bold span without changing prose content."""
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+    markers = re.findall(r"(?<!\\)\*\*", text)
+    return f"{text}**" if len(markers) % 2 else text
+
+
+def _trim_to_information_window(
+    markdown: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> str:
+    """Keep the longest already-complete prefix inside an information window."""
+    text = str(markdown or "").strip()
+    if not text or maximum <= 0:
+        return ""
+    candidates: list[str] = []
+    for match in re.finditer(r"[。！？.!?][”’\"')）】》]*", text):
+        candidates.append(text[: match.end()].rstrip())
+    for match in re.finditer(r"[；;][”’\"')）】》]*", text):
+        prefix = text[: match.start()].rstrip()
+        if prefix:
+            candidates.append(f"{prefix}。")
+    # Dense CJK prose may contain no sentence/semicolon boundary inside a
+    # narrow Planned Part window. A comma already marks a complete clause;
+    # promote that existing clause boundary to a full stop. The downstream
+    # semantic coverage gate still decides whether the objective is complete.
+    for match in re.finditer(r"[，,][”’\"')）】》]*", text):
+        prefix = text[: match.start()].rstrip()
+        if prefix:
+            candidates.append(f"{prefix}。")
+    for match in re.finditer(r"\n\s*\n", text):
+        candidates.append(text[: match.start()].rstrip())
+    valid = [
+        candidate
+        for candidate in candidates
+        if minimum <= _information_units(candidate) <= maximum
+        and candidate.count("```") % 2 == 0
+    ]
+    if valid:
+        return max(valid, key=_information_units)
+
+    # A semantically complete recovery statement is preferable to meeting a
+    # local target by cutting through a word or clause. Section depth and
+    # required-point review remain the authoritative completeness gates.
+    relaxed_minimum = max(12, int(minimum * 0.4))
+    complete_bounded = [
+        candidate
+        for candidate in candidates
+        if relaxed_minimum <= _information_units(candidate) <= maximum
+        and candidate.count("```") % 2 == 0
+    ]
+    if complete_bounded:
+        return max(complete_bounded, key=_information_units)
+    return ""
+
+
+def _scale_outline_to_document_minimum(
+    outline: tuple[SectionPlan, ...],
+    requested_minimum: int,
+) -> tuple[SectionPlan, ...]:
+    current = sum(max(1, plan.min_words) for plan in outline)
+    if requested_minimum <= current or not outline:
+        return outline
+    scaled: list[SectionPlan] = []
+    assigned = 0
+    for index, plan in enumerate(outline):
+        if index == len(outline) - 1:
+            target = requested_minimum - assigned
+        else:
+            target = max(
+                plan.min_words,
+                round(requested_minimum * plan.min_words / current),
+            )
+        scaled.append(replace(plan, min_words=max(1, target)))
+        assigned += max(1, target)
+    return tuple(scaled)
 
 
 def _evidence_items(evidence_pack: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -3110,12 +4029,32 @@ def _document_integrity_violation(
         return mechanical
     for draft in drafts:
         quality = draft.quality if isinstance(draft.quality, Mapping) else {}
-        review = quality.get("completeness_review")
-        if not isinstance(review, Mapping) or review.get("complete") is not True:
-            return f"section_completeness_missing:{draft.plan.section_id}"
         hard_failures = quality.get("hard_failures")
         if isinstance(hard_failures, (list, tuple)) and hard_failures:
             return f"section_blocking_failure:{draft.plan.section_id}"
+        review = quality.get("completeness_review")
+        failures = quality.get("failures")
+        reviewer_degraded = (
+            quality.get("degraded") is True
+            or (
+                isinstance(failures, (list, tuple))
+                and any(
+                    failure in failures
+                    for failure in (
+                        "completeness_review_degraded",
+                        "semantic_incomplete_degraded",
+                    )
+                )
+            )
+        )
+        if (
+            not isinstance(review, Mapping)
+            or (
+                review.get("complete") is not True
+                and not reviewer_degraded
+            )
+        ):
+            return f"section_completeness_missing:{draft.plan.section_id}"
     return None
 
 
@@ -3192,6 +4131,82 @@ def _is_transient_llm_stream_error(exc: Exception) -> bool:
     )
 
 
+def _section_plans_from_outline_payload(
+    structured: Any,
+    *,
+    contract: SectionedAuthoringContract,
+) -> list[SectionPlan]:
+    raw_sections = (
+        structured.get("sections")
+        if isinstance(structured, Mapping)
+        else None
+    )
+    plans: list[SectionPlan] = []
+    if not isinstance(raw_sections, list):
+        return plans
+    for index, raw in enumerate(raw_sections, start=1):
+        if not isinstance(raw, Mapping):
+            return []
+        title = str(raw.get("title") or "").strip()
+        objective = str(raw.get("objective") or "").strip()
+        if not title or _information_units(objective) < 2:
+            return []
+        required_points = tuple(
+            dict.fromkeys(
+                str(item).strip()
+                for item in raw.get("required_points", [])
+                if str(item).strip()
+            )
+        )
+        if not required_points:
+            # Older/custom structured-output adapters may omit this newer
+            # field. The section objective is already skill/task grounded and
+            # is safer than either failing the whole workflow or inventing a
+            # generic replacement section.
+            required_points = (objective,)
+        if any(_information_units(point) < 2 for point in required_points):
+            # Reject only obvious provider fragments, not concise but valid
+            # skill-specific requirements.
+            return []
+        plans.append(
+            SectionPlan(
+                section_id=_slug(
+                    raw.get("section_id") or title,
+                    fallback=f"section-{index}",
+                ),
+                title=title,
+                objective=objective,
+                evidence_query=str(
+                    raw.get("evidence_query") or title
+                ).strip(),
+                min_words=_clamp_int(
+                    _int(
+                        raw.get("min_words"),
+                        contract.default_section_words,
+                    ),
+                    minimum=contract.min_section_words,
+                    maximum=contract.max_section_words,
+                ),
+                required_points=required_points,
+            )
+        )
+    return plans
+
+
+def _outline_output_token_budget(
+    contract: SectionedAuthoringContract,
+    *,
+    retry: bool,
+) -> int:
+    # Outlines are bounded by the contract's section count, not by the final
+    # document length. Keep the structured response comfortably large enough
+    # for atomic requirements, but do not let a long document request turn the
+    # outline itself into a long-form generation that exceeds the platform's
+    # structured-output deadline.
+    per_section = 220 if retry else 180
+    return min(4800, max(2400, 800 + contract.max_outline_sections * per_section))
+
+
 def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
     profile = str(contract.length_profile or "").strip().lower()
     profile_enum = [profile] if profile in {"short", "medium", "long"} else ["short", "medium", "long"]
@@ -3217,6 +4232,7 @@ def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
                         "section_id",
                         "title",
                         "objective",
+                        "required_points",
                         "evidence_query",
                         "min_words",
                     ],
@@ -3224,6 +4240,10 @@ def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
                         "section_id": {"type": "string"},
                         "title": {"type": "string"},
                         "objective": {"type": "string"},
+                        "required_points": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                         "evidence_query": {"type": "string"},
                         "min_words": {"type": "integer"},
                     },
@@ -3233,11 +4253,139 @@ def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
     }
 
 
+def _section_seam_schema() -> dict[str, Any]:
+    return {
+        "title": "SectionSeamReview",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "smooth": {"type": "boolean"},
+            "bridge": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["smooth", "bridge", "reason"],
+    }
+
+
+def _final_tail_review_schema() -> dict[str, Any]:
+    return {
+        "title": "FinalTailReview",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "complete": {"type": "boolean"},
+            "replacement_tail": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["complete", "replacement_tail", "reason"],
+    }
+
+
+def _safe_final_tail_replacement(value: str) -> str:
+    text = str(value or "").strip()
+    if (
+        not text
+        or "\n" in text
+        or text.startswith("#")
+        or "```" in text
+        or _information_units(text) > 80
+    ):
+        return ""
+    if not re.search(r"[。！？.!?][”’\"')）】》]*$", text):
+        text = f"{text.rstrip('，,；;：:、')}。"
+    return text
+
+
+def _replace_final_sentence(markdown: str, replacement: str) -> str:
+    text = str(markdown or "").rstrip()
+    boundaries = list(re.finditer(r"[。！？.!?][”’\"')）】》]*\s*", text))
+    ends_at_boundary = bool(
+        re.search(r"[。！？.!?][”’\"')）】》]*$", text)
+    )
+    if ends_at_boundary and len(boundaries) >= 2:
+        start = boundaries[-2].end()
+    elif ends_at_boundary:
+        start = text.rfind("\n\n") + 2
+    else:
+        start = boundaries[-1].end() if boundaries else text.rfind("\n\n") + 2
+    return f"{text[:start]}{replacement}".strip()
+
+
+def _safe_seam_bridge(value: str) -> str:
+    bridge = " ".join(str(value or "").split()).strip()
+    if (
+        not bridge
+        or "#" in bridge
+        or _information_units(bridge) > 80
+        or "\n" in str(value or "")
+    ):
+        return ""
+    if re.search(r"[。！？.!?][”’\"')）】》]*\s*$", bridge):
+        return bridge
+    return f"{bridge}。"
+
+
+def _insert_bridge_after_heading(markdown: str, bridge: str) -> str:
+    text = str(markdown or "").strip()
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith("## "):
+        raise RuntimeError("document_seam_review_invalid:section_heading_missing")
+    return "\n".join((lines[0], "", bridge, "", *lines[1:])).strip()
+
+
 def _json_block(value: Any, *, limit: int) -> str:
     text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def _explicit_acceptance_criteria(brief: Mapping[str, Any]) -> tuple[str, ...]:
+    """Read durable TaskBrief criteria without making semantic guesses."""
+    collected: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if str(key).strip().lower() == "acceptance_criteria":
+                    if isinstance(child, (list, tuple)):
+                        collected.extend(
+                            str(item).strip()
+                            for item in child
+                            if str(item).strip()
+                        )
+                    elif str(child or "").strip():
+                        collected.append(str(child).strip())
+                elif isinstance(child, (Mapping, list, tuple)):
+                    visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(brief)
+    return tuple(dict.fromkeys(collected))
+
+
+def _outline_covers_acceptance_criteria(
+    plans: Sequence[SectionPlan],
+    *,
+    criterion_count: int,
+) -> bool:
+    if criterion_count <= 0:
+        return True
+    flattened = "\n".join(
+        text
+        for plan in plans
+        for text in (plan.title, plan.objective, *plan.required_points)
+    )
+    return all(
+        re.search(
+            rf"(?<![A-Z0-9-]){re.escape(f'AC-{index}')}(?!\d)",
+            flattened,
+        )
+        is not None
+        for index in range(1, criterion_count + 1)
+    )
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -3256,6 +4404,11 @@ def _section_plan_from_mapping(value: Any) -> SectionPlan | None:
         objective=str(raw.get("objective") or ""),
         evidence_query=str(raw.get("evidence_query") or ""),
         min_words=_positive_int(raw.get("min_words"), 1),
+        required_points=tuple(
+            str(item).strip()
+            for item in raw.get("required_points", [])
+            if str(item).strip()
+        ),
     )
 
 
