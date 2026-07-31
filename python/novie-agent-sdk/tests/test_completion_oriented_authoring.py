@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -36,7 +36,10 @@ from novie_agent_sdk.document_part_assembly import (
     accept_part,
     assemble_section,
 )
-from novie_agent_sdk.document_part_execution import execute_planned_parts
+from novie_agent_sdk.document_part_execution import (
+    AcceptedPartArtifact,
+    execute_planned_parts,
+)
 
 
 @dataclass
@@ -45,6 +48,7 @@ class _Section:
     title: str = "Context"
     objective: str = "Explain the problem and constraints."
     min_words: int = 300
+    required_points: tuple[str, ...] = ()
 
 
 def _scope() -> dict[str, str]:
@@ -57,7 +61,7 @@ def _scope() -> dict[str, str]:
     }
 
 
-def test_execution_plan_subdivides_and_keeps_identity_across_revision() -> None:
+def test_execution_plan_uses_one_retry_unit_per_section_and_keeps_identity() -> None:
     first = build_authoring_execution_plan(
         [_Section()],
         scope=_scope(),
@@ -71,15 +75,36 @@ def test_execution_plan_subdivides_and_keeps_identity_across_revision() -> None:
         revision=2,
     )
 
-    assert first.part_count > 1
+    assert first.part_count == 1
     assert first.mandatory_call_count == first.part_count + 1
     assert first.sections[0].target_information_units == 300
-    assert first.sections[0].max_information_units > 300
+    assert first.sections[0].max_information_units == 375
     assert [
         item.part_identity for item in first.sections[0].parts
     ] == [
         item.part_identity for item in second.sections[0].parts
     ]
+
+
+def test_execution_plan_groups_required_points_within_part_capacity() -> None:
+    section = _Section(
+        min_words=240,
+        required_points=(
+            "Explain the problem.",
+            "Describe the constraints.",
+            "State the decision.",
+        ),
+    )
+
+    plan = build_authoring_execution_plan(
+        [section],
+        scope=_scope(),
+        context_budget={"max_part_information_units": 360},
+    )
+
+    assert plan.part_count == 1
+    objectives = [part.objective for part in plan.sections[0].parts]
+    assert all(point in "\n".join(objectives) for point in section.required_points)
 
 
 def test_execution_plan_marks_estimated_deadline_pressure_without_false_rejection() -> None:
@@ -317,15 +342,17 @@ def test_part_assembly_normalizes_headings_and_uses_one_blank_seam() -> None:
         context_budget={"max_part_information_units": 25},
     )
     parts = plan.sections[0].parts
+    first_part = replace(parts[0], ordinal=1, total=2)
+    second_part = replace(parts[0], ordinal=2, total=2)
     accepted = [
         accept_part(
-            parts[0],
+            first_part,
             "## Context\n\n### First\n\none two three",
             section_title="Context",
             truncated=False,
         ),
         accept_part(
-            parts[1],
+            second_part,
             "# Foreign\n\nfour five six",
             section_title="Context",
             truncated=False,
@@ -372,14 +399,15 @@ def test_truncated_part_is_never_accepted() -> None:
         )
 
 
-def test_part_acceptance_allows_completion_headroom_but_keeps_hard_ceiling() -> None:
+def test_part_acceptance_uses_the_planned_twenty_five_percent_ceiling() -> None:
     part = build_authoring_execution_plan(
         [_Section(min_words=80)],
         scope=_scope(),
         context_budget={"max_part_information_units": 100},
     ).sections[0].parts[0]
-    hard_maximum = 1200
-    tolerated = " ".join(f"word-{index}" for index in range(hard_maximum))
+    tolerated = " ".join(
+        f"word-{index}" for index in range(part.max_information_units)
+    )
     excessive = f"{tolerated} overflow"
 
     accepted = accept_part(
@@ -389,7 +417,7 @@ def test_part_acceptance_allows_completion_headroom_but_keeps_hard_ceiling() -> 
         truncated=False,
     )
 
-    assert accepted.information_units == hard_maximum
+    assert accepted.information_units == part.max_information_units
     with pytest.raises(PlannedPartRejected, match="part_over_maximum"):
         accept_part(
             part,
@@ -397,6 +425,25 @@ def test_part_acceptance_allows_completion_headroom_but_keeps_hard_ceiling() -> 
             section_title="Context",
             truncated=False,
         )
+
+
+def test_part_acceptance_can_use_safe_section_allowance() -> None:
+    part = build_authoring_execution_plan(
+        [_Section(min_words=100)],
+        scope=_scope(),
+        context_budget={},
+    ).sections[0].parts[0]
+    complete_prose = " ".join(f"word-{index}" for index in range(300))
+
+    accepted = accept_part(
+        part,
+        complete_prose,
+        section_title="Context",
+        truncated=False,
+        hard_max_information_units=320,
+    )
+
+    assert accepted.information_units == 300
 
 
 @pytest.mark.asyncio
@@ -444,3 +491,171 @@ async def test_overlong_part_is_repartitioned_and_completed() -> None:
         if event == "document.part.repartitioned"
     )
     assert repartition["reason"] == "part_over_maximum"
+
+
+@pytest.mark.asyncio
+async def test_empty_part_is_retried_before_failing_document() -> None:
+    section = build_authoring_execution_plan(
+        [_Section(min_words=40)],
+        scope=_scope(),
+        context_budget={"max_part_information_units": 80},
+    ).sections[0]
+    generated = 0
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def generate(part, _cursor, _handoff):  # type: ignore[no-untyped-def]
+        nonlocal generated
+        generated += 1
+        if generated == 1:
+            return "", False
+        return " ".join(
+            f"word-{index}" for index in range(part.max_information_units - 1)
+        ), False
+
+    async def persist(part):  # type: ignore[no-untyped-def]
+        return {"artifact_ref": f"artifact://{part.plan.part_identity}"}
+
+    async def checkpoint(_accepted, _cursor, _revision):  # type: ignore[no-untyped-def]
+        return None
+
+    async def emit(event, metadata):  # type: ignore[no-untyped-def]
+        events.append((event, dict(metadata)))
+
+    result = await execute_planned_parts(
+        section,
+        scope=_scope(),
+        evidence={},
+        generate=generate,
+        persist=persist,
+        checkpoint=checkpoint,
+        emit=emit,
+    )
+
+    assert generated == 2
+    assert len(result.parts) == 1
+    assert result.plan_revision == 2
+    retry = next(
+        metadata
+        for event, metadata in events
+        if event == "document.part.empty_output_retried"
+    )
+    assert retry["reason"] == "empty_part"
+
+
+def test_small_recovery_tail_can_repartition_below_planning_minimum() -> None:
+    section = build_authoring_execution_plan(
+        [_Section(min_words=30)],
+        scope=_scope(),
+        context_budget={"max_part_information_units": 30},
+    ).sections[0]
+
+    recovered = repartition_remaining_parts(
+        section.parts,
+        failed_index=0,
+        revision=2,
+        scope=_scope(),
+        min_part_information_units=20,
+    )
+
+    assert [part.max_information_units for part in recovered[:2]] == [19, 19]
+    assert sum(part.max_information_units for part in recovered[:2]) == (
+        section.parts[0].max_information_units
+    )
+    assert all(part.max_information_units > 0 for part in recovered)
+
+
+@pytest.mark.asyncio
+async def test_mismatched_resumed_part_is_invalidated_and_regenerated() -> None:
+    section = build_authoring_execution_plan(
+        [_Section(min_words=20)],
+        scope=_scope(),
+        context_budget={},
+    ).sections[0]
+    mismatched_plan = replace(
+        section.parts[0],
+        objective_digest="stale-objective",
+        part_identity="stale-part",
+    )
+    stale = accept_part(
+        mismatched_plan,
+        " ".join(f"stale-{index}" for index in range(20)),
+        section_title=section.title,
+        truncated=False,
+    )
+    resumed = AcceptedPartArtifact(
+        accepted=stale,
+        artifact_ref={"artifact_ref": "artifact://stale"},
+        handoff="stale",
+    )
+    events: list[str] = []
+
+    async def generate(part, _cursor, _handoff):  # type: ignore[no-untyped-def]
+        return " ".join(f"fresh-{index}" for index in range(20)), False
+
+    async def persist(part):  # type: ignore[no-untyped-def]
+        return {"artifact_ref": f"artifact://{part.plan.part_identity}"}
+
+    async def checkpoint(_accepted, _cursor, _revision):  # type: ignore[no-untyped-def]
+        return None
+
+    async def emit(event, _metadata):  # type: ignore[no-untyped-def]
+        events.append(event)
+
+    result = await execute_planned_parts(
+        section,
+        scope=_scope(),
+        evidence={},
+        generate=generate,
+        persist=persist,
+        checkpoint=checkpoint,
+        emit=emit,
+        resumed=(resumed,),
+    )
+
+    assert "document.part.resume_invalidated" in events
+    assert result.parts[0].accepted.plan.objective_digest != "stale-objective"
+
+
+@pytest.mark.asyncio
+async def test_overlong_section_accepts_last_result_without_repartition() -> None:
+    section = build_authoring_execution_plan(
+        [_Section(min_words=300)],
+        scope=_scope(),
+        context_budget={"max_part_information_units": 180},
+    ).sections[0]
+    assert len(section.parts) == 1
+    generated_maxima: list[int] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def generate(part, _cursor, _handoff):  # type: ignore[no-untyped-def]
+        generated_maxima.append(part.max_information_units)
+        units = 700 if len(generated_maxima) == 1 else part.max_information_units - 1
+        return " ".join(f"word-{index}" for index in range(units)), False
+
+    async def persist(part):  # type: ignore[no-untyped-def]
+        return {"artifact_ref": f"artifact://{part.plan.part_identity}"}
+
+    async def checkpoint(_accepted, _cursor, _revision):  # type: ignore[no-untyped-def]
+        return None
+
+    async def emit(event, metadata):  # type: ignore[no-untyped-def]
+        events.append((event, dict(metadata)))
+
+    result = await execute_planned_parts(
+        section,
+        scope=_scope(),
+        evidence={"artifact_ref": "artifact://evidence"},
+        generate=generate,
+        persist=persist,
+        checkpoint=checkpoint,
+        emit=emit,
+        min_part_information_units=20,
+        allow_over_maximum=True,
+    )
+
+    assert generated_maxima == [375]
+    assert len(result.parts) == 1
+    assert result.parts[0].accepted.information_units == 700
+    assert result.cursor.remaining_objective_digests == ()
+    assert "document.part.coalesced" not in [event for event, _ in events]
+    assert "document.part.repartitioned" not in [event for event, _ in events]

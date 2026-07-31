@@ -82,6 +82,55 @@ def append_recovery_part(
     return replace(plan, revision=revision, sections=tuple(sections))
 
 
+def replace_section_with_recovery_part(
+    plan: AuthoringExecutionPlan,
+    *,
+    section_index: int,
+    issue_code: str,
+    reason: str,
+    scope: Mapping[str, Any],
+) -> AuthoringExecutionPlan:
+    """Replace a semantically incomplete section within its original budget."""
+    section = plan.sections[section_index]
+    revision = plan.revision + 1
+    objective = (
+        f"Rewrite the complete section to resolve the remaining completeness "
+        f"issue `{issue_code}` without exceeding its existing section budget. "
+        f"Preserve correct prior material, remove repetition, and satisfy the "
+        f"full section objective `{section.objective}`. Required coverage: "
+        f"{list(section.required_points)}. Review finding: {reason}"
+    )
+    objective_digest = _digest(
+        {
+            "section_id": section.section_id,
+            "ordinal": 1,
+            "objective": objective,
+            "replacement_revision": revision,
+        }
+    )
+    evidence_digest = _digest({"pending_evidence_scope": section.section_id})
+    recovery = PlannedPart(
+        section_id=section.section_id,
+        ordinal=1,
+        total=1,
+        objective=objective,
+        objective_digest=objective_digest,
+        evidence_digest=evidence_digest,
+        part_identity=part_identity(
+            scope=scope,
+            section_id=section.section_id,
+            objective_digest=objective_digest,
+            evidence_digest=evidence_digest,
+        ),
+        target_information_units=section.target_information_units,
+        max_information_units=section.max_information_units,
+        plan_revisions=(revision,),
+    )
+    sections = list(plan.sections)
+    sections[section_index] = replace(section, parts=(recovery,))
+    return replace(plan, revision=revision, sections=tuple(sections))
+
+
 def merge_executed_section_parts(
     plan: AuthoringExecutionPlan,
     *,
@@ -106,4 +155,8 @@ def merge_executed_section_parts(
     )
 
 
-__all__ = ["append_recovery_part", "merge_executed_section_parts"]
+__all__ = [
+    "append_recovery_part",
+    "merge_executed_section_parts",
+    "replace_section_with_recovery_part",
+]

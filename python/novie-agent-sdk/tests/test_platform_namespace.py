@@ -521,6 +521,31 @@ async def test_artifacts_read_raw_text_preserves_exact_stored_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_artifacts_read_restore_text_uses_restore_mode() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode()))
+        return httpx.Response(
+            200,
+            json=_ok_envelope(
+                {
+                    "available": True,
+                    "artifact_id": "artifact-1",
+                    "mode": "restore",
+                    "metadata": {"encoding": "utf-8"},
+                    "content": "restored",
+                }
+            ),
+        )
+
+    ns = _build_with_responder(responder)
+
+    assert await ns.artifacts.read_restore_text("artifact://artifact-1") == "restored"
+    assert calls[0]["inputs"]["mode"] == "restore"
+
+
+@pytest.mark.asyncio
 async def test_artifacts_read_text_caches_exact_repeated_reads() -> None:
     call_count = 0
 

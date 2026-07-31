@@ -54,13 +54,22 @@ def repartition_remaining_parts(
     if failed_index < 0 or failed_index >= len(parts):
         raise IndexError("failed_index is outside the Planned Part sequence")
     failed = parts[failed_index]
-    if failed.max_information_units <= max(2, min_part_information_units * 2):
+    maximum = failed.max_information_units
+    if maximum <= 2:
         raise ValueError("document_part_completion_exhausted")
-    left_max = max(min_part_information_units, failed.max_information_units // 2)
-    right_max = failed.max_information_units - left_max
-    if right_max < min_part_information_units:
-        right_max = min_part_information_units
-        left_max = failed.max_information_units - right_max
+    # The configured minimum is a planning preference, not proof that a small
+    # final allowance is unsplittable. Adapt it for the bounded recovery tail
+    # so a 3..(2 * configured minimum) unit remainder can still converge
+    # without exceeding the document-wide hard maximum.
+    effective_minimum = min(
+        max(1, min_part_information_units),
+        max(1, maximum // 2),
+    )
+    left_max = max(effective_minimum, maximum // 2)
+    right_max = maximum - left_max
+    if right_max < effective_minimum:
+        right_max = effective_minimum
+        left_max = maximum - right_max
     objectives = (
         f"{failed.objective} Complete the first remaining bounded portion.",
         f"{failed.objective} Complete the second remaining bounded portion.",
@@ -109,4 +118,70 @@ def repartition_remaining_parts(
     return tuple(replace(item, total=total) for item in rebuilt)
 
 
-__all__ = ["SectionCoverageCursor", "repartition_remaining_parts"]
+def coalesce_remaining_parts(
+    parts: Sequence[PlannedPart],
+    *,
+    failed_index: int,
+    revision: int,
+    scope: Mapping[str, Any],
+) -> tuple[PlannedPart, ...]:
+    """Merge unfinished objectives when smaller parts worsen overlong output."""
+    if failed_index < 0 or failed_index >= len(parts):
+        raise IndexError("failed_index is outside the Planned Part sequence")
+    unfinished = tuple(parts[failed_index:])
+    if len(unfinished) < 2:
+        raise ValueError("document_part_coalescing_not_applicable")
+    prefix = list(parts[:failed_index])
+    failed = unfinished[0]
+    objective = (
+        "Complete all of these remaining objectives together in one concise, "
+        "bounded part. Cover each objective once and do not add background:\n- "
+        + "\n- ".join(item.objective for item in unfinished)
+    )
+    ordinal = len(prefix) + 1
+    total = ordinal
+    objective_digest = _digest(
+        {
+            "section_id": failed.section_id,
+            "ordinal": ordinal,
+            "objective": objective,
+            "coalesced_objective_digests": [
+                item.objective_digest for item in unfinished
+            ],
+        }
+    )
+    maximum = sum(item.max_information_units for item in unfinished)
+    target = max(
+        1,
+        min(
+            maximum - 1,
+            sum(item.target_information_units for item in unfinished),
+        ),
+    )
+    merged = PlannedPart(
+        section_id=failed.section_id,
+        ordinal=ordinal,
+        total=total,
+        objective=objective,
+        objective_digest=objective_digest,
+        evidence_digest=failed.evidence_digest,
+        part_identity=part_identity(
+            scope=scope,
+            section_id=failed.section_id,
+            objective_digest=objective_digest,
+            evidence_digest=failed.evidence_digest,
+        ),
+        target_information_units=target,
+        max_information_units=maximum,
+        plan_revisions=(revision,),
+    )
+    rebuilt = [replace(item, total=total) for item in prefix]
+    rebuilt.append(merged)
+    return tuple(rebuilt)
+
+
+__all__ = [
+    "SectionCoverageCursor",
+    "coalesce_remaining_parts",
+    "repartition_remaining_parts",
+]

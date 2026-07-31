@@ -12,6 +12,7 @@ from .document_authoring_plan import (
 )
 from .document_authoring_recovery import (
     SectionCoverageCursor,
+    coalesce_remaining_parts,
     repartition_remaining_parts,
 )
 from .document_part_assembly import AcceptedPart, PlannedPartRejected, accept_part
@@ -26,6 +27,7 @@ CheckpointPart = Callable[
     Awaitable[None],
 ]
 EmitPart = Callable[[str, Mapping[str, Any]], Awaitable[None]]
+PartMaximum = Callable[[PlannedPart], int]
 
 
 class PartCompletionExhausted(RuntimeError):
@@ -73,21 +75,39 @@ async def execute_planned_parts(
     persist: PersistPart,
     checkpoint: CheckpointPart,
     emit: EmitPart,
+    max_acceptable_information_units: PartMaximum | None = None,
     resumed: Sequence[AcceptedPartArtifact] = (),
     max_plan_revisions: int = 2,
     min_part_information_units: int = 20,
+    allow_over_maximum: bool = False,
 ) -> PartExecutionResult:
     """Generate, persist, then checkpoint every complete part."""
     accepted = list(resumed)
     parts = tuple(section.parts)
     revision = 1
+    resume_mismatch = False
     for resumed_part in accepted:
-        expected = parts[resumed_part.accepted.plan.ordinal - 1]
+        ordinal = resumed_part.accepted.plan.ordinal
+        if ordinal < 1 or ordinal > len(parts):
+            resume_mismatch = True
+            break
+        expected = parts[ordinal - 1]
         if (
             expected.objective_digest
             != resumed_part.accepted.plan.objective_digest
         ):
-            raise PartCompletionExhausted("document_part_resume_identity_mismatch")
+            resume_mismatch = True
+            break
+    if resume_mismatch:
+        await emit(
+            "document.part.resume_invalidated",
+            {
+                "section_id": section.section_id,
+                "reason": "document_part_resume_identity_mismatch",
+                "resumed_part_count": len(accepted),
+            },
+        )
+        accepted = []
     cursor = SectionCoverageCursor(
         section_id=section.section_id,
         accepted_part_identities=tuple(
@@ -124,13 +144,26 @@ async def execute_planned_parts(
                 markdown,
                 section_title=section.title,
                 truncated=truncated,
+                hard_max_information_units=(
+                    max_acceptable_information_units(planned)
+                    if max_acceptable_information_units is not None
+                    else None
+                ),
+                # Generation already owns the bounded three-rewrite policy.
+                # The size ceiling triggers those retries; it is not a second
+                # fail-closed admission gate after the final model result.
+                allow_over_maximum=allow_over_maximum,
             )
         except PlannedPartRejected as exc:
             rejection = str(exc)
             issue_code = next(
                 (
                     code
-                    for code in ("output_truncated", "part_over_maximum")
+                    for code in (
+                        "output_truncated",
+                        "part_over_maximum",
+                        "empty_part",
+                    )
                     if code in rejection
                 ),
                 "",
@@ -138,18 +171,35 @@ async def execute_planned_parts(
             if not issue_code:
                 raise
             if revision >= max_plan_revisions:
+                if issue_code == "empty_part":
+                    # Preserve the precise terminal reason after the bounded
+                    # retry so callers can distinguish provider-empty output
+                    # from plan-shape exhaustion.
+                    raise
                 raise PartCompletionExhausted(
                     "document_part_completion_exhausted"
                 ) from exc
             revision += 1
             try:
-                parts = repartition_remaining_parts(
-                    parts,
-                    failed_index=index,
-                    revision=revision,
-                    scope=scope,
-                    min_part_information_units=min_part_information_units,
-                )
+                if issue_code == "empty_part":
+                    recovery_event = "document.part.empty_output_retried"
+                elif issue_code == "part_over_maximum" and len(parts) - index > 1:
+                    parts = coalesce_remaining_parts(
+                        parts,
+                        failed_index=index,
+                        revision=revision,
+                        scope=scope,
+                    )
+                    recovery_event = "document.part.coalesced"
+                else:
+                    parts = repartition_remaining_parts(
+                        parts,
+                        failed_index=index,
+                        revision=revision,
+                        scope=scope,
+                        min_part_information_units=min_part_information_units,
+                    )
+                    recovery_event = "document.part.repartitioned"
             except ValueError as split_error:
                 raise PartCompletionExhausted(
                     "document_part_completion_exhausted"
@@ -163,7 +213,7 @@ async def execute_planned_parts(
                 plan_revision=revision,
             )
             await emit(
-                "document.part.repartitioned",
+                recovery_event,
                 {
                     "section_id": section.section_id,
                     "failed_part_identity": planned.part_identity,

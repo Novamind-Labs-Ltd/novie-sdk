@@ -1,7 +1,6 @@
 """Deterministic ADR-115 Planned Part acceptance and section assembly."""
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from typing import Sequence
@@ -31,7 +30,10 @@ def information_units(markdown: str) -> int:
         str(markdown or ""),
         flags=re.IGNORECASE,
     )
-    return len(re.findall(r"\b[\w'-]+\b", text, flags=re.UNICODE))
+    text = re.sub(r"```.*?```|`[^`]*`|<[^>]+>", "", text, flags=re.DOTALL)
+    cjk = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text)
+    latin = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:['’-][A-Za-z0-9]+)*", text)
+    return len(cjk) + len(latin)
 
 
 def normalize_part_markdown(markdown: str, *, section_title: str) -> str:
@@ -69,6 +71,8 @@ def accept_part(
     *,
     section_title: str,
     truncated: bool,
+    hard_max_information_units: int | None = None,
+    allow_over_maximum: bool = False,
 ) -> AcceptedPart:
     if truncated:
         raise PlannedPartRejected("document_planned_part_rejected: output_truncated")
@@ -76,17 +80,12 @@ def accept_part(
     units = information_units(normalized)
     if not normalized or units <= 0:
         raise PlannedPartRejected("document_planned_part_rejected: empty_part")
-    # ``max_information_units`` is the prompt/planning bound, not the provider
-    # token stop.  Natural-language models often need extra prose to close a
-    # paragraph, citation, list, or table.  Keep that completion headroom
-    # bounded by an independent hard ceiling; materially runaway output still
-    # enters repartition recovery, and the document-level output budget remains
-    # the aggregate safety limit.
-    hard_maximum = max(
-        plan.max_information_units + 8,
-        math.ceil(plan.max_information_units * 12),
-    )
-    if units > hard_maximum:
+    hard_maximum = plan.max_information_units
+    if hard_max_information_units is not None:
+        # A caller-provided document/section allowance is a true aggregate
+        # boundary, not another soft part-size hint.
+        hard_maximum = max(1, int(hard_max_information_units))
+    if units > hard_maximum and not allow_over_maximum:
         raise PlannedPartRejected("document_planned_part_rejected: part_over_maximum")
     return AcceptedPart(plan=plan, markdown=normalized, information_units=units)
 

@@ -39,6 +39,11 @@ def authoring_execution_plan_from_mapping(
                     raw_section.get("max_information_units") or 0
                 ),
                 parts=parts,
+                required_points=tuple(
+                    str(item)
+                    for item in raw_section.get("required_points") or ()
+                    if str(item)
+                ),
             )
         )
     return AuthoringExecutionPlan(
