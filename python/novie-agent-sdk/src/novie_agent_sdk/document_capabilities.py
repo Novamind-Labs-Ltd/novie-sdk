@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from novie_protocol.contracts.capability import CapabilityInputContract
+
 from .skill_contracts import SkillContractResolver, SkillRuntimeContract
 
 
@@ -28,12 +30,62 @@ class DocumentCapabilitySpec:
     consumes: tuple[str, ...] = ("task_brief",)
     consumes_strict: tuple[str, ...] = ()
     optional_consumes: tuple[str, ...] = ()
+    input_contracts: tuple[CapabilityInputContract, ...] = ()
     provides: tuple[str, ...] = ()
     artifact_access: str = "summary_then_fetch"
     synthesis_path: bool = False
     research_track: str | None = None
     side_effect_policy: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Make explicit contracts the runtime source of truth.
+
+        Older Agent packages still pass the three legacy fields. They remain
+        readable during migration, while new packages can provide one typed
+        contract and have the legacy projections derived deterministically.
+        """
+        if not self.input_contracts:
+            return
+        contracts = tuple(
+            item
+            if isinstance(item, CapabilityInputContract)
+            else CapabilityInputContract.from_dict(item)
+            for item in self.input_contracts
+        )
+        artifacts = tuple(dict.fromkeys(item.artifact for item in contracts))
+        if len(artifacts) != len(contracts):
+            raise ValueError(
+                f"duplicate input contract for {self.capability_id!r}"
+            )
+        required = tuple(
+            item.artifact
+            for item in contracts
+            if item.required
+        )
+        optional = tuple(
+            item.artifact
+            for item in contracts
+            if not item.required
+        )
+        overlap = set(required).intersection(optional)
+        if overlap:
+            raise ValueError(
+                "input contract cannot be both required and optional: "
+                + ", ".join(sorted(overlap))
+            )
+        object.__setattr__(self, "input_contracts", contracts)
+        object.__setattr__(self, "consumes", artifacts)
+        object.__setattr__(
+            self,
+            "consumes_strict",
+            tuple(
+                item.artifact
+                for item in contracts
+                if item.required and item.source == "upstream_capability"
+            ),
+        )
+        object.__setattr__(self, "optional_consumes", optional)
 
 
 @dataclass(frozen=True)
@@ -171,6 +223,7 @@ def resolve_document_agent_input(
 
 
 __all__ = [
+    "CapabilityInputContract",
     "DocumentAgentInput",
     "DocumentCapabilitySpec",
     "DocumentRuntimeProfile",

@@ -335,6 +335,7 @@ from .context_budget import (
     wall_clock_deadline,
 )
 from .document_capabilities import (
+    CapabilityInputContract,
     DocumentAgentInput,
     DocumentCapabilitySpec,
     DocumentRuntimeProfile,
@@ -635,6 +636,7 @@ __all__ = [
     "wall_clock_deadline",
     "DocumentAgentInput",
     "DocumentCapabilitySpec",
+    "CapabilityInputContract",
     "DocumentRuntimeProfile",
     "resolve_document_agent_input",
     "resolve_document_runtime_profile",

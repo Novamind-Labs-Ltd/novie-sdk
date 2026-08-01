@@ -145,6 +145,8 @@ Purpose:
 - Shared runtime-facing capability contract for document agents.
 - Carries `capability_id`, `skill_sources`, `mode`, `phase`, `artifact_type`,
   `artifact_family`, `consumes`, `consumes_strict`, `optional_consumes`,
+  `input_contracts` (typed artifact/source/required declarations; when present
+  it is the canonical source and the legacy consume projections are derived),
   `provides`, `artifact_access`, `synthesis_path`, and side-effect metadata.
 - Agent packages still own their concrete registry values.
 
