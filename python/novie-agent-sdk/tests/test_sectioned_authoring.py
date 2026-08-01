@@ -2668,21 +2668,107 @@ async def test_fixed_shape_outline_uses_canonical_section_titles_without_llm() -
     assert any(event["event"] == "document.outline.fixed_shape" for event in phase_events)
 
 
-def test_outline_budget_is_bounded_for_long_skill_profiles() -> None:
+def test_outline_budget_scales_with_contract_complexity_and_attempt() -> None:
     contract = SectionedAuthoringContract(
         length_profile="long",
         min_outline_sections=8,
         max_outline_sections=16,
     )
+    criteria = tuple(f"Requirement {index} with detailed evidence" for index in range(10))
 
-    assert _outline_output_token_budget(
-        contract,
-        retry=False,
-    ) == 3680
-    assert _outline_output_token_budget(
-        contract,
-        retry=True,
-    ) == 4320
+    simple = _outline_output_token_budget(contract)
+    complex_initial = _outline_output_token_budget(
+        contract, acceptance_criteria=criteria,
+        brief={"scope": list(criteria)},
+    )
+    complex_retry = _outline_output_token_budget(
+        contract, acceptance_criteria=criteria,
+        brief={"scope": list(criteria)}, attempt=1,
+    )
+
+    assert 2400 <= simple < complex_initial < complex_retry <= 12000
+
+
+@pytest.mark.asyncio
+async def test_outline_empty_stream_retries_then_preserves_acceptance_criteria() -> None:
+    class _EmptyOutlineLlm:
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def structured(self, **kwargs: Any) -> dict[str, Any]:
+            self.budgets.append(kwargs["max_output_tokens"])
+            raise PlatformLlmCallError(
+                capability_id="platform.llm.structured",
+                kind="platform_unavailable",
+                error_code="platform_llm_structured_empty_stream",
+                detail="structured LLM stream produced no output",
+                error_envelope={
+                    "reason_code": "platform_llm_structured_empty_stream",
+                },
+                retryable=True,
+            )
+
+    llm = _EmptyOutlineLlm()
+    events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=llm, platform=_FakePlatform(),
+        artifact_type="example_document", step_id="s1",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "min_outline_sections": 2, "max_outline_sections": 3,
+        },
+        phase_event_sink=events.append,
+    )
+
+    _profile, outline = await author._build_outline(
+        brief={
+            "title": "Customer report",
+            "task_brief_details": {
+                "acceptance_criteria": ["Cover segments", "Recommend actions"],
+            },
+        },
+        upstream={},
+    )
+
+    assert len(llm.budgets) == 3
+    assert llm.budgets == sorted(llm.budgets)
+    assert _outline_covers_acceptance_criteria(outline, criterion_count=2)
+    assert any(event["event"] == "document.outline.degraded" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_outline_retry_merges_partial_sections() -> None:
+    class _PartialOutlineLlm:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def structured(self, **_kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            index = self.calls
+            return {"structured": {"length_profile": "short", "sections": [{
+                "section_id": f"part-{index}", "title": f"Part {index}",
+                "objective": f"AC-{index} requirement",
+                "required_points": [f"AC-{index}: covered"],
+                "evidence_query": f"part {index}", "min_words": 90,
+            }]}}
+
+    llm = _PartialOutlineLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm, platform=_FakePlatform(),
+        artifact_type="example_document", step_id="s1",
+        capability_id="agent.example.write_document",
+        authoring_contract={
+            "min_outline_sections": 2, "max_outline_sections": 3,
+        },
+    )
+
+    _profile, outline = await author._build_outline(
+        brief={"task_brief_details": {"acceptance_criteria": ["One", "Two"]}},
+        upstream={},
+    )
+
+    assert llm.calls == 2
+    assert [plan.section_id for plan in outline] == ["part-1", "part-2"]
 
 
 @pytest.mark.asyncio

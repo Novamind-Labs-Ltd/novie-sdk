@@ -57,6 +57,13 @@ from .document_section_parts import (
     author_planned_section,
     resumed_parts_from_checkpoint,
 )
+from .document_outline_recovery import (
+    is_recoverable_outline_error as _is_recoverable_outline_error,
+    merge_outline_plans as _merge_outline_plans,
+    outline_output_token_budget as _outline_output_token_budget,
+    outline_retry_context as _outline_retry_context,
+    repair_outline_deterministically as _repair_outline_deterministically,
+)
 from .skill_contracts import SkillRuntimeContract
 
 _SECTIONED_AUTHORING_ENV = "NOVIE_SECTIONED_AUTHORING_V2"
@@ -2359,137 +2366,85 @@ class SectionedLongformAuthor:
             f"Original task:\n{_json_block(brief, limit=8000)}\n\n"
             f"Available upstream/workpad refs:\n{_json_block(upstream, limit=12000)}"
         )
-        call_id = self._next_llm_call_id("build_outline")
-        await self._emit(
-            "agent.llm_call.started",
-            call_id=call_id,
-            llm_purpose="build_outline",
-            status="running",
-            max_outline_sections=self._contract.max_outline_sections,
-            length_profile=self._contract.length_profile,
-        )
-        try:
-            result = await self._llm.structured(
-                messages=[{"role": "user", "content": prompt}],
-                output_schema=_outline_schema(self._contract),
-                temperature=0.2,
-                max_output_tokens=_outline_output_token_budget(
-                    self._contract,
-                    retry=False,
-                ),
-            )
-        except Exception as exc:
-            await self._emit(
-                "agent.llm_call.failed",
-                call_id=call_id,
-                llm_purpose="build_outline",
-                status="failed",
-                error=type(exc).__name__,
-                message=str(exc),
-            )
-            raise
-        structured = result.get("structured") if isinstance(result, Mapping) else None
         length_profile = self._contract.length_profile
-        plans = _section_plans_from_outline_payload(
-            structured,
-            contract=self._contract,
-        )
-        await self._emit(
-            "agent.llm_call.completed",
-            call_id=call_id,
-            llm_purpose="build_outline",
-            status="complete",
-            section_count=len(plans),
-        )
-        if (
-            len(plans) >= self._contract.min_outline_sections
-            and _outline_covers_acceptance_criteria(
-                plans,
-                criterion_count=len(acceptance_criteria),
+        accepted: list[SectionPlan] = []
+        for attempt in range(3):
+            purpose = "build_outline" if attempt == 0 else "build_outline_retry"
+            if attempt:
+                await self._emit(
+                    "document.outline.retry_requested", status="running",
+                    reason="structured_outline_incomplete",
+                    section_count=len(accepted),
+                    required_section_count=self._contract.min_outline_sections,
+                    retry_attempt=attempt, max_retry_attempts=2,
+                )
+            call_id = self._next_llm_call_id(purpose)
+            token_budget = _outline_output_token_budget(
+                self._contract, acceptance_criteria=acceptance_criteria,
+                brief=brief, attempt=attempt,
             )
-        ):
-            return (
-                length_profile or "medium",
-                tuple(plans[: self._contract.max_outline_sections]),
-            )
-        retry_plans: list[SectionPlan] = []
-        for retry_attempt in range(1, 3):
-            await self._emit(
-                "document.outline.retry_requested",
-                status="running",
-                reason="structured_outline_incomplete",
-                section_count=len(plans if retry_attempt == 1 else retry_plans),
-                required_section_count=self._contract.min_outline_sections,
-                retry_attempt=retry_attempt,
-                max_retry_attempts=2,
-            )
-            retry_call_id = self._next_llm_call_id("build_outline_retry")
             await self._emit(
                 "agent.llm_call.started",
-                call_id=retry_call_id,
-                llm_purpose="build_outline_retry",
+                call_id=call_id, llm_purpose=purpose,
                 status="running",
                 max_outline_sections=self._contract.max_outline_sections,
                 length_profile=self._contract.length_profile,
-                retry_attempt=retry_attempt,
+                retry_attempt=attempt, max_output_tokens=token_budget,
             )
-            retry_result = await self._llm.structured(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{prompt}\n\n"
-                            "The previous response did not contain enough valid "
-                            "sections or did not map every AC-N acceptance criterion. "
-                            "Return a complete outline now. Preserve every "
-                            "explicit deliverable dimension and acceptance "
-                            "requirement from the Original task as an exact section "
-                            "or atomic required point. Do not substitute generic "
-                            "Overview, Details, Next Steps, or numbered placeholder "
-                            f"sections. Bounded retry {retry_attempt} of 2."
-                        ),
-                    }
-                ],
-                output_schema=_outline_schema(self._contract),
-                temperature=0,
-                max_output_tokens=_outline_output_token_budget(
-                    self._contract,
-                    retry=True,
-                ),
-                method="json_schema",
-                strict=True,
+            retry_context = _outline_retry_context(
+                accepted, acceptance_criteria,
+                json_block=_json_block,
             )
-            retry_structured = (
-                retry_result.get("structured")
-                if isinstance(retry_result, Mapping)
-                else None
+            try:
+                result = await self._llm.structured(
+                    messages=[{"role": "user", "content": prompt + retry_context}],
+                    output_schema=_outline_schema(self._contract),
+                    temperature=0.2 if attempt == 0 else 0,
+                    max_output_tokens=token_budget,
+                    **({"method": "json_schema", "strict": True} if attempt else {}),
+                )
+            except Exception as exc:
+                await self._emit(
+                    "agent.llm_call.failed", call_id=call_id,
+                    llm_purpose=purpose, status="failed",
+                    error=type(exc).__name__, message=str(exc),
+                    retry_attempt=attempt, max_output_tokens=token_budget,
+                )
+                if not _is_recoverable_outline_error(exc):
+                    raise
+                continue
+            structured = result.get("structured") if isinstance(result, Mapping) else None
+            candidate = _section_plans_from_outline_payload(
+                structured, contract=self._contract,
             )
-            retry_plans = _section_plans_from_outline_payload(
-                retry_structured,
-                contract=self._contract,
+            accepted = _merge_outline_plans(
+                accepted, candidate, maximum=self._contract.max_outline_sections,
             )
             await self._emit(
                 "agent.llm_call.completed",
-                call_id=retry_call_id,
-                llm_purpose="build_outline_retry",
+                call_id=call_id, llm_purpose=purpose,
                 status="complete",
-                section_count=len(retry_plans),
-                retry_attempt=retry_attempt,
+                section_count=len(accepted), retry_attempt=attempt,
+                max_output_tokens=token_budget,
             )
             if (
-                len(retry_plans) >= self._contract.min_outline_sections
+                len(accepted) >= self._contract.min_outline_sections
                 and _outline_covers_acceptance_criteria(
-                    retry_plans,
-                    criterion_count=len(acceptance_criteria),
+                    accepted, criterion_count=len(acceptance_criteria),
                 )
             ):
-                return (
-                    length_profile or "medium",
-                    tuple(retry_plans[: self._contract.max_outline_sections]),
-                )
-        raise RuntimeError(
-            "document_outline_invalid:explicit_scope_not_preserved"
+                return length_profile or "medium", tuple(accepted)
+        recovered = _repair_outline_deterministically(
+            accepted, acceptance_criteria=acceptance_criteria,
+            contract=self._contract, brief=brief,
+            plan_factory=SectionPlan, slugger=_slug,
         )
+        await self._emit(
+            "document.outline.degraded", status="complete",
+            reason="structured_outline_recovered_deterministically",
+            section_count=len(recovered), retry_attempts=2,
+        )
+        return length_profile or "medium", recovered
 
     async def _refresh_authoring_summary(
         self,
@@ -4257,20 +4212,6 @@ def _section_plans_from_outline_payload(
             )
         )
     return plans
-
-
-def _outline_output_token_budget(
-    contract: SectionedAuthoringContract,
-    *,
-    retry: bool,
-) -> int:
-    # Outlines are bounded by the contract's section count, not by the final
-    # document length. Keep the structured response comfortably large enough
-    # for atomic requirements, but do not let a long document request turn the
-    # outline itself into a long-form generation that exceeds the platform's
-    # structured-output deadline.
-    per_section = 220 if retry else 180
-    return min(4800, max(2400, 800 + contract.max_outline_sections * per_section))
 
 
 def _outline_schema(contract: SectionedAuthoringContract) -> dict[str, Any]:
