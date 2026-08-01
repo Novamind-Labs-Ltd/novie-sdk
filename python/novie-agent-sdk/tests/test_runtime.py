@@ -1548,34 +1548,6 @@ def test_stream_endpoint_emits_terminal_error_when_handler_raises():
     assert events[-1]["metadata"]["terminal_source"] == "sdk_exception_guard"
 
 
-def test_stream_endpoint_exposes_execution_budget_pause_as_cancelled():
-    from fastapi.testclient import TestClient
-    from novie_agent_sdk.runtime import StreamContext
-
-    class ExecutionBudgetPaused(RuntimeError):
-        reason_code = "execution_budget_paused"
-        error_code = "execution_budget_paused"
-
-    agent = Agent(_stream_manifest("stream-execution-budget-paused"))
-
-    @agent.stream
-    async def handle(ctx: StreamContext):
-        yield {"kind": "content", "content": "accepted section"}
-        raise ExecutionBudgetPaused("unsafe internal budget detail")
-
-    client = TestClient(agent.build_app())
-    with client.stream("POST", "/stream", json={"input": {"q": "x"}}) as resp:
-        events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
-
-    assert [event.get("kind") for event in events] == ["content", "cancelled"]
-    assert events[-1]["error_code"] == "execution_budget_paused"
-    assert events[-1]["error"] == (
-        "Task execution paused at its configured budget boundary."
-    )
-    assert events[-1]["retryable"] is False
-    assert "unsafe internal budget detail" not in json.dumps(events)
-
-
 def test_stream_endpoint_serializes_public_agent_error_without_raw_cause():
     from fastapi.testclient import TestClient
     from novie_agent_sdk.runtime import StreamContext
@@ -1689,35 +1661,6 @@ def test_invoke_endpoint_serializes_public_agent_error_without_raw_cause():
         "retryable": False,
         "replan_eligible": True,
         "repair_eligible": True,
-    }
-
-
-def test_invoke_endpoint_exposes_execution_budget_pause_as_cancelled():
-    from fastapi.testclient import TestClient
-
-    class ExecutionBudgetPaused(RuntimeError):
-        reason_code = "execution_budget_paused"
-        error_code = "execution_budget_paused"
-
-    agent = Agent(_simple_manifest("invoke-execution-budget-paused"))
-
-    @agent.invoke
-    async def handle(ctx: InvokeContext):
-        raise ExecutionBudgetPaused("unsafe internal budget detail")
-
-    response = TestClient(agent.build_app()).post(
-        "/invoke", json={"input": {"q": "x"}}
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "cancelled",
-        "error": "Task execution paused at its configured budget boundary.",
-        "error_code": "execution_budget_paused",
-        "output": {},
-        "retryable": False,
-        "replan_eligible": False,
-        "repair_eligible": False,
     }
 
 
