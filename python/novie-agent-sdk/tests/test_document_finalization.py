@@ -132,6 +132,43 @@ def test_document_event_transports_manifest_instead_of_large_body() -> None:
     assert len(str(event.output)) < 10000
 
 
+def test_finish_current_builds_distinct_user_authorized_partial() -> None:
+    ledger = _ledger()
+    ledger["artifact_refs"] = ledger["artifact_refs"][:1]
+    ledger["execution_control_action"] = "finish_current"
+    event = build_document_deliverable_event(
+        card=None,
+        structured={"summary": "Current draft"},
+        document_title="Example report",
+        artifact_type="example_document",
+        artifact_family="document",
+        capability_id="agent.example.write",
+        analysis="# Report",
+        narrative="# Report",
+        final_payload_type=_FinalPayload,
+        recovery_type=_Recovery,
+        quality={
+            "quality_status": "degraded",
+            "quality_checks_passed": False,
+            "quality_final_review_passed": True,
+            "quality_publication_eligible": False,
+        },
+        authoring_ledger=ledger,
+    )
+
+    assert event.output["kind"] == "partial_document_deliverable"
+    assert event.output["artifact_type"] == "example_document.partial"
+    assert event.output["source_artifact_type"] == "example_document"
+    assert event.output["publication_state"] == "published_partial"
+    assert event.output["quality_publication_eligible"] is False
+    assert set(event.output["provides_artifacts"]) == {
+        "example_document.partial"
+    }
+    assert event.output["finalization_manifest"]["publication_state"] == (
+        "published_partial"
+    )
+
+
 def test_checkpoint_rebuilds_manifest_ready_authoring_ledger() -> None:
     checkpoint = {
         "outline_ref": _ledger()["outline_ref"],

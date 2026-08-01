@@ -77,6 +77,10 @@ def build_document_finalization_manifest(
         )
 
     degraded = list(authoring_ledger.get("degraded_sections") or [])
+    execution_control_action = str(
+        authoring_ledger.get("execution_control_action") or ""
+    ).strip()
+    published_partial = execution_control_action == "finish_current"
     return {
         "kind": DOCUMENT_FINALIZATION_KIND,
         "version": DOCUMENT_FINALIZATION_VERSION,
@@ -94,6 +98,15 @@ def build_document_finalization_manifest(
             "status": "degraded" if degraded else "passed",
             "degraded_sections": degraded,
         },
+        **(
+            {
+                "publication_state": "published_partial",
+                "execution_control_action": execution_control_action,
+                "incomplete": True,
+            }
+            if published_partial
+            else {"publication_state": "published_final"}
+        ),
     }
 
 
@@ -145,8 +158,12 @@ def authoring_ledger_from_checkpoint(
         "outline_ref": _mapping(checkpoint.get("outline_ref")),
         "artifact_refs": refs,
         "section_count": len(refs),
+        "completed_section_count": len(refs),
         "degraded": bool(checkpoint.get("degraded_sections")),
         "degraded_sections": list(checkpoint.get("degraded_sections") or []),
+        "execution_control_action": str(
+            checkpoint.get("execution_control_action") or ""
+        ),
     }
 
 

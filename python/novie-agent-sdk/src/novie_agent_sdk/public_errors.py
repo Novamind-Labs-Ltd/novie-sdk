@@ -35,6 +35,7 @@ class PublicAgentError(RuntimeError):
 
 _SAFE_ENVELOPE_MESSAGES = {
     "agent_internal_error": "Agent execution failed.",
+    "execution_budget_paused": "Task execution paused at its configured budget boundary.",
     "sectioned_authoring_llm_failed": "Document finalization failed.",
     "sectioned_authoring_finalize_timeout": "Document finalization timed out.",
     "stream_heartbeat_timeout": "Platform LLM stream became unresponsive.",
@@ -44,6 +45,16 @@ _SAFE_ENVELOPE_MESSAGES = {
 def public_error_fields(error: BaseException) -> PublicErrorFields:
     if isinstance(error, PublicAgentError):
         return PublicErrorFields(error.error_code, error.public_message)
+    reason_code = str(
+        getattr(error, "reason_code", "")
+        or getattr(error, "error_code", "")
+        or ""
+    ).strip()
+    if reason_code == "execution_budget_paused":
+        return PublicErrorFields(
+            reason_code,
+            _SAFE_ENVELOPE_MESSAGES[reason_code],
+        )
     return PublicErrorFields("agent_internal_error", "Agent execution failed.")
 
 

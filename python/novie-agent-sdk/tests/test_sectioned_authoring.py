@@ -1802,6 +1802,129 @@ async def test_legacy_resumed_draft_is_revalidated_for_completeness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finish_current_assembles_only_accepted_checkpoint_sections() -> None:
+    events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        defer_final_artifact=True,
+        phase_event_sink=events.append,
+    )
+    outline = [
+        {
+            "section_id": "context",
+            "title": "Context",
+            "objective": "Explain the context.",
+            "min_words": 3,
+        },
+        {
+            "section_id": "recommendation",
+            "title": "Recommendation",
+            "objective": "Give the recommendation.",
+            "min_words": 3,
+        },
+    ]
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        resume_state={
+            "outline": outline,
+            "drafts": [
+                {
+                    "plan": outline[0],
+                    "markdown": "## Context\n\nalpha beta gamma",
+                    "quality": {},
+                }
+            ],
+            "execution_control_action": "finish_current",
+        },
+    )
+
+    assert len(result.drafts) == 1
+    assert "## Context" in result.markdown
+    assert "## Recommendation" not in result.markdown
+    assert result.ledger["execution_control_action"] == "finish_current"
+    assert result.ledger["degraded"] is True
+    assert any(
+        item["failures"] == ["execution_budget_finish_current"]
+        for item in result.ledger["degraded_sections"]
+    )
+    assert any(
+        event["event"] == "document.execution_control.finish_current_applied"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_shorten_writes_one_remaining_section_and_omits_the_rest() -> None:
+    events: list[dict[str, Any]] = []
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        defer_final_artifact=True,
+        phase_event_sink=events.append,
+        authoring_contract={
+            "require_evidence_refs": False,
+            "min_section_words": 3,
+            "default_section_words": 3,
+            "max_section_words": 20,
+        },
+    )
+    outline = [
+        {
+            "section_id": section_id,
+            "title": title,
+            "objective": f"Write {title}.",
+            "min_words": 3,
+        }
+        for section_id, title in (
+            ("context", "Context"),
+            ("recommendation", "Recommendation"),
+            ("next_steps", "Next Steps"),
+        )
+    ]
+
+    result = await author.author(
+        brief={"title": "Example document"},
+        upstream={},
+        resume_state={
+            "outline": outline,
+            "drafts": [
+                {
+                    "plan": outline[0],
+                    "markdown": "## Context\n\nalpha beta gamma",
+                    "quality": {},
+                }
+            ],
+            "execution_control_action": "shorten",
+        },
+    )
+
+    assert [draft.plan.section_id for draft in result.drafts] == [
+        "context",
+        "recommendation",
+    ]
+    assert "## Next Steps" not in result.markdown
+    assert any(
+        item["section_id"] == "next_steps"
+        and item["failures"] == ["execution_budget_shortened"]
+        for item in result.ledger["degraded_sections"]
+    )
+    assert any(
+        event["event"] == "document.execution_control.shorten_applied"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_deferred_final_rejects_glued_heading_in_accepted_section() -> None:
     author = SectionedLongformAuthor(
         llm_facade=_FakeLlm(),

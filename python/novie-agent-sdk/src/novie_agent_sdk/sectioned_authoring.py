@@ -1418,7 +1418,64 @@ class SectionedLongformAuthor:
             estimated_authoring_seconds=execution_plan.estimated_authoring_seconds,
             deadline_feasible=execution_plan.deadline_feasible,
         )
-        for index, plan in enumerate(outline[len(drafts) :], start=len(drafts) + 1):
+        execution_control = _mapping(state.get("execution_control"))
+        execution_control_action = str(
+            state.get("execution_control_action")
+            or execution_control.get("action")
+            or ""
+        ).strip()
+        remaining_outline = outline[len(drafts) :]
+        if execution_control_action == "finish_current":
+            if not drafts:
+                raise RuntimeError(
+                    "document_finish_current_unavailable:no_accepted_sections"
+                )
+            remaining_outline = []
+            existing_degraded_ids = {
+                str(item.get("section_id") or "")
+                for item in degraded_sections
+                if isinstance(item, Mapping)
+            }
+            for unfinished in outline[len(drafts) :]:
+                if unfinished.section_id not in existing_degraded_ids:
+                    degraded_sections.append(
+                        {
+                            "section_id": unfinished.section_id,
+                            "section_title": unfinished.title,
+                            "failures": ["execution_budget_finish_current"],
+                        }
+                    )
+            await self._emit(
+                "document.execution_control.finish_current_applied",
+                status="degraded",
+                accepted_section_count=len(drafts),
+                omitted_section_count=len(outline) - len(drafts),
+            )
+        elif execution_control_action == "shorten" and len(remaining_outline) > 1:
+            omitted_outline = remaining_outline[1:]
+            remaining_outline = remaining_outline[:1]
+            existing_degraded_ids = {
+                str(item.get("section_id") or "")
+                for item in degraded_sections
+                if isinstance(item, Mapping)
+            }
+            for unfinished in omitted_outline:
+                if unfinished.section_id not in existing_degraded_ids:
+                    degraded_sections.append(
+                        {
+                            "section_id": unfinished.section_id,
+                            "section_title": unfinished.title,
+                            "failures": ["execution_budget_shortened"],
+                        }
+                    )
+            await self._emit(
+                "document.execution_control.shorten_applied",
+                status="degraded",
+                accepted_section_count=len(drafts),
+                retained_section_count=1,
+                omitted_section_count=len(omitted_outline),
+            )
+        for index, plan in enumerate(remaining_outline, start=len(drafts) + 1):
             execution_section = execution_plan.sections[index - 1]
             self._document_information_budget.reserved_future_units = (
                 sum(max(1, item.min_words) for item in outline[index:])
@@ -1497,6 +1554,7 @@ class SectionedLongformAuthor:
                 "drafts": [_draft_resume_record(draft) for draft in drafts],
                 "degraded_sections": degraded_sections,
                 "authoring_context_summary": authoring_summary,
+                "execution_control_action": execution_control_action,
                 **self._authoring_call_budget.metadata(),
             }
             resumed_parts = await resumed_parts_from_checkpoint(
@@ -1773,6 +1831,7 @@ class SectionedLongformAuthor:
                 authoring_context_summary=authoring_summary,
                 current_section_id="",
                 accepted_parts=[],
+                execution_control_action=execution_control_action,
                 **self._authoring_call_budget.metadata(),
             )
 
@@ -1783,7 +1842,11 @@ class SectionedLongformAuthor:
             length_profile=self._contract.length_profile,
             finalization=self._contract.finalization,
         )
-        final_markdown = await self._polish_final(brief=brief, drafts=drafts)
+        final_markdown = (
+            _join_markdown([draft.markdown for draft in drafts])
+            if execution_control_action == "finish_current"
+            else await self._polish_final(brief=brief, drafts=drafts)
+        )
         # Fail-closed document agents publish the final deliverable through
         # the platform's completed-output materializer. Keeping the SDK-side
         # artifact in memory until that boundary avoids a durable final
@@ -1808,6 +1871,7 @@ class SectionedLongformAuthor:
             final_ref=final_ref,
             narrative=final_markdown,
             degraded_sections=degraded_sections,
+            execution_control_action=execution_control_action,
         )
         await self._emit(
             "document.final.created",
@@ -1853,6 +1917,8 @@ class SectionedLongformAuthor:
                 "artifact_refs": artifact_refs,
                 "degraded": bool(degraded_sections),
                 "degraded_sections": degraded_sections,
+                "execution_control_action": execution_control_action,
+                "completed_section_count": len(drafts),
             },
         )
 
