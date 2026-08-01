@@ -15,6 +15,7 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from novie_agent_sdk import (
+    CapabilityInputContract,
     DocumentAgentTemplate,
     DocumentCapabilitySpec,
     build_document_deliverable_event,
@@ -24,6 +25,28 @@ from novie_agent_sdk import (
     resolve_document_agent_input,
     resolve_document_runtime_profile,
 )
+
+
+def test_explicit_input_contracts_are_runtime_source_of_truth(tmp_path: Path) -> None:
+    spec = DocumentCapabilitySpec(
+        capability_id="agent.architect.create_architecture",
+        skill_sources=[],
+        mode="create_architecture",
+        phase="default",
+        artifact_type="architecture_document",
+        artifact_family="architecture_bundle",
+        package_root=tmp_path,
+        consumes=("requirements_analysis",),
+        consumes_strict=("requirements_analysis",),
+        input_contracts=(
+            CapabilityInputContract("task_brief", "user_input"),
+            CapabilityInputContract("requirements_analysis", required=False),
+        ),
+    )
+
+    assert spec.consumes == ("task_brief", "requirements_analysis")
+    assert spec.consumes_strict == ()
+    assert spec.optional_consumes == ("requirements_analysis",)
 
 
 class _FakeGraph:
