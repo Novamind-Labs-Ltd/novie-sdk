@@ -2651,6 +2651,9 @@ class Agent:
                         result = await self._invoke_handler(ctx)
                     except Exception as exc:
                         public_error = public_error_fields(exc)
+                        execution_paused = (
+                            public_error.error_code == "execution_budget_paused"
+                        )
                         if started_invocation and hdrs.idempotency_key:
                             await self._invocation_store.fail(
                                 hdrs.idempotency_key,
@@ -2667,6 +2670,16 @@ class Agent:
                                 "retryable": exc.retryable,
                                 "replan_eligible": exc.replan_eligible,
                                 "repair_eligible": exc.repair_eligible,
+                            }
+                        if execution_paused:
+                            return {
+                                "status": "cancelled",
+                                "error": public_error.public_message,
+                                "error_code": public_error.error_code,
+                                "output": {},
+                                "retryable": False,
+                                "replan_eligible": False,
+                                "repair_eligible": False,
                             }
                         raise
                     response = _coerce_invoke_response(result)
@@ -2867,8 +2880,16 @@ class Agent:
                                 terminal_error_emitted = True
                                 _log_terminal_guard("sdk_exception_guard", payload)
                                 public_error = public_error_fields(payload)
+                                execution_paused = (
+                                    public_error.error_code
+                                    == "execution_budget_paused"
+                                )
                                 error_event = {
-                                    "kind": "terminal_error",
+                                    "kind": (
+                                        "cancelled"
+                                        if execution_paused
+                                        else "terminal_error"
+                                    ),
                                     "error": public_error.public_message,
                                     "error_code": public_error.error_code,
                                     "output": {},
@@ -2882,6 +2903,12 @@ class Agent:
                                         retryable=payload.retryable,
                                         replan_eligible=payload.replan_eligible,
                                         repair_eligible=payload.repair_eligible,
+                                    )
+                                elif execution_paused:
+                                    error_event.update(
+                                        retryable=False,
+                                        replan_eligible=False,
+                                        repair_eligible=False,
                                     )
                                 emitted_events.append(error_event)
                                 if started_invocation and hdrs.idempotency_key:

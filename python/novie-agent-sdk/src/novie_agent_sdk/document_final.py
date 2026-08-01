@@ -235,7 +235,15 @@ def build_document_deliverable_event(
     helper owns the repeated envelope: recovery, final_payload,
     provides_artifacts, metadata, and the final ``AgentStreamEvent``.
     """
-    _require_publishable_document_quality(quality)
+    execution_control_action = str(
+        (authoring_ledger or {}).get("execution_control_action") or ""
+    ).strip()
+    published_partial = execution_control_action == "finish_current"
+    if not published_partial:
+        _require_publishable_document_quality(quality)
+    effective_artifact_type = (
+        f"{artifact_type}.partial" if published_partial else artifact_type
+    )
     canonical_title = str(document_title or "").strip()
     if not canonical_title:
         raise ValueError(
@@ -246,7 +254,7 @@ def build_document_deliverable_event(
     structured_dump = _dump_model(structured)
     finalization_manifest = (
         build_typed_document_finalization_manifest(
-            artifact_type=artifact_type,
+            artifact_type=effective_artifact_type,
             authoring_ledger=authoring_ledger,
         )
         if authoring_ledger
@@ -265,7 +273,8 @@ def build_document_deliverable_event(
     )
     flags = [str(flag) for flag in degraded_flags or () if str(flag)]
     common_metadata: dict[str, Any] = {
-        "artifact_type": artifact_type,
+        "artifact_type": effective_artifact_type,
+        **({"source_artifact_type": artifact_type} if published_partial else {}),
         "artifact_family": artifact_family,
         "document_title": canonical_title,
         "title_source": canonical_title_source,
@@ -281,6 +290,15 @@ def build_document_deliverable_event(
         "finalize_attempts": max(1, int(finalize_attempts or 1)),
     }
     event_metadata = {**common_metadata, **dict(metadata or {})}
+    if published_partial:
+        event_metadata.update(
+            {
+                "artifact_type": effective_artifact_type,
+                "source_artifact_type": artifact_type,
+                "publication_state": "published_partial",
+                "incomplete": True,
+            }
+        )
     if fallback_used:
         event_metadata["delivery_mode"] = "non_stream_fallback"
     if checkpoint_id:
@@ -321,7 +339,7 @@ def build_document_deliverable_event(
 
     final_payload_metadata = {
         "narrative_preview": transported_narrative[:500] if transported_narrative else "",
-        "artifact_type": artifact_type,
+        "artifact_type": effective_artifact_type,
         "artifact_family": artifact_family,
         "document_title": canonical_title,
         "title_source": canonical_title_source,
@@ -346,7 +364,7 @@ def build_document_deliverable_event(
         **dict(payload_metadata or {}),
     }
     final_payload = final_payload_type(
-        plan_id=plan_id or capability_id or artifact_type,
+        plan_id=plan_id or capability_id or effective_artifact_type,
         final_markdown=transported_analysis,
         structured_output=transported_structured,
         degraded_flags=list(flags),
@@ -355,7 +373,7 @@ def build_document_deliverable_event(
     )
 
     output = document_final_output(
-        artifact_type=artifact_type,
+        artifact_type=effective_artifact_type,
         artifact_family=artifact_family,
         capability_id=capability_id or "",
         analysis=transported_analysis,
@@ -376,7 +394,11 @@ def build_document_deliverable_event(
     )
     output.update(
         {
-            "kind": "document_deliverable",
+            "kind": (
+                "partial_document_deliverable"
+                if published_partial
+                else "document_deliverable"
+            ),
             "document_title": canonical_title,
             "title": canonical_title,
             "title_source": canonical_title_source,
@@ -388,6 +410,23 @@ def build_document_deliverable_event(
             "final_markdown": transported_analysis,
             "content": transported_analysis,
             "authoring_strategy": authoring_strategy,
+            "publication_state": (
+                "published_partial" if published_partial else "published_final"
+            ),
+            **(
+                {
+                    "source_artifact_type": artifact_type,
+                    "incomplete": True,
+                    "quality_publication_eligible": False,
+                    "provides_artifacts": {
+                        effective_artifact_type: {
+                            "structured_output": transported_structured
+                        }
+                    },
+                }
+                if published_partial
+                else {}
+            ),
         }
     )
     structured_summary = str(structured_dump.get("summary") or "").strip()
