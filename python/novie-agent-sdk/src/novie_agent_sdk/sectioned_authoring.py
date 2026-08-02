@@ -1292,7 +1292,6 @@ class SectionedLongformAuthor:
             length_profile = str(state.get("length_profile") or self._contract.length_profile)
             outline_ref = _mapping(state.get("outline_ref"))
             drafts = await self._resume_drafts_from_state(state, outline=outline)
-            drafts = await self._revalidate_resumed_drafts(drafts)
             await self._emit(
                 "document.sectioned_authoring.resumed",
                 status="running",
@@ -1414,6 +1413,11 @@ class SectionedLongformAuthor:
             ),
             reviews_used=_positive_int(state.get("authoring_review_calls_used"), 0),
         )
+        if drafts:
+            drafts = await self._revalidate_resumed_drafts(drafts)
+            self._document_information_budget.used_units = sum(
+                _information_units(draft.markdown) for draft in drafts
+            )
         authoring_summary = _mapping(state.get("authoring_context_summary"))
         await self._emit(
             "document.authoring_plan.accepted",
@@ -1623,7 +1627,8 @@ class SectionedLongformAuthor:
             recovery_units_used = 0
             recovery_round = 0
             while (
-                (
+                not quality.degraded
+                and (
                     quality.hard_failures
                     or (
                         self._contract.gate_enforcement
@@ -1941,6 +1946,35 @@ class SectionedLongformAuthor:
             for failure in quality.hard_failures
         ):
             return quality
+        if not self._authoring_calls_available("review", 1):
+            failures = tuple(
+                dict.fromkeys((*quality.failures, "completeness_review_degraded"))
+            )
+            await self._emit(
+                "document.section.completeness_review_skipped",
+                status="degraded",
+                section_id=plan.section_id,
+                section_title=plan.title,
+                reason="authoring_call_budget_exhausted",
+                **self._authoring_call_budget_metadata(),
+            )
+            return replace(
+                quality,
+                failures=failures,
+                degraded=True,
+                completeness_review={
+                    "complete": False,
+                    "reliable": False,
+                    "issue_code": "review_budget_exhausted",
+                    "reason": (
+                        "Completeness review was skipped because the bounded "
+                        "authoring review budget was exhausted."
+                    ),
+                    "coverage": [],
+                    "markdown_digest": _markdown_digest(markdown),
+                    "skipped": True,
+                },
+            )
         self._reserve_authoring_call("review")
         review = await review_section_completeness(
             self._llm,
@@ -1972,10 +2006,14 @@ class SectionedLongformAuthor:
             issue_code=review.issue_code,
             complete=review.complete,
         )
+        review_metadata = {
+            **review.to_metadata(),
+            "markdown_digest": _markdown_digest(markdown),
+        }
         return replace(
             quality,
             failures=failures,
-            completeness_review=review.to_metadata(),
+            completeness_review=review_metadata,
         )
 
     async def _emit(self, event: str, **metadata: Any) -> None:
@@ -2088,6 +2126,12 @@ class SectionedLongformAuthor:
                 )
                 break
             review = quality.get("completeness_review")
+            recorded_digest = (
+                str(review.get("markdown_digest") or "")
+                if isinstance(review, Mapping)
+                else ""
+            )
+            current_digest = _markdown_digest(draft.markdown)
             expected_point_ids = {
                 item["point_id"] for item in _required_coverage_points(draft.plan)
             }
@@ -2103,7 +2147,46 @@ class SectionedLongformAuthor:
                 not isinstance(review, Mapping)
                 or review.get("complete") is not True
                 or recorded_point_ids != expected_point_ids
+                or bool(recorded_digest) and recorded_digest != current_digest
             ):
+                if not self._authoring_calls_available("review", 1):
+                    failure = "completeness_review_degraded"
+                    failures = list(quality.get("failures") or ())
+                    soft_failures = list(quality.get("soft_failures") or ())
+                    if failure not in failures:
+                        failures.append(failure)
+                    if failure not in soft_failures:
+                        soft_failures.append(failure)
+                    quality.update(
+                        {
+                            "failures": failures,
+                            "soft_failures": soft_failures,
+                            "degraded": True,
+                            "completeness_review": {
+                                "complete": False,
+                                "reliable": False,
+                                "issue_code": "review_budget_exhausted",
+                                "reason": (
+                                    "Resume review was skipped because the bounded "
+                                    "authoring review budget was exhausted."
+                                ),
+                                "coverage": [],
+                                "markdown_digest": current_digest,
+                                "skipped": True,
+                            },
+                        }
+                    )
+                    await self._emit(
+                        "document.section.resume_degraded",
+                        status="complete",
+                        section_id=draft.plan.section_id,
+                        section_title=draft.plan.title,
+                        reason="review_budget_exhausted",
+                        reliable=False,
+                    )
+                    admitted.append(replace(draft, quality=quality))
+                    continue
+                self._reserve_authoring_call("review")
                 reviewed = await review_section_completeness(
                     self._llm,
                     section_title=draft.plan.title,
@@ -2111,7 +2194,10 @@ class SectionedLongformAuthor:
                     required_points=_required_coverage_points(draft.plan),
                     markdown=draft.markdown,
                 )
-                quality["completeness_review"] = reviewed.to_metadata()
+                quality["completeness_review"] = {
+                    **reviewed.to_metadata(),
+                    "markdown_digest": current_digest,
+                }
                 if not reviewed.complete:
                     failure = (
                         "completeness_review_degraded"
@@ -3042,19 +3128,11 @@ class SectionedLongformAuthor:
 
     def _authoring_calls_available(self, kind: str, count: int) -> bool:
         budget = self._authoring_call_budget
-        requested = max(0, int(count))
-        if budget is None or requested == 0:
-            return True
-        if budget.used + requested > budget.total_limit:
-            return False
-        if kind == "review" and budget.reviews_used + requested > budget.review_limit:
-            return False
-        if (
-            kind == "compaction"
-            and budget.compactions_used + requested > budget.compaction_limit
-        ):
-            return False
-        return True
+        return True if budget is None else budget.available(kind, count)
+
+    def _authoring_call_budget_metadata(self) -> dict[str, int]:
+        budget = self._authoring_call_budget
+        return {} if budget is None else budget.metadata()
 
     async def _polish_final(
         self,
@@ -4495,6 +4573,11 @@ def _draft_resume_record(draft: SectionDraft) -> dict[str, Any]:
         "artifact_ref": dict(draft.artifact_ref),
         "quality": dict(draft.quality),
     }
+
+
+def _markdown_digest(markdown: str) -> str:
+    normalized = "\n".join(line.rstrip() for line in str(markdown or "").splitlines())
+    return hashlib.sha256(normalized.strip().encode("utf-8")).hexdigest()
 
 
 def _artifact_id_from_ref(ref: Mapping[str, Any]) -> str:

@@ -22,6 +22,7 @@ from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _HEADING_RE,
     SectionedAuthoringContract,
+    SectionQualityGateResult,
     _close_truncated_tail,
     _close_unbalanced_bold,
     _document_integrity_violation,
@@ -1910,6 +1911,87 @@ async def test_finalization_skips_optional_reviews_when_budget_is_exhausted() ->
 
 
 @pytest.mark.asyncio
+async def test_section_completeness_review_degrades_when_budget_is_exhausted() -> None:
+    events: list[dict[str, Any]] = []
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        phase_event_sink=events.append,
+    )
+    author._authoring_call_budget = AuthoringCallBudget(
+        total_limit=82,
+        compaction_limit=5,
+        review_limit=22,
+        used=66,
+        reviews_used=22,
+    )
+    quality = SectionQualityGateResult(
+        failures=(),
+        information_units=10,
+        citation_count=0,
+        evidence_item_count=0,
+    )
+
+    reviewed = await author._apply_completeness_review(
+        plan=SectionPlan(section_id="summary", title="Summary"),
+        markdown="## Summary\n\nA complete summary.",
+        quality=quality,
+    )
+
+    assert reviewed.degraded is True
+    assert "completeness_review_degraded" in reviewed.failures
+    assert reviewed.completeness_review["skipped"] is True
+    assert author._authoring_call_budget.reviews_used == 22
+    assert llm.structured_prompts == []
+    assert any(
+        event["event"] == "document.section.completeness_review_skipped"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_resumed_draft_reuses_matching_review_without_spending_budget() -> None:
+    llm = _FakeLlm()
+    author = SectionedLongformAuthor(
+        llm_facade=llm,
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+    )
+    author._authoring_call_budget = AuthoringCallBudget(
+        total_limit=82,
+        compaction_limit=5,
+        review_limit=22,
+        used=66,
+        reviews_used=22,
+    )
+    draft = SectionDraft(
+        plan=SectionPlan(section_id="summary", title="Summary", min_words=3),
+        markdown="## Summary\n\nA complete summary.",
+        quality={
+            "completeness_review": {
+                "complete": True,
+                "reliable": True,
+                "issue_code": "none",
+                "coverage": [],
+            },
+            "hard_failures": [],
+        },
+    )
+
+    admitted = await author._revalidate_resumed_drafts([draft])
+
+    assert len(admitted) == 1
+    assert author._authoring_call_budget.reviews_used == 22
+    assert llm.structured_prompts == []
+
+
+@pytest.mark.asyncio
 async def test_finish_current_assembles_only_accepted_checkpoint_sections() -> None:
     events: list[dict[str, Any]] = []
     author = SectionedLongformAuthor(
@@ -2538,7 +2620,7 @@ async def test_persistent_semantic_gap_degrades_without_recovery() -> None:
         phase_event_sink=phase_events.append,
     )
 
-    result = await author.author(
+    await author.author(
         brief={"title": "Example document"},
         upstream={},
     )
@@ -2728,7 +2810,7 @@ async def test_truncated_small_part_accepts_last_retry_as_degraded() -> None:
         phase_event_sink=phase_events.append,
     )
 
-    result = await author.author(
+    await author.author(
         brief={"title": "Example document"},
         upstream={},
         workflow_id="workflow-1",

@@ -222,6 +222,21 @@ def test_authoring_call_budget_rejects_unplanned_review() -> None:
         budget.reserve("review")
 
 
+def test_authoring_call_budget_reports_availability_without_mutation() -> None:
+    budget = AuthoringCallBudget(
+        total_limit=82,
+        compaction_limit=5,
+        review_limit=22,
+        used=66,
+        reviews_used=22,
+    )
+
+    assert budget.available("draft") is True
+    assert budget.available("review") is False
+    assert budget.used == 66
+    assert budget.reviews_used == 22
+
+
 def test_coverage_cursor_advances_only_after_accepted_part() -> None:
     plan = build_authoring_execution_plan(
         [_Section(min_words=10)],
