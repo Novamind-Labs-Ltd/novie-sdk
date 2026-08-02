@@ -153,6 +153,22 @@ class AuthoringCallBudget:
     compactions_used: int = 0
     reviews_used: int = 0
 
+    def available(self, kind: str, count: int = 1) -> bool:
+        """Return whether ``count`` calls can be admitted without mutation."""
+        requested = max(0, int(count))
+        if requested == 0:
+            return True
+        if self.used + requested > self.total_limit:
+            return False
+        if (
+            kind == "compaction"
+            and self.compactions_used + requested > self.compaction_limit
+        ):
+            return False
+        if kind == "review" and self.reviews_used + requested > self.review_limit:
+            return False
+        return True
+
     def reserve(self, kind: str) -> None:
         if self.used >= self.total_limit:
             raise DocumentAuthoringCallBudgetExceeded(
