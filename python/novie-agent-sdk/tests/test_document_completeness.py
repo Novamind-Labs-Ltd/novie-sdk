@@ -14,9 +14,62 @@ from novie_agent_sdk.document_completeness import (
 class _StructuredLlm:
     def __init__(self, payload: Any) -> None:
         self.payload = payload
+        self.calls: list[dict[str, Any]] = []
 
-    async def structured(self, **_kwargs: Any) -> dict[str, Any]:
+    async def structured(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
         return {"structured": self.payload}
+
+
+class _FailingStructuredLlm:
+    async def structured(self, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("provider returned no structured output")
+
+
+@pytest.mark.asyncio
+async def test_review_disables_reasoning_and_scales_output_for_coverage() -> None:
+    point_ids = [f"point-{index}" for index in range(10)]
+    llm = _StructuredLlm(
+        {
+            "structure_complete": True,
+            "issue_code": "none",
+            "coverage": [
+                {"point_id": point_id, "covered": True, "evidence": "Present."}
+                for point_id in point_ids
+            ],
+            "reason": "Complete.",
+        }
+    )
+
+    await review_section_completeness(
+        llm,
+        section_title="Review",
+        section_objective="Cover every point.",
+        required_points=tuple(
+            {"point_id": point_id, "requirement": f"Cover {point_id}."}
+            for point_id in point_ids
+        ),
+        markdown="## Review\n\nComplete content.",
+    )
+
+    assert llm.calls[0]["reasoning_mode"] == "disabled"
+    assert llm.calls[0]["reasoning_workload"] == "review"
+    assert llm.calls[0]["max_output_tokens"] == 1856
+
+
+@pytest.mark.asyncio
+async def test_review_provider_failure_degrades_without_aborting_document() -> None:
+    review = await review_section_completeness(
+        _FailingStructuredLlm(),
+        section_title="Review",
+        section_objective="Cover the objective.",
+        markdown="## Review\n\nMechanically complete content.",
+    )
+
+    assert review.complete is False
+    assert review.reliable is False
+    assert review.structure_complete is True
+    assert "unavailable" in review.reason
 
 
 @pytest.mark.asyncio
