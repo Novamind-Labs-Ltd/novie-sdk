@@ -1,4 +1,4 @@
-"""Fail-closed semantic and mechanical completeness checks for documents."""
+"""Semantic completeness review with fail-closed mechanical document checks."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -94,6 +94,29 @@ class SectionCompletenessReview:
         }
 
 
+def _review_output_token_budget(point_count: int) -> int:
+    """Leave enough visible output for one evidence row per coverage point."""
+    return min(4096, max(1024, 256 + max(1, point_count) * 160))
+
+
+def _unavailable_review(
+    point_ids: Sequence[str],
+    *,
+    reason: str,
+) -> SectionCompletenessReview:
+    return SectionCompletenessReview(
+        complete=False,
+        issue_code="missing_planned_content",
+        reason=reason,
+        coverage=tuple(
+            {"point_id": point_id, "covered": False, "evidence": ""}
+            for point_id in point_ids
+        ),
+        structure_complete=True,
+        reliable=False,
+    )
+
+
 async def review_section_completeness(
     llm_facade: Any,
     *,
@@ -154,17 +177,27 @@ async def review_section_completeness(
             temperature=0,
             method="json_schema",
             strict=True,
-            max_output_tokens=512,
+            max_output_tokens=_review_output_token_budget(len(point_ids)),
+            reasoning_mode="disabled",
+            reasoning_workload="review",
         )
     except Exception as exc:
-        raise DocumentCompletenessReviewError(
-            "document_completeness_review_unavailable: structured review failed"
-        ) from exc
+        return _unavailable_review(
+            point_ids,
+            reason=(
+                "Structured completeness review was unavailable; deterministic "
+                f"document checks remain active ({type(exc).__name__})."
+            ),
+        )
 
     payload = result.get("structured") if isinstance(result, Mapping) else None
     if not isinstance(payload, Mapping):
-        raise DocumentCompletenessReviewError(
-            "document_completeness_review_unavailable: structured result missing"
+        return _unavailable_review(
+            point_ids,
+            reason=(
+                "Structured completeness review returned no usable result; "
+                "deterministic document checks remain active."
+            ),
         )
     # Compatibility for callers whose single-objective test/provider adapter
     # still returns the ADR-114 shape. Production sectioned authoring always

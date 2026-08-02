@@ -17,6 +17,7 @@ from novie_agent_sdk import (
     sectioned_authoring_contract_from_skill,
 )
 from novie_agent_sdk.sectioned_authoring import _scale_outline_to_document_minimum
+from novie_agent_sdk.document_authoring_budget import AuthoringCallBudget
 from novie_agent_sdk import astream_sectioned_document_finalization
 from novie_agent_sdk.sectioned_authoring import (
     _HEADING_RE,
@@ -1804,6 +1805,108 @@ async def test_legacy_resumed_draft_is_revalidated_for_completeness() -> None:
     admitted = await author._revalidate_resumed_drafts([legacy])
 
     assert admitted[0].quality["completeness_review"]["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_semantically_incomplete_resumed_draft_is_preserved_as_degraded() -> None:
+    events: list[dict[str, Any]] = []
+
+    class _IncompleteReviewLlm(_FakeLlm):
+        async def structured(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs["output_schema"].get("title") == "SectionCompletenessReview":
+                return {
+                    "structured": {
+                        "complete": False,
+                        "issue_code": "missing_planned_content",
+                        "reason": "One semantic point is not explicit.",
+                    }
+                }
+            return await super().structured(**kwargs)
+
+    author = SectionedLongformAuthor(
+        llm_facade=_IncompleteReviewLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        phase_event_sink=events.append,
+    )
+    draft = SectionDraft(
+        plan=SectionPlan(
+            section_id="overview",
+            title="Overview",
+            objective="Provide a complete overview.",
+            min_words=3,
+        ),
+        markdown="## Overview\n\nMechanically complete overview body.",
+        quality={},
+    )
+
+    admitted = await author._revalidate_resumed_drafts([draft])
+
+    assert len(admitted) == 1
+    assert admitted[0].quality["degraded"] is True
+    assert "semantic_incomplete_degraded" in admitted[0].quality["soft_failures"]
+    assert any(
+        event["event"] == "document.section.resume_degraded" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalization_skips_optional_reviews_when_budget_is_exhausted() -> None:
+    events: list[dict[str, Any]] = []
+    author = SectionedLongformAuthor(
+        llm_facade=_FakeLlm(),
+        platform=_FakePlatform(),
+        artifact_type="example_document",
+        step_id="s2",
+        capability_id="agent.example.write_document",
+        context_budget={"enable_document_seam_review": True},
+        phase_event_sink=events.append,
+    )
+    author._authoring_call_budget = AuthoringCallBudget(
+        total_limit=52,
+        compaction_limit=4,
+        review_limit=20,
+        used=51,
+        reviews_used=11,
+    )
+    drafts = [
+        SectionDraft(
+            plan=SectionPlan(section_id="overview", title="Overview"),
+            markdown="## Overview\n\nComplete overview.",
+            quality={
+                "completeness_review": {
+                    "complete": True,
+                    "issue_code": "none",
+                    "reason": "Complete.",
+                },
+                "hard_failures": [],
+            },
+        ),
+        SectionDraft(
+            plan=SectionPlan(section_id="recommendation", title="Recommendation"),
+            markdown="## Recommendation\n\nComplete recommendation.",
+            quality={
+                "completeness_review": {
+                    "complete": True,
+                    "issue_code": "none",
+                    "reason": "Complete.",
+                },
+                "hard_failures": [],
+            },
+        ),
+    ]
+
+    result = await author._polish_final(brief={"title": "Doc"}, drafts=drafts)
+
+    assert "## Overview" in result
+    assert "## Recommendation" in result
+    assert author._authoring_call_budget.used == 51
+    assert any(
+        event["event"] == "document.final.optional_reviews_skipped"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

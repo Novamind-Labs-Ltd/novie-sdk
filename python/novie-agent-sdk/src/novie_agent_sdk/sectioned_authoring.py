@@ -2111,16 +2111,30 @@ class SectionedLongformAuthor:
                     required_points=_required_coverage_points(draft.plan),
                     markdown=draft.markdown,
                 )
+                quality["completeness_review"] = reviewed.to_metadata()
                 if not reviewed.complete:
+                    failure = (
+                        "completeness_review_degraded"
+                        if not reviewed.reliable
+                        else "semantic_incomplete_degraded"
+                    )
+                    failures = list(quality.get("failures") or ())
+                    soft_failures = list(quality.get("soft_failures") or ())
+                    if failure not in failures:
+                        failures.append(failure)
+                    if failure not in soft_failures:
+                        soft_failures.append(failure)
+                    quality["failures"] = failures
+                    quality["soft_failures"] = soft_failures
+                    quality["degraded"] = True
                     await self._emit(
-                        "document.section.resume_invalidated",
-                        status="gate_failed",
+                        "document.section.resume_degraded",
+                        status="complete",
                         section_id=draft.plan.section_id,
                         section_title=draft.plan.title,
                         reason=reviewed.issue_code,
+                        reliable=reviewed.reliable,
                     )
-                    break
-                quality["completeness_review"] = reviewed.to_metadata()
             admitted.append(replace(draft, quality=quality))
         return admitted
 
@@ -3026,6 +3040,22 @@ class SectionedLongformAuthor:
         if budget is not None:
             budget.reserve(kind)
 
+    def _authoring_calls_available(self, kind: str, count: int) -> bool:
+        budget = self._authoring_call_budget
+        requested = max(0, int(count))
+        if budget is None or requested == 0:
+            return True
+        if budget.used + requested > budget.total_limit:
+            return False
+        if kind == "review" and budget.reviews_used + requested > budget.review_limit:
+            return False
+        if (
+            kind == "compaction"
+            and budget.compactions_used + requested > budget.compaction_limit
+        ):
+            return False
+        return True
+
     async def _polish_final(
         self,
         *,
@@ -3038,6 +3068,22 @@ class SectionedLongformAuthor:
             self._context_budget.get("enable_document_seam_review"),
             False,
         )
+        optional_review_count = len(drafts) if seam_review_enabled else 0
+        if seam_review_enabled and not self._authoring_calls_available(
+            "review", optional_review_count
+        ):
+            seam_review_enabled = False
+            await self._emit(
+                "document.final.optional_reviews_skipped",
+                status="degraded",
+                reason="authoring_call_budget_exhausted",
+                requested_review_calls=optional_review_count,
+                **(
+                    self._authoring_call_budget.metadata()
+                    if self._authoring_call_budget is not None
+                    else {}
+                ),
+            )
         for index, draft in enumerate(drafts):
             markdown = draft.markdown
             if seam_review_enabled and index > 0:
