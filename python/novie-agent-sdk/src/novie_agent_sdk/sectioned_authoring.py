@@ -2201,7 +2201,9 @@ class SectionedLongformAuthor:
                         messages=messages,
                         temperature=temperature,
                         max_output_tokens=allocated_output_tokens,
-                        model=model, **{"reasoning_mode": "disabled"},
+                        model=model,
+                        reasoning_mode="disabled",
+                        reasoning_workload="document",
                     )
                     content = str(result.get("content") or "")
                     if content:
@@ -2221,7 +2223,9 @@ class SectionedLongformAuthor:
                         messages,
                         temperature=temperature,
                         max_output_tokens=allocated_output_tokens,
-                        model=model, **{"reasoning_mode": "disabled"},
+                        model=model,
+                        reasoning_mode="disabled",
+                        reasoning_workload="document",
                     ):
                         delta = _llm_stream_event_delta(event)
                         if delta:
@@ -2401,6 +2405,8 @@ class SectionedLongformAuthor:
                     output_schema=_outline_schema(self._contract),
                     temperature=0.2 if attempt == 0 else 0,
                     max_output_tokens=token_budget,
+                    reasoning_mode="disabled",
+                    reasoning_workload="outline",
                     **({"method": "json_schema", "strict": True} if attempt else {}),
                 )
             except Exception as exc:
@@ -3066,6 +3072,8 @@ class SectionedLongformAuthor:
                     method="json_schema",
                     strict=True,
                     max_output_tokens=256,
+                    reasoning_mode="disabled",
+                    reasoning_workload="review",
                 )
                 payload = result.get("structured") if isinstance(result, Mapping) else None
                 if not isinstance(payload, Mapping):
@@ -3123,6 +3131,8 @@ class SectionedLongformAuthor:
                 method="json_schema",
                 strict=True,
                 max_output_tokens=384,
+                reasoning_mode="disabled",
+                reasoning_workload="review",
             )
             tail_payload = (
                 tail_result.get("structured")

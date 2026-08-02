@@ -26,6 +26,13 @@ import logging
 import os
 from typing import Any
 
+from .llm_reasoning import (
+    ReasoningEffort,
+    ReasoningMode,
+    ReasoningWorkload,
+    byok_reasoning_effort,
+)
+
 _log = logging.getLogger(__name__)
 
 # ── Public env-var names (agent configures their own key) ─────────────────
@@ -128,6 +135,9 @@ class ByokLlmClient:
         model: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> Any:
         from langchain_openai import ChatOpenAI
 
@@ -142,6 +152,14 @@ class ByokLlmClient:
             kwargs["temperature"] = temperature
         if max_output_tokens is not None:
             kwargs["max_tokens"] = int(max_output_tokens)
+        effective_effort = byok_reasoning_effort(
+            str(kwargs["model"]),
+            reasoning_mode,
+            reasoning_effort,
+            reasoning_workload,
+        )
+        if effective_effort is not None:
+            kwargs["reasoning"] = {"effort": effective_effort}
 
         llm = ChatOpenAI(**kwargs)
         if self._usage_sink is not None:
@@ -161,6 +179,9 @@ class ByokLlmClient:
         model: str | None = None,
         temperature: float | None = None,
         max_output_tokens: int | None = None,
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Send a chat request using the agent's own key.
 
@@ -183,6 +204,9 @@ class ByokLlmClient:
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            reasoning_mode=reasoning_mode,
+            reasoning_effort=reasoning_effort,
+            reasoning_workload=reasoning_workload,
         )
         response = await llm.ainvoke([_to_msg(m) for m in messages])
         content = getattr(response, "content", str(response))
@@ -207,6 +231,9 @@ class ByokLlmClient:
         method: str | None = None,
         strict: bool | None = None,
         timeout_seconds: float | None = None,
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Structured JSON-schema output using the agent's own key.
 
@@ -238,6 +265,9 @@ class ByokLlmClient:
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            reasoning_mode=reasoning_mode,
+            reasoning_effort=reasoning_effort,
+            reasoning_workload=reasoning_workload,
         )
         structured_kwargs: dict[str, Any] = {}
         if method is not None:

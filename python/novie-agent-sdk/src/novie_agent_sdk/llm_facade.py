@@ -22,6 +22,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, Literal
 
+from .llm_reasoning import ReasoningEffort, ReasoningMode, ReasoningWorkload
+
 if TYPE_CHECKING:
     from .byok_llm import ByokLlmClient
     from .observability import AgentObservability, UsageReport
@@ -33,9 +35,6 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 LlmMode = Literal["platform", "byok", "unavailable"]
-ReasoningMode = Literal["default", "disabled"]
-
-
 class LlmFacade:
     """Unified platform-or-BYOK LLM surface for SDK agent handlers."""
 
@@ -98,6 +97,8 @@ class LlmFacade:
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Send a chat request.
 
@@ -121,6 +122,8 @@ class LlmFacade:
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 reasoning_mode=reasoning_mode,
+                reasoning_effort=reasoning_effort,
+                reasoning_workload=reasoning_workload,
             )
             return {**result, "llm_mode": "platform"}
 
@@ -135,6 +138,9 @@ class LlmFacade:
                 model=model,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
+                reasoning_mode=reasoning_mode,
+                reasoning_effort=reasoning_effort,
+                reasoning_workload=reasoning_workload,
             )
             return {**result, "llm_mode": "byok"}
 
@@ -155,6 +161,8 @@ class LlmFacade:
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
         reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a chat response as platform-shaped text events.
 
@@ -175,6 +183,8 @@ class LlmFacade:
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
                     reasoning_mode=reasoning_mode,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_workload=reasoning_workload,
                 ):
                     yield event
                 return
@@ -188,6 +198,8 @@ class LlmFacade:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             reasoning_mode=reasoning_mode,
+            reasoning_effort=reasoning_effort,
+            reasoning_workload=reasoning_workload,
         )
         content = str(result.get("content") or "")
         if content:
@@ -205,6 +217,9 @@ class LlmFacade:
         method: str | None = None,
         strict: bool | None = None,
         timeout_seconds: float | None = None,
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Invoke the LLM with a JSON-schema structured output contract.
 
@@ -234,6 +249,9 @@ class LlmFacade:
                 method=method,
                 strict=strict,
                 timeout_seconds=timeout_seconds,
+                reasoning_mode=reasoning_mode,
+                reasoning_effort=reasoning_effort,
+                reasoning_workload=reasoning_workload,
             )
             return {**result, "llm_mode": "platform"}
 
@@ -246,6 +264,9 @@ class LlmFacade:
                 max_output_tokens=max_output_tokens,
                 method=method,
                 strict=strict,
+                reasoning_mode=reasoning_mode,
+                reasoning_effort=reasoning_effort,
+                reasoning_workload=reasoning_workload,
             )
             return {**result, "llm_mode": "byok"}
 

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from novie_agent_sdk.llm_facade import LlmFacade, build_llm_facade
+from novie_agent_sdk.llm_reasoning import byok_reasoning_effort
 from novie_agent_sdk.observability import AgentObservability
 from novie_agent_sdk.platform_namespace import (
     QuotaExceededError,
@@ -82,6 +83,18 @@ class TestPlatformMode:
         ))
         assert ns.llm.chat.await_args.kwargs["reasoning_mode"] == "disabled"
 
+    def test_chat_forwards_reasoning_workload_to_platform(self) -> None:
+        ns = _make_available_platform_ns(responses={})
+        facade = LlmFacade(ns)
+        _run(facade.chat(
+            [{"role": "user", "content": "split"}],
+            reasoning_workload="task_decomposition",
+        ))
+        assert (
+            ns.llm.chat.await_args.kwargs["reasoning_workload"]
+            == "task_decomposition"
+        )
+
     def test_structured_delegates_to_platform(self) -> None:
         ns = _make_available_platform_ns(responses={"structured": {"structured": {"a": 1}}})
         facade = LlmFacade(ns)
@@ -110,6 +123,19 @@ class TestPlatformMode:
         kwargs = ns.llm.structured.await_args.kwargs
         assert kwargs["method"] == "json_schema"
         assert kwargs["strict"] is True
+
+    def test_structured_forwards_reasoning_policy_to_platform(self) -> None:
+        ns = _make_available_platform_ns(responses={"structured": {"structured": {}}})
+        facade = LlmFacade(ns)
+        _run(facade.structured(
+            [{"role": "user", "content": "outline"}],
+            {"type": "object"},
+            reasoning_mode="disabled",
+            reasoning_workload="outline",
+        ))
+        kwargs = ns.llm.structured.await_args.kwargs
+        assert kwargs["reasoning_mode"] == "disabled"
+        assert kwargs["reasoning_workload"] == "outline"
 
     def test_structured_forwards_timeout_to_platform(self) -> None:
         ns = _make_available_platform_ns(responses={"structured": {"structured": {"a": 1}}})
@@ -264,8 +290,6 @@ def test_llm_facade_exposes_platform_ns_publicly() -> None:
     keep platform_ns public so they never reach into _platform_ns."""
     from types import SimpleNamespace
 
-    from novie_agent_sdk.llm_facade import LlmFacade
-
     namespace = SimpleNamespace(is_available=True)
     assert LlmFacade(namespace).platform_ns is namespace
 
@@ -359,3 +383,15 @@ def test_byok_chat_preserves_provider_finish_reason(
     result = _run(client.chat([{"role": "user", "content": "write"}]))
 
     assert result["response_metadata"]["finish_reason"] == "length"
+
+
+def test_byok_task_decomposition_maps_to_medium_for_gpt_5_6() -> None:
+    assert byok_reasoning_effort(
+        "gpt-5.6-luna", "default", None, "task_decomposition"
+    ) == "medium"
+
+
+def test_byok_reasoning_hint_is_ignored_for_unregistered_model() -> None:
+    assert byok_reasoning_effort(
+        "gpt-4o", "disabled", None, "document"
+    ) is None
