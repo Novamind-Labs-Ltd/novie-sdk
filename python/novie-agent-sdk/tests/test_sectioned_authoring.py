@@ -241,6 +241,7 @@ class _FakeLlm:
         self.chat_kwargs: list[dict[str, Any]] = []
         self.chat_prompts: list[str] = []
         self.structured_prompts: list[str] = []
+        self.structured_kwargs: list[dict[str, Any]] = []
 
     async def structured(
         self,
@@ -248,9 +249,10 @@ class _FakeLlm:
         messages: list[dict[str, str]],
         output_schema: dict[str, Any],
         temperature: float,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         self.structured_prompts.append("\n".join(item["content"] for item in messages))
+        self.structured_kwargs.append(dict(kwargs))
         if output_schema.get("title") == "SectionCompletenessReview":
             return {
                 "structured": {
@@ -772,6 +774,9 @@ async def test_sectioned_author_records_outline_sections_and_final_ref() -> None
     ]
     assert platform.workpads.final_refs == ["artifact://artifact-6"]
     assert all(item["reasoning_mode"] == "disabled" for item in llm.chat_kwargs)
+    assert all(item["reasoning_workload"] == "document" for item in llm.chat_kwargs)
+    assert llm.structured_kwargs[0]["reasoning_mode"] == "disabled"
+    assert llm.structured_kwargs[0]["reasoning_workload"] == "outline"
     event_names = [event["event"] for event in phase_events]
     assert event_names.count("document.part.completed") == 2
     assert event_names.count("document.section.completed") == 2

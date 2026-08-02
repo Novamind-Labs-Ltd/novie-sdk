@@ -72,6 +72,12 @@ from .llm_contract import (
     normalise_llm_result,
     normalise_stream_event,
 )
+from .llm_reasoning import (
+    ReasoningEffort,
+    ReasoningMode,
+    ReasoningWorkload,
+    add_reasoning_arguments,
+)
 from .runtime import RequestHeaders
 from .timeout_policy import DEFAULT_SDK_TIMEOUTS
 
@@ -538,6 +544,10 @@ def _openai_chat_body(arguments: Mapping[str, Any]) -> dict[str, Any]:
         body["parallel_tool_calls"] = args["parallel_tool_calls"]
     if args.get("reasoning_mode") == "disabled":
         body["reasoning_mode"] = "disabled"
+    if args.get("reasoning_effort") is not None:
+        body["reasoning_effort"] = args["reasoning_effort"]
+    if args.get("reasoning_workload") is not None:
+        body["reasoning_workload"] = args["reasoning_workload"]
     return body
 
 
@@ -1733,7 +1743,9 @@ class LlmNamespace:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
-        reasoning_mode: Literal["default", "disabled"] = "default",
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM.
 
@@ -1765,8 +1777,10 @@ class LlmNamespace:
             args["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             args["parallel_tool_calls"] = parallel_tool_calls
-        if reasoning_mode == "disabled":
-            args["reasoning_mode"] = reasoning_mode
+        add_reasoning_arguments(
+            args, mode=reasoning_mode, effort=reasoning_effort,
+            workload=reasoning_workload,
+        )
         diagnostics = await self._parent.invoke_llm_capability(_LLM_CHAT_CAP, args)
         return normalise_llm_result(self._unwrap(diagnostics, _LLM_CHAT_CAP))
 
@@ -1780,7 +1794,9 @@ class LlmNamespace:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
-        reasoning_mode: Literal["default", "disabled"] = "default",
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream the platform chat LLM as raw platform events."""
         args: dict[str, Any] = {"messages": messages}
@@ -1796,8 +1812,10 @@ class LlmNamespace:
             args["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             args["parallel_tool_calls"] = parallel_tool_calls
-        if reasoning_mode == "disabled":
-            args["reasoning_mode"] = reasoning_mode
+        add_reasoning_arguments(
+            args, mode=reasoning_mode, effort=reasoning_effort,
+            workload=reasoning_workload,
+        )
 
         stream = getattr(self._parent._llm_caller, "invoke_event_stream", None)
         if not callable(stream):
@@ -1831,6 +1849,9 @@ class LlmNamespace:
         method: str | None = None,
         strict: bool | None = None,
         timeout_seconds: float | None = None,
+        reasoning_mode: ReasoningMode = "default",
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_workload: ReasoningWorkload | None = None,
     ) -> dict[str, Any]:
         """Invoke the platform chat LLM with a JSON-schema structured output.
 
@@ -1868,6 +1889,10 @@ class LlmNamespace:
             args["strict"] = strict
         if timeout_seconds is not None:
             args["timeout_seconds"] = float(timeout_seconds)
+        add_reasoning_arguments(
+            args, mode=reasoning_mode, effort=reasoning_effort,
+            workload=reasoning_workload,
+        )
         diagnostics = await self._parent.invoke_llm_capability(
             _LLM_STRUCTURED_CAP,
             args,

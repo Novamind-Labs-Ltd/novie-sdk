@@ -1022,6 +1022,26 @@ async def test_llm_structured_forwards_per_call_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_structured_forwards_reasoning_policy() -> None:
+    captured: dict[str, Any] = {}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body["inputs"])
+        return httpx.Response(200, json=_ok_envelope({"structured": {"ok": True}}))
+
+    ns = _build_with_responder(responder)
+    await ns.llm.structured(
+        [{"role": "user", "content": "outline"}],
+        output_schema={"type": "object"},
+        reasoning_mode="disabled",
+        reasoning_workload="outline",
+    )
+    assert captured["reasoning_mode"] == "disabled"
+    assert captured["reasoning_workload"] == "outline"
+
+
+@pytest.mark.asyncio
 async def test_llm_chat_raises_call_error_on_envelope_5xx() -> None:
     """Non-quota envelope failures (binding denied, schema violation,
     unavailable) must also raise rather than silently degrade so callers
@@ -1073,6 +1093,7 @@ async def test_llm_chat_streams_over_openai_chat_completions() -> None:
         temperature=0.2,
         max_output_tokens=256,
         reasoning_mode="disabled",
+        reasoning_workload="outline",
     )
 
     assert result["content"] == "hello"
@@ -1097,6 +1118,7 @@ async def test_llm_chat_streams_over_openai_chat_completions() -> None:
     assert body["temperature"] == 0.2
     assert body["max_tokens"] == 256
     assert body["reasoning_mode"] == "disabled"
+    assert body["reasoning_workload"] == "outline"
     assert "arguments" not in body
     assert "caller_type" not in body
 
