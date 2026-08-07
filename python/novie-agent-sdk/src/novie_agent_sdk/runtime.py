@@ -2377,6 +2377,30 @@ class RegistrationClient:
 
     async def start_heartbeat(self) -> None:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._heartbeat_task.add_done_callback(self._on_heartbeat_task_done)
+
+    def _on_heartbeat_task_done(self, task: "asyncio.Task[None]") -> None:
+        """Restart the loop if it ever ends without being cancelled.
+
+        Logging the exit is necessary but not sufficient: an agent whose
+        heartbeat has stopped is invisible to the platform within minutes, and
+        nothing else in the process notices. A cancelled task is a deliberate
+        shutdown and is left alone.
+        """
+        if task.cancelled() or self._heartbeat_task is not task:
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:  # pragma: no cover - covered by cancelled()
+            return
+        except BaseException:
+            pass
+        _log.warning(
+            "heartbeat loop ended; restarting it agent_id=%s",
+            self._manifest.agent_id,
+        )
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._heartbeat_task.add_done_callback(self._on_heartbeat_task_done)
 
     async def stop_heartbeat(self) -> None:
         if self._heartbeat_task is not None:
@@ -2387,28 +2411,76 @@ class RegistrationClient:
                 pass
 
     async def _heartbeat_loop(self) -> None:
+        """Beat until cancelled, and never fail quietly.
+
+        This loop went silent on a dev cluster and the agent stayed
+        "registered" while answering nothing for hours. Nothing in the logs
+        said so: failures were debug-level and the loop's exit was not
+        recorded at all, so the only evidence was a heartbeat timestamp that
+        had stopped advancing. Every exit path below now leaves a trace.
+        """
         import httpx
-        while True:
-            await asyncio.sleep(self._heartbeat_interval)
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(
-                        f"{self._platform_url}/agents/{self._manifest.agent_id}/heartbeat",
-                        headers=self._auth_headers(),
-                    )
+
+        consecutive_failures = 0
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval)
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.post(
+                            f"{self._platform_url}/agents/{self._manifest.agent_id}/heartbeat",
+                            headers=self._auth_headers(),
+                        )
                     if resp.status_code == 404:
                         _log.info(
                             "heartbeat returned 404; re-registering with Platform agent_id=%s",
                             self._manifest.agent_id,
                         )
                         await self.register()
+                        consecutive_failures = 0
                         continue
                     if resp.status_code not in (200, 204):
-                        _log.debug("heartbeat returned %s", resp.status_code)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _log.debug("Heartbeat failed (non-fatal)", exc_info=True)
+                        consecutive_failures += 1
+                        # A single blip is noise; a run of them is the agent
+                        # going dark while still looking alive to itself.
+                        _log.log(
+                            logging.WARNING if consecutive_failures > 1 else logging.INFO,
+                            "heartbeat rejected agent_id=%s status=%s consecutive_failures=%s",
+                            self._manifest.agent_id,
+                            resp.status_code,
+                            consecutive_failures,
+                        )
+                        continue
+                    if consecutive_failures:
+                        _log.info(
+                            "heartbeat recovered agent_id=%s after %s failures",
+                            self._manifest.agent_id,
+                            consecutive_failures,
+                        )
+                    consecutive_failures = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    consecutive_failures += 1
+                    _log.warning(
+                        "heartbeat failed agent_id=%s consecutive_failures=%s",
+                        self._manifest.agent_id,
+                        consecutive_failures,
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            _log.info("heartbeat loop cancelled agent_id=%s", self._manifest.agent_id)
+            raise
+        except BaseException:
+            # The loop must not be able to die without saying so. Without this
+            # the process keeps serving health checks and looks fine while the
+            # platform slowly decides it is dead.
+            _log.exception(
+                "heartbeat loop exited unexpectedly agent_id=%s; the agent will "
+                "stop being reachable once the platform marks it stale",
+                self._manifest.agent_id,
+            )
+            raise
 
 
 # ── Agent class ───────────────────────────────────────────────────────────────
